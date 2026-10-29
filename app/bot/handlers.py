@@ -1367,6 +1367,18 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
               **analysis)
     if not analysis.get("ok"):
         reason = analysis.get("reason", "undecodable")
+        if reason == "undecodable" and data:
+            # "No audio track at all" is not "corrupt audio": when the
+            # container provably has no audio stream (e.g. a video-only
+            # file), report "silent" so the user sees the accurate
+            # "no usable audio" line instead of the "corrupt" line.
+            try:
+                if has_audio_stream(data) is False:
+                    reason = "silent"
+                    log_event(log, "identify_stage", stage="validate",
+                              ms=0, ok=False, reason="silent_no_stream")
+            except Exception:
+                pass
         # Distinct extraction-stage error — never "not_found".
         return AudioIdResult(status="error", detail=reason)
     # Stage 2: Shazam windows. Each window is (raw_probe, prepared_wav):

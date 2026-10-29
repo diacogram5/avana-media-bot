@@ -112,3 +112,50 @@ async def test_hard_query_still_honest_none(fake_client):
     # Underground track on no probed source: honest None, never a fake.
     res = await fs.find_full_song_file("Kaka3yd", "KHORKHEH")
     assert res is None
+
+
+@pytest.mark.asyncio
+async def test_highest_bitrate_candidate_wins(monkeypatch, fake_client):
+    """Among valid candidates the highest real bitrate is returned.
+
+    Two fake MP3s (128k vs 320k, distinguished by _probe_bitrate_kbps
+    stub): the 320k file must win even though both pass every gate.
+    """
+    low = b"ID3\x04\x00" + b"\x00" * 300_000
+    high = b"ID3\x04\x00" + b"\x01" * 300_000
+
+    class _TwoFiles(_FakeClient):
+        async def get(self, url, **k):
+            url = str(url)
+            self.requested.append(url)
+            if "rest_route=/wp/v2/search" in url:
+                return _FakeResp(json_data=[
+                    {"id": 99, "title": POST_TITLE, "url": POST_URL}])
+            if "wp-json/wp/v2/search" in url:
+                return _FakeResp(json_data=[])
+            if "rest_route=/wp/v2/posts/99" in url:
+                return _FakeResp(json_data={
+                    "content": {"rendered": "<p>stripped</p>"}})
+            if url.startswith(POST_URL):
+                return _FakeResp(text=(
+                    '<html><body>'
+                    '<a href="https://dl.musicsweb.ir/a-128.mp3">128</a>'
+                    '<a href="https://dl.musicsweb.ir/a-320.mp3">320</a>'
+                    '</body></html>'))
+            if url.endswith("a-128.mp3"):
+                return _FakeResp(content=low)
+            if url.endswith("a-320.mp3"):
+                return _FakeResp(content=high)
+            raise AssertionError(f"unexpected GET {url}")
+
+    def factory(*a, **k):
+        return _TwoFiles(*a, **k)
+
+    monkeypatch.setattr(fs.httpx, "AsyncClient", factory)
+    monkeypatch.setattr(
+        fs, "_probe_bitrate_kbps",
+        lambda data, ext: 320 if data == high else 128)
+    fs._CACHE.clear()
+    res = await fs.find_full_song_file(ARTIST, TITLE)
+    assert res is not None
+    assert res["data"] == high

@@ -171,6 +171,42 @@ async def _site_candidates(client: httpx.AsyncClient, base: str, style: str,
     return out
 
 
+def _probe_bitrate_kbps(data: bytes, ext: str) -> int | None:
+    """Real bitrate via ffprobe; None when unmeasurable. Never guessed."""
+    import json as _json
+    import shutil
+    import subprocess
+    import tempfile
+    if not data or shutil.which("ffprobe") is None:
+        return None
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as fh:
+            fh.write(data)
+            path = fh.name
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=bit_rate:format=bit_rate",
+             "-of", "json", path],
+            timeout=30, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        info = _json.loads(proc.stdout or "{}")
+        streams = info.get("streams") or [{}]
+        fmt = info.get("format") or {}
+        br_raw = streams[0].get("bit_rate") or fmt.get("bit_rate")
+        return int(round(float(br_raw) / 1000))
+    except Exception:
+        return None
+    finally:
+        if path:
+            try:
+                import os
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 async def find_full_song_file(artist: str, title: str,
                               sites: tuple | None = None) -> dict | None:
     """Return {"data", "ext", "duration_sec", "source"} or None.
@@ -204,6 +240,10 @@ async def find_full_song_file(artist: str, title: str,
                 if candidates:
                     break
             candidates.sort(key=lambda c: c[0], reverse=True)
+            # Honest quality preference: among the valid candidates, the
+            # highest real bitrate wins (a 320k source over a 128k one).
+            # Nothing is upscaled — the bitrate is probed, never guessed.
+            valid: list[tuple[int, bytes, str, float, str]] = []
             for _rank, url, source in candidates[:3]:
                 ext = "m4a" if url.lower().endswith(".m4a") else "mp3"
                 try:
@@ -223,8 +263,14 @@ async def find_full_song_file(artist: str, title: str,
                 duration = _fingerprint_duration(data)
                 if duration < FULL_SONG_MIN_SECONDS:
                     continue
-                _cache_put(key, data, ext, duration, source)
-                return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
+                br = _probe_bitrate_kbps(data, ext) or 0
+                valid.append((br, data, ext, duration, source))
+            if not valid:
+                return None
+            valid.sort(key=lambda v: v[0], reverse=True)
+            _br, data, ext, duration, source = valid[0]
+            _cache_put(key, data, ext, duration, source)
+            return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
     except Exception:
         return None
     return None

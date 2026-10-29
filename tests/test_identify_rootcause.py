@@ -230,3 +230,30 @@ def test_identify_audio_gate_rejects_garbage():
         handlers._identify_audio(b"\x00\x01\x02" * 5000, "clip.mp4", cfg))
     assert result.status == "error", result
     assert result.detail in ("undecodable", "silent", "lookup_error"), result
+
+
+def _make_video_only_mp4() -> bytes:
+    """A real MP4 container with a video stream but NO audio stream."""
+    import os
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        path = f.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", "testsrc=duration=2:size=160x120:rate=10",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", path],
+            check=True, timeout=60)
+        return open(path, "rb").read()
+    finally:
+        os.unlink(path)
+
+
+def test_identify_audio_video_without_stream_reports_silent():
+    """A video with no audio track at all is 'silent' (no usable audio),
+    not 'undecodable' (corrupt): the user sees the accurate 'no usable
+    audio' line instead of the 'corrupt audio' line."""
+    cfg = Config(bot_token="<redacted>", owner_id=1)
+    result = asyncio.run(
+        handlers._identify_audio(_make_video_only_mp4(), "clip.mp4", cfg))
+    assert result.status == "error", result
+    assert result.detail == "silent", result
