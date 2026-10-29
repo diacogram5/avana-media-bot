@@ -14,7 +14,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import db as dbmod
-from ..bot.logic import attach_bot_id
+from ..bot.audio_send import send_song_audio
+from ..bot.logic import menu_escape
 
 # ---------------------------------------------------------------------------
 # Song-result store (integrator wires song-card buttons to this)
@@ -188,6 +189,7 @@ def _render_pro_view(conn: sqlite3.Connection, telegram_id: int):
         lines.append(T_PL_EMPTY)
 
     kb.append([InlineKeyboardButton(text="➕ پلی‌لیست جدید", callback_data="pro:new")])
+    kb.append(_main_menu_row())
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -219,14 +221,26 @@ def _render_playlist_view(conn: sqlite3.Connection, pl: dict):
         InlineKeyboardButton(text="🗑 حذف", callback_data=f"pro:del:{pl['id']}"),
     ])
     kb.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data="pro:open")])
+    kb.append(_main_menu_row())
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 async def _edit_or_answer(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    # Never leave the user staring at an unchanged card: if the edit
+    # fails (e.g. "message is not modified"), send a fresh message.
     try:
         await callback.message.edit_text(text, reply_markup=kb)
+        return
     except Exception:
         pass
+    try:
+        await callback.message.answer(text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+def _main_menu_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:main")]
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +307,12 @@ def register(router: Router) -> None:
         if not audio:
             await callback.answer(BRIEF["generic"], show_alert=True)
             return
-        bot_id = dbmod.get_bot_id(conn, config)
         try:
-            await callback.message.answer_audio(
-                audio=audio, caption=attach_bot_id(_title_line(fav["title"], fav["artist"]), bot_id))
+            sent = await send_song_audio(
+                callback.message, audio, fav["title"], fav.get("artist", ""),
+                caption=_title_line(fav["title"], fav["artist"]))
+            if sent is None:
+                raise RuntimeError("send failed")
         except Exception:
             await callback.answer(BRIEF["generic"], show_alert=True)
             return
@@ -334,7 +350,9 @@ def register(router: Router) -> None:
         await callback.answer()
 
     @r.message(ProStates.create_name)
-    async def pro_got_name(message: Message, state: FSMContext) -> None:
+    @menu_escape
+    async def pro_got_name(message: Message, state: FSMContext,
+                           conn: sqlite3.Connection) -> None:
         name = (message.text or "").strip()
         if not name:
             await message.answer(BRIEF["generic"])
@@ -353,7 +371,9 @@ def register(router: Router) -> None:
         await _ask_color(callback, state)
 
     @r.message(ProStates.create_desc)
-    async def pro_got_desc(message: Message, state: FSMContext) -> None:
+    @menu_escape
+    async def pro_got_desc(message: Message, state: FSMContext,
+                           conn: sqlite3.Connection) -> None:
         await state.update_data(desc=(message.text or "").strip())
         await state.set_state(ProStates.create_color)
         rows = [[InlineKeyboardButton(text=c, callback_data=f"pro:color:{c}")]
@@ -481,18 +501,23 @@ def register(router: Router) -> None:
         if not items:
             await callback.answer(T_PL_VIEW_EMPTY, show_alert=True)
             return
-        bot_id = dbmod.get_bot_id(conn, config)
         await callback.answer("در حال پخش…")
+        played = 0
         for it in items:
             audio = (it.get("preview_url") or it.get("url") or "").strip()
             if not audio:
                 continue
             try:
-                await callback.message.answer_audio(
-                    audio=audio,
-                    caption=attach_bot_id(_title_line(it["title"], it["artist"]), bot_id))
+                sent = await send_song_audio(
+                    callback.message, audio, it["title"], it.get("artist", ""),
+                    caption=_title_line(it["title"], it["artist"]))
+                if sent is None:
+                    break
+                played += 1
             except Exception:
                 break
+        if not played:
+            await callback.message.answer("پخش انجام نشد؛ دوباره تلاش کنید.")
 
     # --- edit playlist ------------------------------------------------------
     @r.callback_query(F.data.startswith("pro:edit:"))
@@ -594,6 +619,7 @@ def register(router: Router) -> None:
         await _edit_or_answer(callback, text, kb)
 
     @r.message(ProStates.edit_name)
+    @menu_escape
     async def pl_edit_name_done(message: Message, state: FSMContext,
                                conn: sqlite3.Connection) -> None:
         data = await state.get_data()
@@ -613,6 +639,7 @@ def register(router: Router) -> None:
         await message.answer(text, reply_markup=kb)
 
     @r.message(ProStates.edit_desc)
+    @menu_escape
     async def pl_edit_desc_done(message: Message, state: FSMContext,
                                conn: sqlite3.Connection) -> None:
         data = await state.get_data()

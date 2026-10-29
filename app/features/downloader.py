@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -29,8 +30,9 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 
 from ..config import Config
 from ..media import process_link
+from ..bot.logic import menu_escape
 from ..security import validate_link
-from ..services.link_media import extract_media_url
+from ..services.link_media import extract_media_url, extract_video_qualities
 
 # ---------------------------------------------------------------------------
 # Spec-exact strings (port-spec/web-ui-spec.md, sections 4 and 11)
@@ -195,6 +197,8 @@ def detect_source(url: str, validation=None) -> str:
         kind = validation.kind
         if kind == "direct_file":
             return "direct"
+        if kind == "tiktok":
+            return "tiktok"
         if "youtube" in host or host == "youtu.be":
             return "youtube"
         if "instagram" in host:
@@ -266,6 +270,26 @@ async def detect_formats(url: str, source: str) -> FormatResult:
         html = await _fetch_page(url)
         if html is None:
             return FormatResult(formats=[], error="unavailable")
+        qualities = extract_video_qualities(html)
+        if len(qualities) >= 2:
+            # Genuinely multiple qualities: the user picks BEFORE any
+            # download. Options come only from the page's real advertised
+            # files — never fabricated. Sizes are HEAD-probed where known.
+            def _res(q):
+                m = re.search(r"(\d+)", q.get("hint") or "")
+                return int(m.group(1)) if m else 0
+            qualities.sort(key=_res, reverse=True)
+            formats = []
+            for i, q in enumerate(qualities):
+                size = await _probe_size(q["url"])
+                label = q["hint"] or f"کیفیت {i + 1}"
+                if size:
+                    label += f" · ≈{_human_mb(size)}"
+                formats.append({"id": f"q{i}", "label": f"🎬 {label}",
+                                "url": q["url"]})
+            formats.append({"id": "qbest", "label": "⭐ بالاترین کیفیت موجود",
+                            "url": qualities[0]["url"]})
+            return FormatResult(formats=formats, content_type="video")
         media_url = extract_media_url(html)
         if media_url:
             return FormatResult(
@@ -280,6 +304,20 @@ async def detect_formats(url: str, source: str) -> FormatResult:
             content_type="post",
         )
     return FormatResult(formats=[], error="")
+
+
+def _human_mb(size_bytes: int) -> str:
+    mb = size_bytes / (1024 * 1024)
+    return f"{mb:.0f} مگابایت" if mb >= 1 else f"{size_bytes // 1024} کیلوبایت"
+
+
+async def _probe_size(url: str) -> int | None:
+    """HEAD-probed content length, or None when unknown."""
+    resp = await _head_media(url)
+    if resp is None:
+        return None
+    cl = resp.headers.get("content-length")
+    return int(cl) if cl and cl.isdigit() else None
 
 
 async def _head_media(url: str):
@@ -510,16 +548,25 @@ def _filename(url: str, content_type: str) -> str:
 
 
 async def _send_file(message: types.Message, job: dict, data: bytes) -> str:
-    """Send the downloaded bytes; return the Telegram file_id for caching."""
+    """Send the downloaded bytes via the unified media pipeline; return
+    the Telegram file_id for caching."""
+    from ..bot.media_send import send_music, send_video
     ctype = job.get("content_type", "unknown")
-    tg_file = BufferedInputFile(data, filename=_filename(
-        job.get("result_url") or job.get("url", ""), ctype))
+    name = _filename(job.get("result_url") or job.get("url", ""), ctype)
     if ctype == "video":
-        sent = await message.answer_video(tg_file)
+        sent = await send_video(
+            message, BufferedInputFile(data, filename=name))
+        if sent is None:
+            raise _TransientError(RETRY_LATER)
         return sent.video.file_id
     if ctype == "audio":
-        sent = await message.answer_audio(tg_file)
+        # The pipeline delivers a real MP3 with honest specs; the title
+        # is unknown here so the URL basename seeds the filename.
+        sent = await send_music(message, data, name.rsplit(".", 1)[0])
+        if sent is None:
+            raise _TransientError(RETRY_LATER)
         return sent.audio.file_id
+    tg_file = BufferedInputFile(data, filename=name)
     if ctype == "photo":
         sent = await message.answer_photo(tg_file)
         return sent.photo[-1].file_id
@@ -611,6 +658,26 @@ async def _start_job_from_message(message: types.Message,
     asyncio.create_task(run_job(status_msg, conn, config, job["id"]))
 
 
+def pick_format(conn: sqlite3.Connection, job_id: int, user_id: int,
+                fmt_id: str) -> dict | None:
+    """Record the user's format/quality choice. Returns the updated job,
+    or None when the choice is invalid (unknown job/format, wrong user).
+
+    The chosen quality's own file URL becomes the download source —
+    exactly what the user picked, nothing else.
+    """
+    job = get_job(conn, job_id)
+    if not job or job["user_id"] != user_id:
+        return None
+    formats = json.loads(job.get("formats_json") or "[]")
+    chosen = next((f for f in formats if f.get("id") == fmt_id), None)
+    if not chosen:
+        return None
+    update_job(conn, job_id, chosen_format=fmt_id,
+               result_url=chosen.get("url") or job.get("result_url") or "")
+    return get_job(conn, job_id)
+
+
 def register(router: Router) -> None:
     fr = Router()
 
@@ -618,8 +685,10 @@ def register(router: Router) -> None:
     async def dl_open(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         await state.set_state(DlStates.await_url)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:main")]])
         await callback.message.answer(
-            f"{TITLE}\n\n{EXPLAINER}\n\n{PROMPT_SEND_LINK}")
+            f"{TITLE}\n\n{EXPLAINER}\n\n{PROMPT_SEND_LINK}", reply_markup=kb)
 
     @fr.message(DlStates.await_url, Command("cancel"))
     async def dl_cancel(message: types.Message, state: FSMContext):
@@ -627,6 +696,7 @@ def register(router: Router) -> None:
         await message.answer(EXITED)
 
     @fr.message(DlStates.await_url, F.text)
+    @menu_escape
     async def dl_receive_url(message: types.Message, conn: sqlite3.Connection,
                              config: Config, state: FSMContext):
         text = (message.text or "").strip()
@@ -703,14 +773,9 @@ def register(router: Router) -> None:
             job_id = int(job_id_s)
         except (ValueError, AttributeError):
             return
-        job = get_job(conn, job_id)
-        if not job or job["user_id"] != callback.from_user.id:
+        job = pick_format(conn, job_id, callback.from_user.id, fmt_id)
+        if job is None:
             return
-        formats = json.loads(job.get("formats_json") or "[]")
-        if not any(f.get("id") == fmt_id for f in formats):
-            return
-        update_job(conn, job_id, chosen_format=fmt_id)
-        job = get_job(conn, job_id)
         note = source_note(job["source"])
         await callback.message.edit_text(
             render_job(job), reply_markup=job_keyboard(job_id, job["url"]))

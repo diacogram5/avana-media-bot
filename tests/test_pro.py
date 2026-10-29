@@ -141,7 +141,7 @@ def test_pro_view_empty_texts(db):
     assert pro.T_FAV_EMPTY in text
     assert pro.T_PL_EMPTY in text
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert datas == ["pro:new"]
+    assert datas == ["pro:new", "menu:main"]
 
 
 def test_playlist_view_render(db):

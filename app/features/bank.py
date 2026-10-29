@@ -44,6 +44,7 @@ from aiogram.types import (
     Message,
 )
 
+from ..bot.audio_send import send_song_audio
 from ..config import Config
 
 # --------------------------------------------------------------------------
@@ -1028,8 +1029,11 @@ def register(router: Router) -> None:
         if d.get("artist"):
             caption = f"{caption} – {d['artist']}".strip(" –")
         try:
-            await callback.message.answer_audio(audio=d["file_url"],
-                                                caption=caption or None)
+            sent = await send_song_audio(
+                callback.message, d["file_url"], d.get("title") or "",
+                d.get("artist") or "", caption=caption or None)
+            if sent is None:
+                raise RuntimeError("send failed")
         except Exception:
             await callback.message.answer(MSG_CLIENT_ERR)
 

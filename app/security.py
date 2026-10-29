@@ -17,6 +17,13 @@ ALLOWED_DOMAINS = {
     "youtu.be",
     "instagram.com", "www.instagram.com",
     "aparat.com", "www.aparat.com",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com",
+}
+# Short-link hosts we are willing to resolve (HEAD with redirects) before
+# re-validating the final URL against the rules above.
+SHORTENER_HOSTS = {
+    "bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl",
+    "shorturl.at", "rebrand.ly",
 }
 DIRECT_FILE_EXTENSIONS = {".mp3", ".m4a", ".ogg", ".wav", ".mp4", ".webm", ".mov", ".mkv"}
 
@@ -95,7 +102,8 @@ def validate_link(url: str, resolve_dns: bool = False) -> LinkValidation:
             return LinkValidation(False, "dns_failed", host)
     if host in ALLOWED_DOMAINS:
         kind = "youtube" if "youtube" in host or host == "youtu.be" else (
-            "instagram" if "instagram" in host else "aparat" if "aparat" in host else "video")
+            "instagram" if "instagram" in host else "aparat" if "aparat" in host
+            else "tiktok" if "tiktok" in host else "video")
         return LinkValidation(True, "", host, kind)
     if is_direct_file_url(parsed.path):
         return LinkValidation(True, "", host, "direct_file")
@@ -104,6 +112,30 @@ def validate_link(url: str, resolve_dns: bool = False) -> LinkValidation:
 
 def is_valid_telegram_id(value: str) -> bool:
     return bool(re.fullmatch(r"\d{5,20}", value.strip()))
+
+
+def resolve_short_link(url: str, timeout: float = 8.0) -> str:
+    """Resolve a known short-link host to its final URL (no fetch of body).
+
+    Returns the final URL, or the original URL when the host is not a known
+    shortener or resolution fails. The caller must re-validate the result
+    with :func:`validate_link` before any use.
+    """
+    try:
+        host = (urlparse(url.strip()).hostname or "").lower()
+    except ValueError:
+        return url
+    if host not in SHORTENER_HOSTS:
+        return url
+    try:
+        import httpx
+        with httpx.Client(timeout=timeout, follow_redirects=True,
+                          headers={"User-Agent": "Mozilla/5.0"}) as client:
+            resp = client.head(url, follow_redirects=True)
+        final = str(resp.url)
+        return final if final and final != url else url
+    except Exception:
+        return url
 
 
 def sanitize_text(value: str, max_len: int = 1000) -> str:

@@ -17,10 +17,10 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
 DEFAULT_FEATURES = [
     # Web-parity capabilities menu: unique display_order, exact Persian
-    # titles. visible=1 -> shown in the «قابلیت‌ها» menu; visible=0 ->
-    # buttonless on purpose: link_fetch + audio_id trigger automatically
-    # on send, tts + voice_to_text live behind the OpenAI key gate.
-    # Gating (can_use_feature) checks `enabled` only.
+    # titles. visible=1 -> shown in the «قابلیت‌ها» menu and the persistent
+    # bottom menu; link_fetch + audio_id keep their automatic
+    # trigger-on-send behaviour too, tts + voice_to_text live behind the
+    # OpenAI key gate. Gating (can_use_feature) checks `enabled` only.
     ("song_search", "جستجوی آهنگ و ویدیو", 1, 1, 1),
     ("suggest", "درخواست آهنگ", 2, 1, 1),
     ("downloader", "دانلودر هوشمند", 3, 1, 1),
@@ -29,10 +29,10 @@ DEFAULT_FEATURES = [
     ("clear_chat", "پاک‌سازی گفتگو", 6, 1, 1),
     ("history", "تاریخچه جستجو", 7, 1, 1),
     ("help_support", "راهنما و پشتیبانی", 8, 1, 1),
-    ("audio_id", "شناسایی آهنگ از فایل", 9, 1, 0),
+    ("audio_id", "شناسایی آهنگ از فایل", 9, 1, 1),
     ("tts", "تبدیل متن به ویس", 10, 1, 0),
     ("voice_to_text", "تبدیل ویس به متن", 11, 1, 0),
-    ("link_fetch", "دریافت از لینک", 12, 1, 0),
+    ("link_fetch", "دریافت از لینک", 12, 1, 1),
 ]
 
 DEFAULT_SETTINGS = {

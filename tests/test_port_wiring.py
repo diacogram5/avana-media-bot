@@ -25,17 +25,21 @@ def test_menu_composition_web_order(db):
         "پاک‌سازی گفتگو",
         "تاریخچه جستجو",
         "راهنما و پشتیبانی",
+        "شناسایی آهنگ از فایل",
+        "دریافت از لینک",
     ]
 
 
 def test_feature_visible_enabled_decoupling(db):
-    # Key-gated / auto features are enabled (gate passes) but hidden
-    # from the default audience menu.
+    # Key-gated features are enabled (gate passes) but hidden from the
+    # audience menu; link_fetch + audio_id are both visible AND
+    # auto-triggering (web parity: 10 buttons).
     for key in ("tts", "voice_to_text", "audio_id", "link_fetch"):
         ok, _ = can_use_feature(db, 42, key)
         assert ok, key
     menu_keys = {f["key"] for f in capabilities_menu(db)}
-    assert not ({"tts", "voice_to_text", "audio_id", "link_fetch"} & menu_keys)
+    assert not ({"tts", "voice_to_text"} & menu_keys)
+    assert {"audio_id", "link_fetch"} <= menu_keys
     # Disabling removes it from the menu too.
     dbmod.set_feature(db, "lyrics", enabled=False, by_id=1)
     assert "lyrics" not in {f["key"] for f in capabilities_menu(db)}

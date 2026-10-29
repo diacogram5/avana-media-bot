@@ -128,13 +128,19 @@ def test_channel_accuracy_gate():
 
 
 # --- bot-ID rule + brief errors + web fallback --------------------------------
-def test_bot_id_rule():
+def test_bot_id_rule(db):
+    # No-links policy: the bot ID never appears under media files. Its one
+    # fixed, deliberate place is the welcome/help signature line.
     assert attach_bot_id("سلام", "") == "سلام"
     assert attach_bot_id("سلام", "@MyBot") == "سلام\n@MyBot"
     assert attach_bot_id("سلام\n@MyBot", "@MyBot") == "سلام\n@MyBot"
     caption = professional_audio_caption(_song(), bot_id="@MyBot")
-    assert caption.endswith("@MyBot")
-    assert professional_audio_caption(_song()).endswith("https://music.apple.com/track/7")
+    assert "@MyBot" not in caption
+    assert "https://music.apple.com/track/7" not in caption
+    from app.bot.handlers import _with_signature
+    config = Config(bot_token="x", bot_id="@MyBot")
+    out = _with_signature(db, config, "سلام")
+    assert out.endswith("🤖 @MyBot")
     for kind in ("search", "identify", "file", "lyrics", "voice", "translate", "suggest"):
         msg = brief_error(kind)
         assert len(msg) < 120 and "\n" not in msg

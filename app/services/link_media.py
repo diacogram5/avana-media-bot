@@ -36,6 +36,54 @@ _OG_VIDEO_RE2 = re.compile(
     re.IGNORECASE)
 
 
+_QUALITY_HINT_RE = re.compile(r"(2160|1440|1080|720|480|360|240)p\b", re.IGNORECASE)
+
+
+def _quality_hint(url: str) -> str:
+    """Human quality hint parsed from a file URL, or '' when unknown."""
+    m = _QUALITY_HINT_RE.search(url or "")
+    if m:
+        return f"{m.group(1)}p"
+    low = (url or "").lower()
+    if "uhd" in low or "4k" in low:
+        return "2160p"
+    if re.search(r"[\W_]hd[\W_]", low):
+        return "HD"
+    return ""
+
+
+def extract_video_qualities(page_html: str) -> list[dict]:
+    """Every distinct real video file URL a page advertises.
+
+    Returns [{url, hint}] — hint is a quality hint like "720p" when the
+    URL itself carries one, else "". Pure function (no network); only
+    URLs that pass link validation as direct video files are kept.
+    Empty when the page offers no direct video file at all.
+    """
+    if not page_html:
+        return []
+    raw: list[str] = []
+    for pattern in (_OG_VIDEO_RE, _OG_VIDEO_RE2):
+        for match in pattern.finditer(page_html):
+            raw.append(html.unescape(match.group(1)))
+    for match in _VIDEO_URL_RE.finditer(page_html):
+        raw.append(match.group(1).replace("\\/", "/").replace("\\u0026", "&"))
+    out: list[dict] = []
+    seen_urls: set[str] = set()
+    for url in raw:
+        url = (url or "").strip()
+        if not url or url in seen_urls:
+            continue
+        validation = validate_link(url)
+        if not (validation.ok and validation.kind == "direct_file"):
+            continue
+        if not url.lower().split("?")[0].endswith((".mp4", ".webm", ".mov", ".mkv")):
+            continue
+        seen_urls.add(url)
+        out.append({"url": url, "hint": _quality_hint(url)})
+    return out
+
+
 def extract_media_url(page_html: str) -> str | None:
     """Return the first public media-file URL advertised by a page, or None.
 
@@ -96,6 +144,83 @@ def extract_page_text(page_html: str) -> str:
         text = re.sub(r"<[^>]+>", " ", html.unescape(match.group(1))).strip()
         return text
     return ""
+
+
+def extract_dash_audio_url(page_html: str) -> str | None:
+    """Audio AdaptationSet BaseURL from an embedded DASH manifest, or None.
+
+    Instagram's anonymous page (especially when fetched with a search-
+    engine crawler user-agent) embeds a DASH manifest whose video and
+    audio streams are separate. The audio AdaptationSet's <BaseURL> is
+    a direct public .mp4 that carries the reel's real audio — the bytes
+    Shazam needs. Pure function (no network), unit-testable.
+    """
+    if not page_html:
+        return None
+    text = page_html
+    # Unescape the layers Instagram wraps the manifest in.
+    for _ in range(2):
+        new = (text.replace("\\\\/", "/").replace("\\/", "/")
+                   .replace("\\\\u003C", "<").replace("\\u003C", "<")
+                   .replace('\\\\"', '"').replace('\\"', '"'))
+        new = html.unescape(new)
+        if new == text:
+            break
+        text = new
+    match = re.search(
+        r'<AdaptationSet[^>]*contentType="audio"[^>]*>'
+        r'.*?<BaseURL>(https?://[^<]+)</BaseURL>',
+        text, re.S | re.IGNORECASE)
+    if not match:
+        return None
+    url = match.group(1).strip()
+    validation = validate_link(url)
+    if validation.ok and validation.kind == "direct_file":
+        return url
+    return None
+
+
+def _unescape_manifest(page_html: str) -> str:
+    text = page_html or ""
+    for _ in range(2):
+        new = (text.replace("\\\\/", "/").replace("\\/", "/")
+                   .replace("\\\\u003C", "<").replace("\\u003C", "<")
+                   .replace('\\\\"', '"').replace('\\"', '"'))
+        new = html.unescape(new)
+        if new == text:
+            break
+        text = new
+    return text
+
+
+def extract_dash_video_url(page_html: str) -> str | None:
+    """Best video AdaptationSet BaseURL from an embedded DASH manifest.
+
+    Picks the Representation with the highest bandwidth (best quality).
+    Pure function (no network), unit-testable. Returns None when the
+    manifest has no valid direct video file URL.
+    """
+    text = _unescape_manifest(page_html)
+    if not text:
+        return None
+    aset = re.search(
+        r'<AdaptationSet[^>]*contentType="video"[^>]*>(.*?)</AdaptationSet>',
+        text, re.S | re.IGNORECASE)
+    if not aset:
+        return None
+    best_url, best_bw = None, -1
+    for rep in re.finditer(
+            r'<Representation[^>]*bandwidth="(\d+)"[^>]*>.*?<BaseURL>(https?://[^<]+)</BaseURL>',
+            aset.group(1), re.S | re.IGNORECASE):
+        try:
+            bw = int(rep.group(1))
+        except ValueError:
+            continue
+        url = rep.group(2).strip()
+        validation = validate_link(url)
+        if validation.ok and validation.kind == "direct_file" and bw > best_bw:
+            best_url, best_bw = url, bw
+    return best_url
 
 
 def extract_json_media_url(page_html: str) -> str | None:

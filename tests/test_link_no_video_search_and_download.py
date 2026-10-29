@@ -7,7 +7,9 @@ monkeypatched to record exactly which search flavour was invoked.
 """
 import pytest
 
-from app.bot import handlers
+from aiogram.types import BufferedInputFile
+
+from app.bot import audio_send, handlers
 from app.bot.logic import (
     clean_title, is_video_file_url, link_video_delivery,
     professional_audio_caption,
@@ -46,7 +48,9 @@ def test_professional_audio_caption_is_clean_and_official_only():
     assert clean_title(result) == "Dooset Daram – Mehdi Ahmadvand"
     caption = professional_audio_caption(result)
     assert caption.startswith("Dooset Daram – Mehdi Ahmadvand")
-    assert "https://music.apple.com/track/7" in caption
+    # No-links policy: no source URLs and no bot-ID links under media.
+    assert "https://music.apple.com/track/7" not in caption
+    assert "@" not in caption
     for banned in ("Google", "Spotify", "YouTube Music", "آمار", "جستجو بر اساس هنرمند"):
         assert banned not in caption
 
@@ -85,14 +89,16 @@ class _FakeMessage:
         self.videos = []
         self.audios = []
 
-    async def answer(self, text, reply_markup=None):
+    async def answer(self, text, reply_markup=None, **kwargs):
         self.answers.append(text)
 
-    async def answer_video(self, video, caption=None, reply_markup=None):
+    async def answer_video(self, video, caption=None, reply_markup=None, **kwargs):
         self.videos.append((video, caption))
 
-    async def answer_audio(self, audio, caption=None, reply_markup=None):
+    async def answer_audio(self, audio, caption=None, reply_markup=None, **kwargs):
         self.audios.append((audio, caption, reply_markup))
+        from types import SimpleNamespace
+        return SimpleNamespace(message_id=1)
 
 
 @pytest.mark.asyncio
@@ -153,8 +159,10 @@ async def test_link_handler_platform_video_official_only(monkeypatch, db):
 async def test_do_search_sends_song_download(monkeypatch, db):
     """_do_search: clean list + one professional card, no separate download text.
 
-    The list carries no source/duration/URL clutter, and the song's
-    official download link lives only in the preview audio's caption.
+    The list carries no source/duration/URL clutter. The song audio goes
+    through the unified pipeline (downloaded + re-uploaded as a real
+    audio message, never the raw preview URL), and the caption carries
+    no source URLs (no-links policy).
     """
     async def fake_smart(engine, query, limit=10):
         # Prove the engine given to a text search still includes video
@@ -167,7 +175,12 @@ async def test_do_search_sends_song_download(monkeypatch, db):
             preview_url="https://audio.example.com/preview.m4a",
         )], "Dooset Daram"
 
+    async def fake_download(url):
+        assert url == "https://audio.example.com/preview.m4a"
+        return b"ID3\x04\x00\x00" + b"\x00" * 4096, "mp3"
+
     monkeypatch.setattr(handlers, "smart_search", fake_smart)
+    monkeypatch.setattr(audio_send, "_download", fake_download)
     msg = _FakeMessage("دوست دارم")
     await handlers._do_search(msg, db, "دوست دارم")
     joined = "\n".join(msg.answers)
@@ -175,6 +188,11 @@ async def test_do_search_sends_song_download(monkeypatch, db):
     assert "1. Dooset Daram – Mehdi Ahmadvand" in joined
     assert "(itunes)" not in joined
     assert "⬇️ دانلود آهنگ:" not in joined
-    assert msg.audios and msg.audios[0][0] == "https://audio.example.com/preview.m4a"
-    assert msg.audios[0][1].startswith("Dooset Daram – Mehdi Ahmadvand")
-    assert "https://music.apple.com/track/7" in msg.audios[0][1]
+    assert msg.audios
+    audio, caption, _kb = msg.audios[0]
+    # Pipeline: uploaded file (never the raw CDN URL), clean filename.
+    assert isinstance(audio, BufferedInputFile)
+    assert audio.filename == "Dooset Daram - Mehdi Ahmadvand.mp3"
+    assert caption.startswith("Dooset Daram – Mehdi Ahmadvand")
+    assert "https://music.apple.com/track/7" not in caption
+    assert "🔊" in caption  # honest quality label

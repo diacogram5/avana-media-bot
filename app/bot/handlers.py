@@ -29,6 +29,8 @@ Honesty rules enforced here:
 from __future__ import annotations
 
 import io
+import re
+import secrets
 import sqlite3
 
 import httpx
@@ -36,10 +38,13 @@ from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
-    BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    BufferedInputFile, BotCommand, CopyTextButton, InlineKeyboardButton,
+    InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
 from .. import db as dbmod
+from ..bot.audio_send import send_song_audio
+from ..bot.media_send import answer_no_preview, send_music, send_video
 from ..config import Config
 from ..features import admin as adminfeat
 from ..features import bank as bankfeat
@@ -60,7 +65,7 @@ from ..search.lyrics import (
 )
 from ..search.channel import search_channels
 from ..search.suggest import is_mood_request, suggest_songs
-from ..security import RateLimiter, sanitize_text
+from ..security import RateLimiter, resolve_short_link, sanitize_text
 from ..services.audio_id import AudioIdResult, identify_bytes, identify_url
 from ..services.brain import brain_clean_query
 from ..search.audio_match import fingerprint as audio_fingerprint, find_match as find_audio_match
@@ -72,7 +77,8 @@ from ..services.tts import synthesize
 from .logic import (
     attach_bot_id, brief_error, can_use_feature, capabilities_menu,
     format_results, identified_card_acceptable, link_video_delivery,
-    match_identified_song, professional_audio_caption, welcome_text,
+    match_identified_song, menu_title_key, professional_audio_caption,
+    welcome_text,
 )
 
 log = get_logger(__name__)
@@ -126,14 +132,43 @@ def _blocked(conn, user_id: int) -> bool:
 
 
 @router.message(Command("start"))
+def _with_signature(conn, config: Config, text: str) -> str:
+    """Append the bot-ID signature line: the ONE fixed, deliberate place
+    the bot ID appears on outbound content (welcome/help). Never under
+    media files (no-links policy)."""
+    bot_id = dbmod.get_bot_id(conn, config).strip()
+    if not bot_id:
+        return text
+    if not bot_id.startswith("@") and not bot_id.startswith("http"):
+        bot_id = "@" + bot_id
+    if bot_id in text:
+        return text
+    return f"{text}\n\n🤖 {bot_id}"
+
+
 async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config):
     _register(message, conn)
-    # Minimal: welcome text + one «قابلیت‌ها» button. The menu itself is
-    # dynamic (DB features table); new capabilities surface a button only
-    # when added by the admin. No always-visible command clutter.
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✨ قابلیت‌ها", callback_data="menu:open")]])
-    await _answer(message, conn, welcome_text(conn), reply_markup=kb)
+    # Persistent bottom menu (web parity): the 10 main feature buttons stay
+    # at the bottom of the chat, each wired to its real function. Inline
+    # keyboards remain only for supplementary card operations.
+    await _answer(message, conn, _with_signature(conn, config, welcome_text(conn)),
+                  reply_markup=_main_reply_kb(conn))
+
+
+def _main_reply_kb(conn) -> ReplyKeyboardMarkup:
+    """Permanent bottom menu built from the admin-managed feature list.
+
+    Reflects renames/toggles/reorders automatically: whatever the admin
+    panel shows as visible+enabled is what the user gets at the bottom.
+    """
+    titles = [f["title"] for f in capabilities_menu(conn)]
+    rows = []
+    for i in range(0, len(titles), 2):
+        rows.append([KeyboardButton(text=t) for t in titles[i:i + 2]])
+    if not rows:
+        rows = [[KeyboardButton(text="✨ قابلیت‌ها")]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                               is_persistent=True)
 
 
 def _menu_callback(key: str) -> str | None:
@@ -147,6 +182,8 @@ def _menu_callback(key: str) -> str | None:
         "clear_chat": "adm:clear",
         "history": "menu:history",
         "help_support": "menu:help",
+        "link_fetch": "menu:link",
+        "audio_id": "menu:file",
     }
     if key in mapping:
         return mapping[key]
@@ -172,6 +209,140 @@ async def menu_open(callback, conn: sqlite3.Connection, config: Config):
         adminfeat.track(conn, callback.from_user.id, callback.message.chat.id, sent.message_id)
     except Exception:
         pass
+
+
+@router.callback_query(F.data == "menu:link")
+async def menu_link_hint(callback, conn: sqlite3.Connection, config: Config):
+    await callback.answer()
+    await callback.message.answer(
+        "🔗 لینک اینستاگرام، تیک‌تاک، آپارات یا یوتیوب را بفرستید تا ویدیوی همان لینک و آهنگ آن بررسی شود.")
+
+
+@router.callback_query(F.data == "menu:file")
+async def menu_file_hint(callback, conn: sqlite3.Connection, config: Config):
+    await callback.answer()
+    await callback.message.answer(
+        "🎵 فایل صوتی، ویدیو یا ویس را بفرستید تا آهنگ آن شناسایی شود.")
+
+
+async def _run_menu_title(message: Message, conn: sqlite3.Connection,
+                          config: Config, state: FSMContext | None,
+                          key: str) -> None:
+    """Run the real feature behind a persistent-menu button title.
+
+    Reply-keyboard buttons arrive as plain text; this maps the (possibly
+    admin-renamed) title back to its feature key and performs the same
+    operation the inline «قابلیت‌ها» menu would trigger.
+    """
+    uid = message.from_user.id
+    # A menu tap always escapes any stale conversation state first: the
+    # user can never be trapped in a dead-end step.
+    if state is not None:
+        try:
+            await state.clear()
+        except Exception:
+            pass
+    if key == "song_search":
+        await message.answer(
+            "🔍 نام آهنگ، نام خواننده، بخشی از متن ترانه یا لینک را بفرستید؛ "
+            "فیلم یا فایل صوتی هم خودکار شناسایی می‌شود.")
+    elif key == "suggest":
+        allowed, reason = can_use_feature(conn, uid, "suggest")
+        if not allowed:
+            await message.answer(t(reason, "fa")); return
+        if state is not None:
+            await state.set_state("suggest")
+        await message.answer(t("suggest_prompt", "fa"))
+    elif key == "downloader":
+        allowed, reason = can_use_feature(conn, uid, "downloader")
+        if not allowed:
+            await message.answer(t(reason, "fa")); return
+        if state is not None:
+            await state.set_state(dlfeat.DlStates.await_url)
+        await message.answer(f"{dlfeat.TITLE}\n\n{dlfeat.EXPLAINER}\n\n{dlfeat.PROMPT_SEND_LINK}")
+    elif key == "professional":
+        allowed, reason = can_use_feature(conn, uid, "professional")
+        if not allowed:
+            await message.answer(t(reason, "fa")); return
+        text, kb = profeat._render_pro_view(conn, uid)
+        await message.answer(text, reply_markup=kb)
+    elif key == "lyrics":
+        allowed, reason = can_use_feature(conn, uid, "lyrics")
+        if not allowed:
+            await message.answer(t(reason, "fa")); return
+        if state is not None:
+            await state.set_state("lyr:await_query")
+        await message.answer("📝 نام آهنگ و خواننده را بنویسید، مثلاً: مهدی احمدوند - دوست دارم")
+    elif key == "clear_chat":
+        text, kb = adminfeat.clear_view()
+        await message.answer(text, reply_markup=kb)
+    elif key == "history":
+        items = dbmod.recent_searches(conn, uid, limit=15)
+        if not items:
+            await message.answer("🕘 تاریخچه جستجوهای اخیر\n\nهنوز جستجویی ثبت نشده است.")
+            return
+        import datetime as _dt
+        lines = ["🕘 تاریخچه جستجوهای اخیر"]
+        for it in items:
+            ts = _dt.datetime.fromtimestamp(it["created_at"]).strftime("%m-%d %H:%M")
+            lines.append(f"• {it['query'][:60]} · {ts}")
+        await message.answer("\n".join(lines))
+    elif key == "help_support":
+        await message.answer(t("help", "fa"))
+    elif key == "link_fetch":
+        await message.answer(
+            "🔗 لینک اینستاگرام، تیک‌تاک، آپارات یا یوتیوب را بفرستید تا ویدیوی همان لینک و آهنگ آن بررسی شود.")
+    elif key == "audio_id":
+        await message.answer(
+            "🎵 فایل صوتی، ویدیو یا ویس را بفرستید تا آهنگ آن شناسایی شود.")
+    else:
+        feat = dbmod.get_feature(conn, key)
+        if feat and feat.get("enabled"):
+            await message.answer(feat.get("message") or feat.get("title") or "")
+
+
+def _menu_title_key(conn, text: str) -> str | None:
+    """Backwards-compatible alias (moved to logic.menu_title_key)."""
+    return menu_title_key(conn, text)
+
+
+_LINK_RE = re.compile(
+    r"https?://[^\s<>\"\u200c]+"
+    r"|(?:www\.)?(?:instagram\.com|tiktok\.com|aparat\.com"
+    r"|youtube\.com|youtu\.be)/[^\s<>\"\u200c]*",
+    re.IGNORECASE)
+
+
+def _extract_link(text: str) -> str | None:
+    """Find the first link anywhere in the message text.
+
+    A link must reach the link processor even when it is pasted with
+    surrounding words, without a scheme, or behind a shortener — it must
+    never fall through to the audio/video file prompts or text search.
+    """
+    m = _LINK_RE.search(text or "")
+    if not m:
+        return None
+    url = m.group(0).rstrip(".,;:!?)]}\"'")
+    if not url.lower().startswith("http"):
+        url = "https://" + url
+    return resolve_short_link(url)
+
+
+@router.callback_query(F.data == "menu:main")
+async def menu_main(callback, conn: sqlite3.Connection, config: Config,
+                    state: FSMContext | None = None):
+    """«🏠 منوی اصلی»: escape any flow, clear stale state, land back on
+    the persistent bottom menu. Every submenu links here."""
+    await callback.answer()
+    if state is not None:
+        try:
+            await state.clear()
+        except Exception:
+            pass
+    await callback.message.answer(
+        _with_signature(conn, config, welcome_text(conn)),
+        reply_markup=_main_reply_kb(conn))
 
 
 @router.callback_query(F.data == "menu:search")
@@ -242,7 +413,8 @@ async def cmd_help(message: Message, conn: sqlite3.Connection, config: Config):
     # AI answer. Basic rule-based search still works without the key.
     brain_line = ("🧠 هوش برتر: وصل است (OpenAI)" if config.openai_api_key
                   else "🧠 هوش برتر: وصل نیست؛ برای فهم هوشمند، OPENAI_API_KEY لازم است.")
-    await _answer(message, conn, t("help", "fa") + "\n\n" + brain_line + "\n\n" + t("voice_usage", "fa"),
+    await _answer(message, conn, _with_signature(
+        conn, config, t("help", "fa") + "\n\n" + brain_line + "\n\n" + t("voice_usage", "fa")),
                     reply_markup=kb)
 
 
@@ -407,29 +579,85 @@ async def cmd_voice(message: Message, command: CommandObject,
     _track(conn, message, sent)
 
 
-async def _send_link_video(message: Message, conn, outcome, bot_id: str = "") -> None:
+async def _send_link_video(message: Message, conn, outcome, config=None,
+                           bot_id: str = ""):
     """Send the video of the sent link itself for download — no video search.
 
-    Direct public video file: send that same file. Platform link: send
-    the official video via its official open link. Never fetch private
-    or protected platform content.
+    Direct public video file: send that same file. Instagram: the real
+    video file via the anonymous resolver when fetchable, else the
+    official-link card. Other platforms: the official video via its
+    official open link. Never fetch private or protected platform
+    content. Returns the sent Message (or None) so the caller can fold
+    a later fallback into the same card instead of stacking messages.
     """
+    from aiogram.types import BufferedInputFile
+
     delivery, text = link_video_delivery(outcome)
     if delivery == "direct_video_file":
-        send_video = getattr(message, "answer_video", None)
-        if send_video is not None:
-            try:
-                sent = await send_video(outcome.official_url,
-                                        caption=attach_bot_id("🎬 ویدیوی همان لینک برای دانلود", bot_id))
-                _track(conn, message, sent)
-                return
-            except Exception:
-                pass
+        sent = await send_video(message, outcome.official_url,
+                                caption="🎬 ویدیوی همان لینک برای دانلود")
+        if sent is not None:
+            _track(conn, message, sent)
+            return sent
         await _answer(message, conn, text)
+        return None
+    elif delivery == "platform_official" and outcome.kind == "instagram":
+        sent = await _send_instagram_video_file(message, conn, outcome, config)
+        if sent is not None:
+            return sent
+        sent = await _answer(message, conn, text)
+        return sent
     elif delivery == "platform_official":
-        await _answer(message, conn, text)
+        sent = await _answer(message, conn, text)
+        return sent
     else:  # official_link only (e.g. a direct audio file): show the link, clean.
-        await _answer(message, conn, outcome.official_url)
+        await answer_no_preview(message, outcome.official_url)
+        return None
+
+
+def _looks_like_video(data: bytes) -> bool:
+    if not data or len(data) < 16:
+        return False
+    head = data[:16]
+    return head[4:8] == b"ftyp" or head[:4] == b"\x00\x00\x00\x18"
+
+
+async def _send_instagram_video_file(message: Message, conn, outcome,
+                                     config=None):
+    """Fetch the reel's real video file (anonymous resolver) and send it.
+
+    Returns the sent Message, or None when no fetchable video exists —
+    the caller then falls back to the official-link card. Size-capped;
+    the bytes must look like a real video container.
+    """
+    from aiogram.types import BufferedInputFile
+
+    try:
+        from ..services.instagram import resolve_instagram_media
+        _audio_url, video_url, _page_text, _strategy = \
+            await resolve_instagram_media(outcome.official_url)
+    except Exception:
+        return None
+    if not video_url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0",
+                   "Referer": "https://www.instagram.com/"}
+        async with httpx.AsyncClient(timeout=40) as client:
+            resp = await client.get(video_url, headers=headers)
+            resp.raise_for_status()
+            data = resp.content
+    except Exception:
+        return None
+    max_mb = getattr(config, "max_file_mb", 50) if config is not None else 50
+    if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
+        return None
+    sent = await send_video(
+        message, BufferedInputFile(data, filename="video.mp4"),
+        caption="🎬 ویدیوی همان لینک برای دانلود")
+    if sent is not None:
+        _track(conn, message, sent)
+    return sent
 
 
 def _forward_channel(message) -> str:
@@ -529,6 +757,21 @@ async def _identify_audio(data: bytes, filename: str, config: Config) -> AudioId
     return AudioIdResult(status="error")
 
 
+def _link_platform_name(kind: str) -> str:
+    return {"instagram": "اینستاگرام", "youtube": "یوتیوب",
+            "aparat": "آپارات", "tiktok": "تیک‌تاک"}.get(kind, "این سرویس")
+
+
+def _link_needs_file_card(outcome) -> str:
+    """The single compact card for a link whose media the platform did
+    not hand over: video-link line + one honest line. One message,
+    never a stack of video-link + nag + channel notice."""
+    platform = _link_platform_name(outcome.kind)
+    return ("🎬 ویدیوی همان لینک:\n" + outcome.official_url +
+            f"\n\n⚠️ {platform} فایل ویدیو را به بات نداد؛ "
+            "برای شناسایی آهنگ، خود ویدیو را مستقیم بفرستید.")
+
+
 async def _identify_link_audio(outcome, config: Config):
     """Identify a sent link's audio.
 
@@ -542,14 +785,12 @@ async def _identify_link_audio(outcome, config: Config):
       AudD's social-video URL identification if a token is set.
     - Otherwise needs_file=True: the user should send the video itself.
 
-    REAL LIMIT, stated plainly: Instagram pages in practice do NOT
-    advertise a public media file (JS-rendered / login-walled), so
-    media_url is usually None and no audio is available to fingerprint.
-    That — not a search bug — is why an Instagram link alone used to
-    end at "send the video". The caller must therefore still run the
-    channel stage on page_text (below) and say so, instead of stopping
-    silently. Downloaded bytes are used only for fingerprinting and
-    then discarded.
+    Instagram: the multi-strategy anonymous resolver (page -> embed ->
+    captioned embed -> crawler DASH) often yields real media bytes without
+    any login. When it yields nothing, the caller still runs the channel
+    stage on page_text and says so honestly, instead of stopping silently.
+    Downloaded bytes are used for fingerprinting; the watchable video
+    file (when separately resolvable) is sent to the user by the caller.
     """
     url = outcome.official_url
     if outcome.kind == "direct_file":
@@ -566,18 +807,30 @@ async def _identify_link_audio(outcome, config: Config):
         return (result.status, result.title, result.artist, False, "", data)
     media_url = None
     page_text = ""
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            page = resp.text[:2_000_000] if resp.status_code == 200 else ""
-        media_url = extract_media_url(page)
-        page_text = extract_page_text(page)
-    except Exception:
-        media_url = None
+    strategy = "none"
+    if outcome.kind == "instagram":
+        # Multi-strategy anonymous resolver (page -> embed ->
+        # captioned embed -> crawler DASH audio). No login, no cookies.
+        try:
+            from ..services.instagram import resolve_instagram_media
+            media_url, _video_url, page_text, strategy = await resolve_instagram_media(url)
+        except Exception:
+            media_url, _video_url, page_text, strategy = None, None, "", "none"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                page = resp.text[:2_000_000] if resp.status_code == 200 else ""
+            media_url = extract_media_url(page)
+            page_text = extract_page_text(page)
+        except Exception:
+            media_url = None
     if media_url:
         try:
+            headers = {"User-Agent": "Mozilla/5.0",
+                       "Referer": "https://www.instagram.com/"}
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(media_url)
+                resp = await client.get(media_url, headers=headers)
                 resp.raise_for_status()
                 data = resp.content
             if len(data) <= config.max_file_mb * 1024 * 1024:
@@ -601,26 +854,29 @@ async def _run_link_channel_stage(message, conn, config, page_text: str) -> bool
 
     Previously this stage never ran on links at all (no query text),
     so a channel-only AI song had zero chance. Now: if the page
-    advertised title/caption text, that text is the query; if no
-    channels are configured, that is said briefly instead of skipping
-    silently; a found post is labelled as a channel post, never as an
-    identified catalog song. Returns True if a post was sent.
+    advertised title/caption text, that text is the query. The stage
+    stays silent unless it has a real post to show: no public nag
+    about channel settings — the owner alone gets one pointer to the
+    admin panel bank section.
+    Returns True if a post was sent.
     """
     if config is None:
         return False
     channels = dbmod.get_channels(conn, config)
     if not channels:
-        await _answer(message, conn, t("channel_not_configured", "fa"))
+        if message.from_user.id == (config.owner_id or -1):
+            await _answer(
+                message, conn,
+                "📡 بانک هوش برتر هنوز چنلی ندارد؛ از «🛡 پنل مدیریت» ← "
+                "«🏦 بانک هوش برتر» چنل اضافه و ایندکس کنید.")
         return False
     if not (page_text or "").strip():
-        await _answer(message, conn, t("channel_no_result", "fa"))
         return False
     try:
         posts = await search_channels(channels, page_text)
     except Exception:
         posts = []
     if not posts:
-        await _answer(message, conn, t("channel_no_result", "fa"))
         return False
     post = posts[0]
     await _answer(message, conn,
@@ -633,12 +889,17 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                                        own_media: tuple[str, str] | None = None):
     """One clean card for an identified song.
 
-    - Exact catalog match (version-aware) -> audio card with the pro
+    Delivery order (full-version-first):
+    1. The FULL same-version file from existing sources, sent as a real
+       Telegram audio message (never a document, never a short preview).
+    2. Only if no full version exists: the user's own media re-sent as a
+       clearly-labelled replacement.
+    3. Otherwise an honest "full version not found" message with the
+       similar-songs and bank buttons. A short catalog preview is never
+       presented as the song.
+
+    - Exact catalog match (version-aware) -> the card keeps the pro
       buttons (heart / lyrics / add-to-playlist). Never a nearest song.
-    - Identified but no catalog file -> the FULL same-version file first
-      (find_full_song_file); only if none, the user's own media re-sent
-      as a clearly-labelled replacement; then the honest message plus
-      the similar-songs and bank buttons.
     """
     query = f"{title} {artist}".strip()
     engine = SearchEngine([ITunesProvider(entity="song"), DeezerProvider()])
@@ -654,62 +915,63 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         (getattr(match, "preview_url", "") or "") if match else "")
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    if match is not None:
-        if match.preview_url:
-            send_audio = getattr(message, "answer_audio", None)
-            if send_audio is not None:
-                try:
-                    sent = await send_audio(match.preview_url,
-                                            caption=professional_audio_caption(match, bot_id),
-                                            reply_markup=kb)
-                    _track(conn, message, sent)
-                    return
-                except Exception:
-                    pass
-        await _answer(message, conn, professional_audio_caption(match, bot_id), reply_markup=kb)
-        return
-    # Identified, but no catalog file: full-version-first.
+    # 1) FULL VERSION FIRST. (Argument order is (artist, title); a swapped
+    # call silently searched the wrong query and never found anything.)
     full = None
     try:
-        full = await find_full_song_file(title, artist)
+        full = await find_full_song_file(artist, title)
     except Exception:
         full = None
     if full:
         dur = full["duration_sec"]
         label = (f" — مدت: {int(dur // 60)}:{int(dur % 60):02d}" if dur < 90
                  else " — مدت کامل: بیش از ۹۰ ثانیه")
-        try:
-            sent = await message.answer_audio(
-                BufferedInputFile(full["data"], filename=f"{title[:60]}.{full['ext']}"),
-                caption=attach_bot_id(
-                    f"🎵 نسخه کامل آهنگ پیدا و آماده شد{label}\n{title} – {artist}", bot_id),
-                reply_markup=kb)
+        # Real MP3 delivery via the unified pipeline: genuine conversion
+        # when needed, honest probed bitrate, proper AUDIO message.
+        # Telegram's Bot API upload limit is 50 MB.
+        full_data = full["data"] or b""
+        sent = None
+        if full_data and len(full_data) <= 50 * 1024 * 1024:
+            sent = await send_music(
+                message, full_data, title, artist,
+                caption=f"🎵 نسخه کامل آهنگ پیدا و آماده شد{label}\n{title} – {artist}",
+                reply_markup=kb, duration=int(dur) if dur else None)
+        if sent is not None:
             _track(conn, message, sent)
             return
-        except Exception:
-            pass
-    # No full file: the user's own media as a labelled replacement (if any).
+    # 2) No full file: the user's own media as a labelled replacement (if any).
     # Kept button-free and minimal; the 🔎 second search belongs to the
     # not-identified flows (media/link not-found), where it is offered.
     if own_media is not None:
         kind, file_id = own_media
-        cap = attach_bot_id(
-            "آهنگ شناسایی شد، اما فایل اصلی آن برای پخش پیدا نشد؛ صدای موجود در ویدیوی شما "
-            "به‌عنوان فایل صوتی ارسال شد. می‌توانید برای یافتن نسخه کامل یا نسخه‌های دیگر، "
-            "جست‌وجوی تکمیلی انجام دهید.", bot_id)
+        cap = ("آهنگ شناسایی شد، اما نسخه کامل آن برای دانلود پیدا نشد؛ صدای موجود در ویدیوی شما "
+               "به‌عنوان فایل صوتی ارسال شد. می‌توانید برای یافتن نسخه کامل یا نسخه‌های دیگر، "
+               "جست‌وجوی تکمیلی انجام دهید.")
         try:
             if kind == "video":
-                sent = await message.answer_video(file_id, caption=cap)
+                sent = await send_video(message, file_id, caption=cap)
             elif kind == "voice":
                 sent = await message.answer_voice(file_id, caption=cap)
             else:
-                sent = await message.answer_audio(file_id, caption=cap)
-            _track(conn, message, sent)
-            return
+                sent = await send_song_audio(
+                    message, file_id, title, artist, caption=cap)
+            if sent is not None:
+                _track(conn, message, sent)
+                return
         except Exception:
             pass
+    # 3) Honest "full version not found" + more-search options. A short
+    # preview is never presented as the song.
+    more_kb_rows = list(kb.inline_keyboard)
+    more_kb_rows.append([InlineKeyboardButton(
+        text=t("similar_songs", "fa"), callback_data=f"similar:{query[:60]}")])
+    if bank_token:
+        more_kb_rows.append([InlineKeyboardButton(
+            text="🔎 جست‌وجو در بانک هوش برتر",
+            callback_data=f"bank:search:{bank_token}")])
     await _answer(message, conn,
-                  f"{title} – {artist}\nآهنگ شناسایی شد، اما فایلش برای پخش پیدا نشد.")
+                  f"«{title}» از {artist} شناسایی شد، اما نسخه کامل آن برای دانلود پیدا نشد.",
+                  reply_markup=InlineKeyboardMarkup(inline_keyboard=more_kb_rows))
 
 
 def _openai_ready(conn, config) -> tuple[str, bool]:
@@ -822,16 +1084,13 @@ async def _do_search(message: Message, conn, query: str, include_video: bool = T
         kb2 = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
         bot_id = dbmod.get_bot_id(conn, config) if config is not None else ""
         if song.preview_url:
-            send_audio = getattr(message, "answer_audio", None)
-            if send_audio is not None:
-                try:
-                    sent = await send_audio(song.preview_url,
-                                            caption=professional_audio_caption(song, bot_id),
-                                            reply_markup=kb2)
-                    _track(conn, message, sent)
-                    return
-                except Exception:
-                    pass
+            sent = await send_song_audio(
+                message, song.preview_url, song.title, song.artist,
+                caption=professional_audio_caption(song, bot_id),
+                reply_markup=kb2, duration=song.duration)
+            if sent is not None:
+                _track(conn, message, sent)
+                return
         await _answer(message, conn, professional_audio_caption(song, bot_id), reply_markup=kb2)
 
 
@@ -887,6 +1146,13 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             current_state = await state.get_state()
         except Exception:
             current_state = None
+    if title_key := _menu_title_key(conn, text):
+        # Persistent bottom-menu button: run its real feature, not a search.
+        # Checked before the state branches so a menu tap always escapes a
+        # stale conversation state (feature state handlers are additionally
+        # guarded by the menu_escape decorator).
+        await _run_menu_title(message, conn, config, state, title_key)
+        return
     if current_state == "suggest":
         try:
             await state.clear()
@@ -901,19 +1167,23 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             pass
         await _run_lyrics_search(message, conn, text, config)
         return
-    if text.startswith("http://") or text.startswith("https://") or "://" in text:
+    link_url = _extract_link(text)
+    if link_url:
         # Intent from a link is deterministic (no button, no brain call
         # needed): the link's own video, then its audio identification.
+        # Detection finds the URL anywhere in the text, so a pasted link
+        # never falls through to the file prompts or text search.
         allowed, reason = can_use_feature(conn, message.from_user.id, "link_fetch")
         if not allowed:
             await message.answer(t(reason, "fa")); return
-        outcome = process_link(text, config.max_file_mb)
+        outcome = process_link(link_url, config.max_file_mb)
         if not outcome.ok:
             await message.answer(t(outcome.message, "fa")); return
         # Professional minimal link flow: video, then one clean song card.
         # No catalog video search, no video section, no button grid, no
         # empty "not found" boxes.
-        await _send_link_video(message, conn, outcome, bot_id=dbmod.get_bot_id(conn, config))
+        video_msg = await _send_link_video(message, conn, outcome, config,
+                                           bot_id=dbmod.get_bot_id(conn, config))
         # Cached identification first: same link must not re-burn
         # Shazam/AudD lookups (token/API cost).
         import json as _json
@@ -946,11 +1216,26 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         elif needs_file:
             _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                           heard or None, outcome.official_url, page_text)
-            await _answer(message, conn, t("send_video_for_identification", "fa"),
-                          reply_markup=_bank_button(_tok))
+            # ONE compact card: fold the fallback into the already-sent
+            # video message instead of stacking three messages. Media
+            # messages take edit_caption; text messages take edit_text.
+            card = _link_needs_file_card(outcome)
+            kb = _bank_button(_tok)
+            folded = False
+            if video_msg is not None:
+                try:
+                    if getattr(video_msg, "video", None) or getattr(video_msg, "audio", None):
+                        await video_msg.edit_caption(caption=card, reply_markup=kb)
+                    else:
+                        await video_msg.edit_text(card, reply_markup=kb)
+                    folded = True
+                except Exception:
+                    folded = False
+            if not folded:
+                await _answer(message, conn, card, reply_markup=kb)
             # Channel stage was previously never run on links: run it
-            # now on the page's advertised text, or say channels are
-            # not configured — never skip silently.
+            # now on the page's advertised text; it stays silent unless
+            # it has a real post to show (no public nag).
             await _run_link_channel_stage(message, conn, config, page_text)
         else:
             _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
@@ -1087,11 +1372,12 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         # AI/channel-only fallback: the user's own file, labelled honestly
         # (never claimed identified), sent back for download with bot ID.
         try:
-            cap = attach_bot_id(t("ai_channel_note", "fa"), dbmod.get_bot_id(conn, config))
+            cap = t("ai_channel_note", "fa")
             if message.video is not None:
-                sent = await message.answer_video(media.file_id, caption=cap)
+                sent = await send_video(message, media.file_id, caption=cap)
             elif message.audio is not None:
-                sent = await message.answer_audio(media.file_id, caption=cap)
+                sent = await send_song_audio(
+                    message, media.file_id, "", "", caption=cap)
             else:
                 sent = None
             if sent is not None:
@@ -1131,27 +1417,99 @@ async def _run_suggest(message, conn, text: str, config):
         await _answer(message, conn, "برای این حال‌وهوا آهنگ مناسبی پیدا نشد؛ جور دیگری بنویسید، مثلاً: «شاد برای رانندگی».")
         return
     dbmod.record_search(conn, message.from_user.id, text, source="suggest", ok=True)
-    lines = [f"🎧 پیشنهاد برای: {mood}"]
-    for r in results[:5]:
-        lines.append(f"• {r.title} – {r.artist}" if r.artist else f"• {r.title}")
-    await _answer(message, conn, "\n".join(lines))
-    first = results[0]
-    key = profeat.remember_result(first.title, first.artist, first.url, first.preview_url)
-    is_fav = profeat.is_favorite(conn, message.from_user.id, first.title, first.artist)
-    kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    if first.preview_url:
-        send_audio = getattr(message, "answer_audio", None)
-        if send_audio is not None:
-            try:
-                sent = await send_audio(first.preview_url,
-                                        caption=professional_audio_caption(first, dbmod.get_bot_id(conn, config)),
-                                        reply_markup=kb)
-                _track(conn, message, sent)
-                return
-            except Exception:
-                pass
-    await _answer(message, conn, professional_audio_caption(first, dbmod.get_bot_id(conn, config)),
-                  reply_markup=kb)
+    # 3–5 genuinely relevant suggestions, deduplicated, each with its OWN
+    # button to get that song. Never inflated: if fewer valid results
+    # exist, show exactly those and say so honestly.
+    seen: set[tuple[str, str]] = set()
+    uniq = []
+    for r in results:
+        k = ((r.title or "").strip().lower(), (r.artist or "").strip().lower())
+        if k[0] and k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    picks, rest = uniq[:5], uniq[5:]
+    more_tok = secrets.token_hex(6) if rest else ""
+    if more_tok:
+        _SUGGEST_MORE[more_tok] = rest
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    lines = [f"🎧 {len(picks)} پیشنهاد برای: {mood}"]
+    for i, r in enumerate(picks, 1):
+        key = profeat.remember_result(r.title, r.artist, r.url, r.preview_url)
+        info = f"{r.title} – {r.artist}" if r.artist else r.title
+        extra = ""
+        try:
+            if getattr(r, "duration", None):
+                d = int(r.duration)
+                extra = f" · {d // 60}:{d % 60:02d}"
+        except (TypeError, ValueError):
+            extra = ""
+        lines.append(f"{i}. {info}{extra}")
+        label = f"▶️ {r.title[:28]}" + (f" – {r.artist[:20]}" if r.artist else "")
+        kb_rows.append([InlineKeyboardButton(text=label,
+                                            callback_data=f"sg:get:{key}")])
+    extra_row = [InlineKeyboardButton(text="🎵 آهنگ‌های مشابه",
+                                      callback_data=f"similar:{text[:50]}")]
+    if more_tok:
+        extra_row.append(InlineKeyboardButton(text="➕ پیشنهادهای بیشتر",
+                                              callback_data=f"sg:more:{more_tok}"))
+    extra_row.append(InlineKeyboardButton(text="🔄 جستجوی مجدد",
+                                          callback_data="sg:retry"))
+    kb_rows.append(extra_row)
+    await _answer(message, conn, "\n".join(lines),
+                  reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+_SUGGEST_MORE: dict[str, list] = {}
+
+
+@router.callback_query(F.data.startswith("sg:get:"))
+async def suggest_get(callback, conn: sqlite3.Connection, config: Config):
+    """One suggestion's own button: deliver that exact song (full-version-first)."""
+    key = callback.data.split("sg:get:", 1)[1]
+    res = profeat.get_result(key)
+    if not res:
+        await callback.answer(brief_error("generic"), show_alert=True); return
+    await callback.answer()
+    await _send_professional_song_card(
+        callback.message, conn, res["title"], res.get("artist", ""),
+        bot_id=dbmod.get_bot_id(conn, config))
+
+
+@router.callback_query(F.data.startswith("sg:more:"))
+async def suggest_more(callback, conn: sqlite3.Connection, config: Config):
+    tok = callback.data.split("sg:more:", 1)[1]
+    rest = _SUGGEST_MORE.get(tok) or []
+    if not rest:
+        await callback.answer("پیشنهاد بیشتری نیست.", show_alert=True); return
+    picks, remaining = rest[:5], rest[5:]
+    if remaining:
+        _SUGGEST_MORE[tok] = remaining
+    else:
+        _SUGGEST_MORE.pop(tok, None)
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    lines = [f"🎧 {len(picks)} پیشنهاد بیشتر:"]
+    for i, r in enumerate(picks, 1):
+        key = profeat.remember_result(r.title, r.artist, r.url, r.preview_url)
+        info = f"{r.title} – {r.artist}" if r.artist else r.title
+        lines.append(f"{i}. {info}")
+        label = f"▶️ {r.title[:28]}" + (f" – {r.artist[:20]}" if r.artist else "")
+        kb_rows.append([InlineKeyboardButton(text=label,
+                                            callback_data=f"sg:get:{key}")])
+    if remaining:
+        kb_rows.append([InlineKeyboardButton(text="➕ پیشنهادهای بیشتر",
+                                            callback_data=f"sg:more:{tok}")])
+    await callback.answer()
+    await callback.message.answer("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(
+                                      inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data == "sg:retry")
+async def suggest_retry(callback, conn: sqlite3.Connection, config: Config,
+                        state: FSMContext):
+    await state.set_state("suggest")
+    await callback.answer()
+    await callback.message.answer(t("suggest_prompt", "fa"))
 
 
 def _lyrics_picker_kb(page: int, key: str) -> InlineKeyboardMarkup:
@@ -1211,10 +1569,8 @@ async def lyrics_callback(callback, conn: sqlite3.Connection, config: Config):
             await callback.message.answer(lyrics_not_found_text(q))
         return
     LYRICS_CACHE[key] = (result["title"], result.get("artist", ""), lyrics)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌐 ترجمه", callback_data=f"tr:{key}"),
-        InlineKeyboardButton(text="📋 کپی متن آهنگ", callback_data=f"cp:{key}"),
-    ]])
+    kb = _lyrics_card_kb(key, result["title"], result.get("artist", ""),
+                         lyrics, conn, config)
     header = f"📝 متن آهنگ «{result['title']}»"
     if result.get("artist"):
         header += f" — {result['artist']}"
@@ -1226,6 +1582,41 @@ async def lyrics_callback(callback, conn: sqlite3.Connection, config: Config):
         adminfeat.track(conn, callback.from_user.id, callback.message.chat.id, sent.message_id)
     except Exception:
         pass
+
+
+_COPY_TEXT_LIMIT = 240  # Bot API CopyTextButton.text allows 1-256 chars
+
+
+def _copy_button(label: str, text_to_copy: str,
+                 callback_data: str) -> InlineKeyboardButton:
+    """One-click copy button.
+
+    When the text fits the Bot API ``copy_text`` limit the button copies
+    it to the clipboard with a single tap — no second step. Longer texts
+    fall back to a callback that sends a long-press-to-copy message; the
+    bot never claims a copy happened unless it really did.
+    """
+    if text_to_copy and len(text_to_copy) <= _COPY_TEXT_LIMIT:
+        return InlineKeyboardButton(
+            text=label, copy_text=CopyTextButton(text=text_to_copy))
+    return InlineKeyboardButton(text=label, callback_data=callback_data)
+
+
+def _lyrics_share_text(title: str, artist: str, lyrics: str,
+                       conn, config) -> str:
+    """Copy/share version of lyrics: bot ID appended, chat text untouched."""
+    header = (title or "") + (f" – {artist}" if artist else "")
+    return attach_bot_id(f"{header}\n\n{(lyrics or '')[:3000]}",
+                         dbmod.get_bot_id(conn, config))
+
+
+def _lyrics_card_kb(key: str, title: str, artist: str, lyrics: str,
+                    conn, config) -> InlineKeyboardMarkup:
+    share = _lyrics_share_text(title, artist, lyrics, conn, config)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🌐 ترجمه", callback_data=f"tr:{key}"),
+        _copy_button("📋 کپی متن آهنگ", share, f"cp:{key}"),
+    ]])
 
 
 @router.callback_query(F.data.startswith("tr:"))
@@ -1279,8 +1670,9 @@ async def translate_callback(callback, conn: sqlite3.Connection, config: Config)
     if not translated:
         await callback.message.answer("ترجمه این متن پیدا نشد؛ دوباره تلاش کنید."); return
     TRANSLATIONS[(key, lang)] = translated
+    _share = attach_bot_id(translated[:3000], dbmod.get_bot_id(conn, config))
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📋 کپی ترجمه", callback_data=f"ltc:{key}:{lang}"),
+        _copy_button("📋 کپی ترجمه", _share, f"ltc:{key}:{lang}"),
     ]])
     header = f"🌐 ترجمه ({LANG_NAMES.get(lang, lang)}): {title}"
     if artist:
@@ -1298,10 +1690,11 @@ async def translate_copy_callback(callback, conn: sqlite3.Connection, config: Co
     translated = TRANSLATIONS.get((key, lang))
     if not translated:
         await callback.answer(brief_error("translate"), show_alert=True); return
-    await callback.answer("کپی شد")
-    # Copy/share version: bot ID appended; the chat messages stay clean.
+    await callback.answer()
+    # Honest long-press copy: bots have no clipboard API for long texts,
+    # so a copy is never claimed unless the copy_text button did it.
     shared = attach_bot_id(translated[:3000], dbmod.get_bot_id(conn, config))
-    await callback.message.answer(f"📋 کپی ترجمه:\n```\n{shared}\n```", parse_mode="Markdown")
+    await callback.message.answer(f"📋 برای کپی، متن زیر را نگه دارید:\n```\n{shared}\n```", parse_mode="Markdown")
 
 
 @router.callback_query(F.data.startswith("cp:"))
@@ -1310,12 +1703,13 @@ async def copy_callback(callback, conn: sqlite3.Connection, config: Config):
     got = await _lyrics_text_for(key, conn)
     if got is None:
         await callback.answer(brief_error("lyrics"), show_alert=True); return
-    await callback.answer("کپی شد")
+    await callback.answer()
     title, artist, lyrics = got
-    # Copy/share version: bot ID appended; the main lyrics message stays clean.
-    shared = attach_bot_id(f"{title}" + (f" – {artist}" if artist else "") + f"\n\n{lyrics[:3000]}",
-                           dbmod.get_bot_id(conn, config))
-    await callback.message.answer(f"📋 کپی متن آهنگ:\n```\n{shared}\n```", parse_mode="Markdown")
+    # Honest long-press copy: bots have no clipboard API for long texts,
+    # so a copy is never claimed unless the copy_text button did it.
+    shared = _lyrics_share_text(title, artist, lyrics, conn, config)
+    await callback.message.answer(
+        f"📋 برای کپی، متن زیر را نگه دارید:\n```\n{shared}\n```", parse_mode="Markdown")
 
 
 @router.callback_query(F.data.startswith("similar:"))
@@ -1353,10 +1747,7 @@ async def _run_lyrics_search(message: Message, conn, text: str, config):
         return
     key = profeat.remember_result(title, artist, "", "")
     LYRICS_CACHE[key] = (title, artist, lyrics)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌐 ترجمه", callback_data=f"tr:{key}"),
-        InlineKeyboardButton(text="📋 کپی متن آهنگ", callback_data=f"cp:{key}"),
-    ]])
+    kb = _lyrics_card_kb(key, title, artist, lyrics, conn, config)
     header = f"📝 متن آهنگ «{title}»" + (f" — {artist}" if artist else "")
     src = f"\nمنبع: {source}" if source else ""
     await _answer(message, conn, f"{header}\n\n{lyrics[:3500]}{src}", reply_markup=kb)
@@ -1377,6 +1768,50 @@ def build_dispatcher(conn: sqlite3.Connection, config: Config) -> Dispatcher:
     return dp
 
 
+def _install_ad_hook(bot, conn, config: Config) -> None:
+    """Attach the active audience ad after every Nth text answer.
+
+    Wraps ``bot.send_message`` (the choke point every ``message.answer``
+    funnels through, in handlers and feature modules alike). Never fires
+    for the owner; the ad itself is sent through the original methods so
+    it is never counted and never recurses. Best effort: ad failures must
+    never break the real answer.
+    """
+    from .ads import ad_due, pick_active_ad, send_ad
+
+    _orig_send_message = bot.send_message
+    _orig_send_photo = bot.send_photo
+
+    async def send_message_with_ads(chat_id, text, *args, **kwargs):
+        sent = await _orig_send_message(chat_id, text, *args, **kwargs)
+        try:
+            uid = chat_id if isinstance(chat_id, int) else None
+            if uid is None:
+                return sent
+            if config.owner_id is not None and uid == config.owner_id:
+                return sent
+            if ad_due(conn, uid):
+                ad = pick_active_ad(conn)
+                if ad:
+                    await send_ad(bot, chat_id, ad,
+                                  _send_message=_orig_send_message,
+                                  _send_photo=_orig_send_photo)
+        except Exception as exc:
+            log.warning("ad hook failed: %s", exc)
+        return sent
+
+    bot.send_message = send_message_with_ads  # type: ignore[method-assign]
+
+
+def _bot_commands() -> list[BotCommand]:
+    """Minimal professional command menu (the user-facing Menu button)."""
+    return [
+        BotCommand(command="start", description="شروع"),
+        BotCommand(command="help", description="راهنما"),
+        BotCommand(command="admin", description="پنل مدیریت"),
+    ]
+
+
 async def run_bot(config: Config) -> None:
     from ..db import init_db
 
@@ -1391,6 +1826,12 @@ async def run_bot(config: Config) -> None:
         web = start_web_panel(config.db_path, config)
     from aiogram import Bot
     bot = Bot(token=config.bot_token)
+    # Minimal professional command menu (the user-facing Menu button).
+    try:
+        await bot.set_my_commands(_bot_commands())
+    except Exception as exc:
+        log.warning("set_my_commands failed: %s", exc)
+    _install_ad_hook(bot, conn, config)
     dp = build_dispatcher(conn, config)
     log_event(log, "bot_start", **config.safe_summary())
     try:

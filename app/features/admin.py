@@ -25,6 +25,7 @@ from aiogram.types import (
 )
 
 from .. import db as dbmod
+from ..bot.logic import menu_escape
 
 # --- brief failure lines (one short Persian line per failure) ---------------
 BRIEF = {
@@ -304,8 +305,13 @@ def ad_render(ad: dict) -> str:
 
 def ads_view(conn: sqlite3.Connection) -> tuple[str, InlineKeyboardMarkup]:
     ads = list_ads_full(conn)
-    lines = ["📢 تبلیغات", "", ADS_EXPLAINER, ""]
-    rows = [[_btn("➕ ساخت تبلیغ جدید", "adm:ad:new")]]
+    from ..bot.ads import ad_every_n
+    every = ad_every_n(conn)
+    lines = ["📢 تبلیغات", "",
+             f"نمایش خودکار به کاربران: هر {every} پاسخ (به مالک نمایش داده نمی‌شود)",
+             "", ADS_EXPLAINER, ""]
+    rows = [[_btn("➕ ساخت تبلیغ جدید", "adm:ad:new"),
+             _btn("⚙ فاصله نمایش", "adm:ad:every")]]
     if not ads:
         lines.append(ADS_EMPTY)
     for ad in ads:
@@ -562,6 +568,7 @@ class AdmStates(StatesGroup):
     ad_link = State(state="adm:ad:link")
     ad_button = State(state="adm:ad:button")
     ad_edit = State(state="adm:ad:edit")
+    ad_every = State(state="adm:ad:every")
     key_input = State(state="adm:key")
     set_value = State(state="adm:set:value")
 
@@ -639,6 +646,7 @@ def register(router: Router) -> None:
             f"نام فعلی: {feat['title']}\nنام جدید دکمه را بنویسید (حداکثر ۸۰ کاراکتر):")
 
     @ar.message(AdmStates.feat_rename, F.text)
+    @menu_escape
     @_owner_only
     async def feat_rename_save(message: Message, conn: sqlite3.Connection,
                                config, state: FSMContext):
@@ -662,6 +670,7 @@ def register(router: Router) -> None:
         await callback.message.answer("نام دکمه (مثلاً: قوانین استفاده)")
 
     @ar.message(AdmStates.feat_add_name, F.text)
+    @menu_escape
     @_owner_only
     async def feat_add_name(message: Message, conn: sqlite3.Connection,
                             config, state: FSMContext):
@@ -677,6 +686,7 @@ def register(router: Router) -> None:
         await message.answer("متن پاسخ دکمه (وقتی کاربر آن را می‌زند)")
 
     @ar.message(AdmStates.feat_add_text, F.text)
+    @menu_escape
     @_owner_only
     async def feat_add_text(message: Message, conn: sqlite3.Connection,
                             config, state: FSMContext):
@@ -783,6 +793,7 @@ def register(router: Router) -> None:
         await msg.answer(f"✅ تبلیغ ساخته شد.\n\n{ad_render(saved)}", reply_markup=kb)
 
     @ar.message(AdmStates.ad_title, F.text)
+    @menu_escape
     @_owner_only
     async def ad_title_got(message: Message, conn: sqlite3.Connection,
                            config, state: FSMContext):
@@ -799,6 +810,7 @@ def register(router: Router) -> None:
                              reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
 
     @ar.message(AdmStates.ad_desc, F.text)
+    @menu_escape
     @_owner_only
     async def ad_desc_got(message: Message, conn: sqlite3.Connection,
                           config, state: FSMContext):
@@ -815,6 +827,7 @@ def register(router: Router) -> None:
                              reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
 
     @ar.message(AdmStates.ad_link, F.text)
+    @menu_escape
     @_owner_only
     async def ad_link_got(message: Message, conn: sqlite3.Connection,
                           config, state: FSMContext):
@@ -827,6 +840,7 @@ def register(router: Router) -> None:
                              reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
 
     @ar.message(AdmStates.ad_button, F.text)
+    @menu_escape
     @_owner_only
     async def ad_button_got(message: Message, conn: sqlite3.Connection,
                             config, state: FSMContext):
@@ -836,6 +850,35 @@ def register(router: Router) -> None:
         await state.update_data(ad=ad)
         by_id = message.from_user.id if message.from_user else None
         await _finish_ad(message, conn, state, by_id=by_id)
+
+    @ar.callback_query(F.data == "adm:ad:every")
+    @_owner_only
+    async def ad_every_start(callback: CallbackQuery, conn: sqlite3.Connection,
+                             config, state: FSMContext):
+        from ..bot.ads import ad_every_n
+        await state.set_state(AdmStates.ad_every)
+        await callback.answer()
+        await callback.message.answer(
+            f"تبلیغ هر چند پاسخ به کاربران نمایش داده شود؟ (فعلی: هر {ad_every_n(conn)} پاسخ)\n"
+            "یک عدد بین 1 تا 50 بنویسید:")
+
+    @ar.message(AdmStates.ad_every)
+    @menu_escape
+    @_owner_only
+    async def ad_every_got(message: Message, conn: sqlite3.Connection,
+                           config, state: FSMContext):
+        raw = (message.text or "").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 0
+        if not 1 <= n <= 50:
+            await message.answer("عدد معتبر نیست؛ یک عدد بین 1 تا 50 بنویسید:")
+            return
+        dbmod.set_setting(conn, "ad_every_n", str(n), by_id=message.from_user.id)
+        await state.clear()
+        text, kb = ads_view(conn)
+        await message.answer(f"✅ فاصله نمایش تبلیغ شد: هر {n} پاسخ.", reply_markup=kb)
 
     @ar.callback_query(F.data.startswith("adm:ad:toggle:"))
     @_owner_only
@@ -918,6 +961,7 @@ def register(router: Router) -> None:
         await callback.message.answer(AD_EDIT_PROMPTS[field])
 
     @ar.message(AdmStates.ad_edit)
+    @menu_escape
     @_owner_only
     async def ad_edit_save(message: Message, conn: sqlite3.Connection,
                            config, state: FSMContext):
@@ -963,6 +1007,7 @@ def register(router: Router) -> None:
         await callback.message.answer(f"{KEY_PROMPT}\n{KEY_NOTE}")
 
     @ar.message(AdmStates.key_input, F.text)
+    @menu_escape
     @_owner_only
     async def key_save(message: Message, conn: sqlite3.Connection,
                        config, state: FSMContext):
@@ -1066,6 +1111,7 @@ def register(router: Router) -> None:
         await callback.message.answer(f"{setting_label(key)}\nمقدار جدید را بنویسید:")
 
     @ar.message(AdmStates.set_value, F.text)
+    @menu_escape
     @_owner_only
     async def set_save(message: Message, conn: sqlite3.Connection,
                        config, state: FSMContext):

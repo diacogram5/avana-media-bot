@@ -80,12 +80,29 @@ class _FakeMessage:
 
 
 @pytest.mark.asyncio
-async def test_link_channel_stage_says_not_configured_not_silent(db, monkeypatch):
+async def test_link_channel_stage_silent_for_non_owner(db, monkeypatch):
+    """No public nag about unset channels: non-owners hear nothing."""
     from app.config import Config
     msg = _FakeMessage()
+    msg.from_user = type("U", (), {"id": 99})()
     found = await handlers._run_link_channel_stage(msg, db, Config(), "Some Reel Song")
     assert found is False
-    assert any("تنظیم نشده" in a for a in msg.answers)
+    assert msg.answers == []
+
+
+@pytest.mark.asyncio
+async def test_link_channel_stage_points_owner_to_admin_panel(db, monkeypatch):
+    """The owner alone gets one pointer to the admin panel bank section —
+    never a CHANNEL_USERNAMES env-var nag in public."""
+    from app.config import Config
+    cfg = Config()
+    cfg.owner_id = 7
+    msg = _FakeMessage()
+    msg.from_user = type("U", (), {"id": 7})()
+    found = await handlers._run_link_channel_stage(msg, db, cfg, "Some Reel Song")
+    assert found is False
+    assert any("پنل مدیریت" in a for a in msg.answers)
+    assert not any("CHANNEL_USERNAMES" in a for a in msg.answers)
 
 
 @pytest.mark.asyncio
@@ -105,23 +122,37 @@ async def test_link_channel_stage_uses_page_text(db, monkeypatch):
     assert not any("شناسایی شد" in a for a in msg.answers)  # channel post, not identified
 
 
+class _SentMessage:
+    def __init__(self, text):
+        self.text = text
+        self.reply_markup = None
+
+    async def edit_text(self, text, reply_markup=None):
+        self.text = text
+        self.reply_markup = reply_markup
+
+
 class _LinkFakeMessage:
     def __init__(self, text):
         self.text = text
         self.from_user = type("U", (), {"id": 42, "username": "t", "first_name": "T"})()
         self.answers = []
+        self.last_sent = None
 
     async def answer(self, text, reply_markup=None):
         self.answers.append(text)
+        self.last_sent = _SentMessage(text)
+        return self.last_sent
 
     async def answer_video(self, video, caption=None, reply_markup=None):
         pass
 
 
 @pytest.mark.asyncio
-async def test_link_handler_needs_file_runs_channel_stage_not_silent(db, monkeypatch):
-    """End-to-end link branch: Instagram-style needs_file must not end
-    silently — it asks for the video file AND says channels are unset."""
+async def test_link_handler_needs_file_single_compact_card(db, monkeypatch):
+    """End-to-end link branch: Instagram-style needs_file folds into ONE
+    compact card (video line + one honest line) — no channel-settings
+    nag, no stacked messages."""
     from app.config import Config
 
     async def fake_identify(outcome, cfg):
@@ -129,9 +160,13 @@ async def test_link_handler_needs_file_runs_channel_stage_not_silent(db, monkeyp
     monkeypatch.setattr(handlers, "_identify_link_audio", fake_identify)
     msg = _LinkFakeMessage("https://www.instagram.com/reel/De99zjKIQe5/")
     await handlers.text_handler(msg, db, Config())
+    card = msg.last_sent.text
+    assert "🎬 ویدیوی همان لینک:" in card
+    assert "https://www.instagram.com/reel/De99zjKIQe5/" in card
+    assert "مستقیم بفرستید" in card
     joined = "\n".join(msg.answers)
-    assert "ویدیو را مستقیم بفرستید" in joined
-    assert "تنظیم نشده" in joined
+    assert "تنظیم نشده" not in joined
+    assert "CHANNEL_USERNAMES" not in joined
 
 
 @pytest.mark.asyncio

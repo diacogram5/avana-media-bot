@@ -6,6 +6,8 @@ call, so an admin change applies without restarting the bot.
 """
 from __future__ import annotations
 
+import functools
+
 from .. import db as dbmod
 from ..i18n import t
 
@@ -37,6 +39,44 @@ def capabilities_menu(conn) -> list[dict]:
     """Dynamic «قابلیت‌ها» menu: visible+enabled features in menu order."""
     return [f for f in dbmod.list_features(conn)
             if f.get("enabled") and f.get("visible")]
+
+
+def menu_title_key(conn, text: str) -> str | None:
+    """Map a message text to a feature key when it exactly matches a
+    visible menu button title (handles admin renames)."""
+    for f in capabilities_menu(conn):
+        if f.get("title") == text:
+            return f["key"]
+    return None
+
+
+def menu_escape(handler):
+    """Decorator for free-text state handlers: a main-menu button title
+    always escapes the current flow instead of being consumed as flow
+    input. The stale FSM state is cleared and the menu action runs, so
+    the user can never be trapped in a dead-end step.
+
+    The ``handlers`` import is deferred to call time because
+    ``app.bot.handlers`` imports the feature modules.
+    """
+    @functools.wraps(handler)
+    async def wrapper(message, *args, **kwargs):
+        conn = kwargs.get("conn")
+        state = kwargs.get("state")
+        text = (getattr(message, "text", None) or "").strip()
+        if conn is not None and state is not None and text:
+            key = menu_title_key(conn, text)
+            if key is not None:
+                try:
+                    await state.clear()
+                except Exception:
+                    pass
+                from . import handlers as _H
+                await _H._run_menu_title(
+                    message, conn, kwargs.get("config"), state, key)
+                return
+        return await handler(message, *args, **kwargs)
+    return wrapper
 
 
 def format_results(results, page: int = 1, page_size: int = 5) -> str:
@@ -97,22 +137,13 @@ def attach_bot_id(text: str, bot_id: str) -> str:
 
 
 def professional_audio_caption(result, bot_id: str = "") -> str:
-    """Caption for the professional song card: clean title + official link.
+    """Caption for the professional song card: clean title only.
 
-    The official catalog link is the download/purchase link and the
-    catalog preview (sent as the audio message itself) is the legal
-    downloadable preview. A full copyrighted file is never downloaded
-    from an unauthorised source and resent; if no official link exists,
-    the caption is just the clean title and the caller adds one honest
-    line saying no official preview/download was found in the catalog.
+    No source URLs and no bot-ID links under media (no-links policy);
+    the unified media pipeline appends the honest quality label.
+    ``bot_id`` is kept for signature compatibility and ignored.
     """
-    title = clean_title(result)
-    if result.url:
-        caption = f"{title}\n⬇️ دانلود رسمی: {result.url}"
-    else:
-        caption = title
-    # File caption = shared content, so the bot ID travels with forwards.
-    return attach_bot_id(caption, bot_id)
+    return clean_title(result)
 
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv")
