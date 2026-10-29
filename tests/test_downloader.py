@@ -322,12 +322,17 @@ async def test_instagram_with_public_file(fake_http):
 
 
 @pytest.mark.asyncio
-async def test_instagram_without_file_falls_back_to_player(fake_http):
+async def test_instagram_empty_shell_is_distinct_error(fake_http):
+    # HTTP 200 shell with zero media refs: no more silent official-player
+    # fallback — the miss is classified (here: no gating signal, oEmbed
+    # body not JSON-parseable by the fake) and gets its own honest line.
     fake_http.get_resp = _FakeResp(text="<html><head><title>x</title></head></html>")
     res = await detect_formats("https://www.instagram.com/reel/abc/", "instagram")
-    assert res.formats == [
-        {"id": "ig_player", "label": "پخش با پلیر رسمی اینستاگرام"}]
-    assert res.error == ""
+    assert res.formats == []
+    assert res.error == "empty_shell"
+    assert dl.EMPTY_SHELL == (
+        "⚠️ اینستاگرام فایل این پست را به‌صورت عمومی نمی‌دهد؛ "
+        "برای دریافت، خود ویدیو را مستقیم بفرستید.")
 
 
 @pytest.mark.asyncio

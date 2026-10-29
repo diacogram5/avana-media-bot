@@ -436,7 +436,10 @@ async def menu_lyrics(callback, conn: sqlite3.Connection, config: Config, state:
         await callback.answer(t(reason, "fa"), show_alert=True); return
     await state.set_state("lyr:await_query")
     await callback.answer()
-    await callback.message.answer("📝 نام آهنگ و خواننده را بنویسید، مثلاً: مهدی احمدوند - دوست دارم")
+    # In-bot cancel: without it this entry point (inline «قابلیت‌ها» menu)
+    # leaves the user in lyr:await_query with no visible way back.
+    await callback.message.answer("📝 نام آهنگ و خواننده را بنویسید، مثلاً: مهدی احمدوند - دوست دارم",
+                                  reply_markup=_cancel_kb())
 
 
 @router.callback_query(F.data == "menu:history")
@@ -685,6 +688,11 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
         return None
     elif delivery == "platform_official" and outcome.kind == "instagram":
         sent = await _send_instagram_video_file(message, conn, outcome, config)
+        if sent == _INSTAGRAM_GATED:
+            # Dedicated age-gate line; the caller must not overwrite it
+            # with the generic card or run identification stages on it.
+            await _answer(message, conn, dlfeat.AGE_GATED)
+            return _INSTAGRAM_GATED
         if sent is not None:
             return sent
         sent = await _answer(message, conn, text)
@@ -732,6 +740,16 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     except Exception:
         return None
     if not video_url:
+        # Classify the miss: an age-gated reel is impossible to fetch
+        # anonymously, so it gets the dedicated line instead of the
+        # generic "video not handed over" card.
+        try:
+            from ..services.instagram import check_instagram_gating
+            gating = await check_instagram_gating(outcome.official_url)
+        except Exception:
+            gating = None
+        if gating == "age_gated":
+            return _INSTAGRAM_GATED
         return None
     try:
         headers = {"User-Agent": "Mozilla/5.0",
@@ -824,6 +842,12 @@ def _bank_button(token: str | None):
 # that URL instead of the (audio-less) Telegram file.
 _VIDEO_IDENTIFY: dict[str, dict] = {}
 _VIDEO_IDENTIFY_RUNNING: set[str] = set()
+
+# Sentinel returned by _send_instagram_video_file when the reel is
+# age/region-gated (oEmbed gating signals): the dedicated message is
+# already handled by the caller, and no identification stages may run
+# on a reel no anonymous fetch can ever reach.
+_INSTAGRAM_GATED = "instagram_age_gated"
 
 
 def _video_identify_kb(user_id: int, file_id: str, kind: str,
@@ -1531,6 +1555,11 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         # empty "not found" boxes.
         video_msg = await _send_link_video(message, conn, outcome, config,
                                            bot_id=dbmod.get_bot_id(conn, config))
+        if video_msg == _INSTAGRAM_GATED:
+            # Age-gated reel: the dedicated message is already shown.
+            # There is no audio any anonymous fetch can reach, so no
+            # identification, bank sample, or channel stage runs.
+            return
         # Cached identification first: same link must not re-burn
         # Shazam/AudD lookups (token/API cost).
         import json as _json
@@ -1907,7 +1936,10 @@ async def suggest_retry(callback, conn: sqlite3.Connection, config: Config,
                         state: FSMContext):
     await state.set_state("suggest")
     await callback.answer()
-    await callback.message.answer(t("suggest_prompt", "fa"))
+    # In-bot cancel: «🔄 جستجوی مجدد» re-arms the suggest state, so the
+    # prompt must offer the same ❌ لغو the other suggest entries have.
+    await callback.message.answer(t("suggest_prompt", "fa"),
+                                  reply_markup=_cancel_kb())
 
 
 def _lyrics_picker_kb(page: int, key: str) -> InlineKeyboardMarkup:

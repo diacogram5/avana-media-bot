@@ -20,6 +20,9 @@ visible in the logs.
 """
 from __future__ import annotations
 
+import json
+from urllib.parse import quote
+
 import httpx
 
 from ..logging_config import get_logger, log_event
@@ -35,6 +38,46 @@ log = get_logger(__name__)
 DESKTOP_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 GOOGLEBOT_UA = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
 _STRATEGY_TIMEOUT = 12
+
+_OEMBED_ENDPOINT = "https://www.instagram.com/oauth/oembed/?url="
+# Real gating markers an age/region-restricted reel's public oEmbed
+# response carries (measured 2026-10-29 on reel Dd23bq7vkPr).
+_GATING_MARKERS = ("geoblock_required", "MIN_AGE_ACCOUNT", "gating_type")
+
+
+async def check_instagram_gating(page_url: str) -> str | None:
+    """Classify an Instagram post's access restriction from its public
+    oEmbed response.
+
+    Returns "age_gated" | "private_or_deleted" | "timeout" |
+    "network_error", or None when there is no restriction signal.
+    Only explicit signals classify: an oEmbed JSON carrying gating
+    markers (geoblock_required / gating_type / MIN_AGE_ACCOUNT) is
+    age-gated; oEmbed 400/404 is private/deleted; a transport timeout
+    and any other transport failure are reported distinctly. Anything
+    ambiguous returns None so the caller falls back to its honest
+    generic branch. Never raises.
+    """
+    endpoint = _OEMBED_ENDPOINT + quote(_base(page_url), safe="")
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(endpoint, headers=DESKTOP_UA)
+    except httpx.TimeoutException:
+        return "timeout"
+    except Exception:
+        return "network_error"
+    if resp.status_code in (400, 404):
+        return "private_or_deleted"
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    blob = json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else ""
+    if any(marker in blob for marker in _GATING_MARKERS):
+        return "age_gated"
+    return None
 
 
 async def _get(client: httpx.AsyncClient, url: str, headers: dict) -> str:

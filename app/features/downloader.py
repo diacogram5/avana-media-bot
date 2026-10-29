@@ -4,8 +4,11 @@ Honest, queue-based downloading:
 - A link is validated with the same rules as :func:`app.media.process_link`.
 - Format options are REAL per source: a direct file URL gets a real
   download (HEAD-probed); YouTube/TikTok get their official-player note
-  (no fabricated file); Instagram/Aparat try the public page for a real
-  media file and otherwise fall back to the official player.
+  (no fabricated file); Instagram runs the anonymous multi-strategy
+  resolver and offers the real file when found, otherwise a
+  signal-gated error line (age-gated / private-deleted / empty shell /
+  timeout / network); Aparat tries the public page for a real media
+  file and otherwise falls back to the official player.
 - At most 2 jobs run concurrently (module-level ``asyncio.Semaphore(2)``).
 - The same normalized URL reuses a cached ``file_id``
   (stage ``آماده است (از کش)``).
@@ -50,6 +53,17 @@ QUEUE_EMPTY = "صف خالی است؛ یک لینک بفرستید تا اینج
 PICK_FORMAT = "برای شروع پردازش، یک فرمت را انتخاب کنید."
 INVALID_LINK = "این لینک قابل پردازش نیست."
 UNAVAILABLE = "فایل این لینک در دسترس نیست؛ ممکن است پست خصوصی یا حذف شده باشد."
+# Distinct, signal-gated Instagram failure lines (link→download audit,
+# 2026-10-29): each is only shown when its real signal fired, never as
+# a guess.
+AGE_GATED = ("⚠️ این پست اینستاگرام محدودیت سنی یا منطقه‌ای دارد و "
+             "بدون ورود به اینستاگرام قابل دریافت نیست.")
+EMPTY_SHELL = ("⚠️ اینستاگرام فایل این پست را به‌صورت عمومی نمی‌دهد؛ "
+               "برای دریافت، خود ویدیو را مستقیم بفرستید.")
+FETCH_TIMEOUT = ("⚠️ اتصال به اینستاگرام بیش از حد طول کشید؛ "
+                 "لطفاً دوباره تلاش کنید.")
+FETCH_NETWORK = ("⚠️ خطای اتصال به اینستاگرام؛ اتصال اینترنت را بررسی و "
+                 "دوباره تلاش کنید.")
 ENQUEUE_FAILED = "ثبت در صف دانلود نشد؛ دوباره تلاش کنید."
 LINK_FAILED = "لینک پردازش نشد؛ دوباره تلاش کنید."
 TOO_BIG = "فایل برای ارسال از طریق تلگرام بزرگ است."
@@ -127,6 +141,21 @@ BRIEF = {
     "enqueue": ENQUEUE_FAILED,
     "link": LINK_FAILED,
 }
+
+# detect_formats error code -> the one honest user-facing line.
+# "unavailable" stays the spec-exact private/deleted line.
+_DL_ERROR_TEXT = {
+    "unavailable": UNAVAILABLE,
+    "age_gated": AGE_GATED,
+    "empty_shell": EMPTY_SHELL,
+    "timeout": FETCH_TIMEOUT,
+    "network_error": FETCH_NETWORK,
+}
+
+
+def download_error_text(code: str) -> str:
+    """User-facing line for a detect_formats error code; never a traceback."""
+    return _DL_ERROR_TEXT.get(code or "", LINK_FAILED)
 
 
 class DlStates(StatesGroup):
@@ -230,7 +259,52 @@ class FormatResult:
     note: str = ""
     content_type: str = "unknown"
     file_url: str = ""
-    error: str = ""  # "" | "unavailable"
+    # "" | "unavailable" | "age_gated" | "empty_shell" | "timeout" | "network_error"
+    error: str = ""
+
+
+async def _detect_instagram_formats(url: str) -> FormatResult:
+    """Instagram formats via the anonymous multi-strategy resolver.
+
+    The SAME resolver the plain-link message path uses (page -> embed ->
+    captioned embed -> crawler DASH): its (audio_url, video_url) output
+    becomes this stage's file_url, so the downloader finally offers the
+    real file instead of only the official player. When the resolver
+    finds nothing, the miss is classified by real signals — oEmbed
+    gating markers, oEmbed 404, transport timeout/network — and an
+    honest HTTP-200-with-zero-media shell gets its own line.
+    """
+    from ..services.instagram import check_instagram_gating, resolve_instagram_media
+    try:
+        audio_url, video_url, _page_text, _strategy = \
+            await resolve_instagram_media(url)
+    except Exception:
+        audio_url = video_url = None
+    if video_url:
+        return FormatResult(
+            formats=[{"id": "file", "label": FILE_LABEL}],
+            content_type="video",
+            file_url=video_url,
+        )
+    if audio_url:
+        return FormatResult(
+            formats=[{"id": "file", "label": FILE_LABEL}],
+            content_type="audio",
+            file_url=audio_url,
+        )
+    try:
+        gating = await check_instagram_gating(url)
+    except Exception:
+        gating = None
+    if gating == "age_gated":
+        return FormatResult(formats=[], error="age_gated")
+    if gating == "private_or_deleted":
+        return FormatResult(formats=[], error="unavailable")
+    if gating == "timeout":
+        return FormatResult(formats=[], error="timeout")
+    if gating == "network_error":
+        return FormatResult(formats=[], error="network_error")
+    return FormatResult(formats=[], error="empty_shell")
 
 
 async def detect_formats(url: str, source: str) -> FormatResult:
@@ -238,9 +312,13 @@ async def detect_formats(url: str, source: str) -> FormatResult:
 
     - direct: HEAD probe (15s); audio/video content-type -> file download.
     - youtube/tiktok: official player only (platforms give no public file).
-    - instagram/aparat: fetch the public page; a real advertised media
-      file -> file download, otherwise the official player; an
-      unreachable page -> "unavailable" (private/deleted), never a file.
+    - instagram: the anonymous multi-strategy resolver (page -> embed ->
+      captioned embed -> crawler DASH); a real media file -> file
+      download, otherwise a signal-gated error line (age-gated /
+      private-deleted / empty shell / timeout / network) — never a file.
+    - aparat: fetch the public page; a real advertised media file ->
+      file download, otherwise the official player; an unreachable
+      page -> "unavailable" (private/deleted), never a file.
     """
     if source == "youtube":
         return FormatResult(
@@ -266,7 +344,9 @@ async def detect_formats(url: str, source: str) -> FormatResult:
                 file_url=url,
             )
         return FormatResult(formats=[], content_type=ckey)
-    if source in ("instagram", "aparat"):
+    if source == "instagram":
+        return await _detect_instagram_formats(url)
+    if source == "aparat":
         html = await _fetch_page(url)
         if html is None:
             return FormatResult(formats=[], error="unavailable")
@@ -733,8 +813,8 @@ def register(router: Router) -> None:
                 await message.answer(BRIEF["link"])
             return
         result = await detect_formats(url, source)
-        if result.error == "unavailable":
-            await message.answer(UNAVAILABLE)
+        if result.error:
+            await message.answer(download_error_text(result.error))
             return
         if not result.formats:
             await message.answer(f"{INVALID_LINK}\n{LINK_NOT_VALID}")

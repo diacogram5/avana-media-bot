@@ -13,6 +13,7 @@ Wiring notes for the integrator (app/bot/handlers.py owner):
 """
 from __future__ import annotations
 
+import functools
 import sqlite3
 import time
 
@@ -151,6 +152,7 @@ def _owner_only(handler):
         p.kind == inspect.Parameter.VAR_KEYWORD for p in _params.values())
     _allowed = set(_params)
 
+    @functools.wraps(handler)
     async def wrapper(event, conn, config, *args, **kwargs):
         if not _is_owner(event, config):
             await _deny_owner(event)
@@ -172,6 +174,12 @@ def _kb(rows) -> InlineKeyboardMarkup:
 
 def _back_panel_kb() -> InlineKeyboardMarkup:
     return _kb([[_btn("⬅ بازگشت به پنل", "adm:panel")]])
+
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    """In-bot «لغو» for every admin FSM prompt: clears the stale state and
+    lands back on the admin panel. Reuses the existing admin «لغو» style."""
+    return _kb([[_btn("لغو", "adm:cancel")]])
 
 
 async def _edit(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
@@ -663,6 +671,15 @@ def register(router: Router) -> None:
     async def panel(callback: CallbackQuery, conn: sqlite3.Connection, config):
         await _edit(callback, *_panel_view(conn, config))
 
+    @ar.callback_query(F.data == "adm:cancel")
+    @_owner_only
+    async def adm_cancel(callback: CallbackQuery, conn: sqlite3.Connection,
+                         config, state: FSMContext):
+        """Cancel any admin FSM prompt: clear the stale state and land back
+        on the admin panel. Every adm:* awaiting prompt offers this."""
+        await state.clear()
+        await _edit(callback, *_panel_view(conn, config))
+
     # -- watermark-removal stub (disabled by default) ---------------------------
     @ar.callback_query(F.data == "adm:watermark")
     @_owner_only
@@ -724,7 +741,8 @@ def register(router: Router) -> None:
         await state.update_data(feat_key=key)
         await callback.answer()
         await callback.message.answer(
-            f"نام فعلی: {feat['title']}\nنام جدید دکمه را بنویسید (حداکثر ۸۰ کاراکتر):")
+            f"نام فعلی: {feat['title']}\nنام جدید دکمه را بنویسید (حداکثر ۸۰ کاراکتر):",
+            reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.feat_rename, F.text)
     @menu_escape
@@ -748,7 +766,8 @@ def register(router: Router) -> None:
                              config, state: FSMContext):
         await state.set_state(AdmStates.feat_add_name)
         await callback.answer()
-        await callback.message.answer("نام دکمه (مثلاً: قوانین استفاده)")
+        await callback.message.answer("نام دکمه (مثلاً: قوانین استفاده)",
+                                        reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.feat_add_name, F.text)
     @menu_escape
@@ -764,7 +783,8 @@ def register(router: Router) -> None:
             return
         await state.update_data(feat_name=name)
         await state.set_state(AdmStates.feat_add_text)
-        await message.answer("متن پاسخ دکمه (وقتی کاربر آن را می‌زند)")
+        await message.answer("متن پاسخ دکمه (وقتی کاربر آن را می‌زند)",
+                             reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.feat_add_text, F.text)
     @menu_escape
@@ -819,7 +839,8 @@ def register(router: Router) -> None:
         await state.set_state(AdmStates.ad_title)
         await state.update_data(ad={})
         await callback.answer()
-        await callback.message.answer(AD_FLOW[0][1])
+        await callback.message.answer(AD_FLOW[0][1],
+                                        reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.ad_photo, F.photo)
     @_owner_only
@@ -852,7 +873,9 @@ def register(router: Router) -> None:
         if idx + 1 < len(AD_FLOW):
             nxt = AD_FLOW[idx + 1]
             await state.set_state(nxt[0])
-            kb = _kb([[_btn("رد شدن", "adm:ad:skip")]]) if nxt[3] else None
+            _rows = [[_btn("رد شدن", "adm:ad:skip")]] if nxt[3] else []
+            _rows.append([_btn("لغو", "adm:cancel")])
+            kb = _kb(_rows)
             await msg.answer(nxt[1], reply_markup=kb)
         else:
             await _finish_ad(msg, conn, state, by_id)
@@ -888,7 +911,8 @@ def register(router: Router) -> None:
         await state.update_data(ad=ad)
         await state.set_state(AdmStates.ad_photo)
         await message.answer(AD_FLOW[1][1],
-                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
+                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")],
+                                               [_btn("لغو", "adm:cancel")]]))
 
     @ar.message(AdmStates.ad_desc, F.text)
     @menu_escape
@@ -905,7 +929,8 @@ def register(router: Router) -> None:
         await state.update_data(ad=ad)
         await state.set_state(AdmStates.ad_link)
         await message.answer(AD_FLOW[3][1],
-                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
+                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")],
+                                               [_btn("لغو", "adm:cancel")]]))
 
     @ar.message(AdmStates.ad_link, F.text)
     @menu_escape
@@ -918,7 +943,8 @@ def register(router: Router) -> None:
         await state.update_data(ad=ad)
         await state.set_state(AdmStates.ad_button)
         await message.answer(AD_FLOW[4][1],
-                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")]]))
+                             reply_markup=_kb([[_btn("رد شدن", "adm:ad:skip")],
+                                               [_btn("لغو", "adm:cancel")]]))
 
     @ar.message(AdmStates.ad_button, F.text)
     @menu_escape
@@ -941,7 +967,8 @@ def register(router: Router) -> None:
         await callback.answer()
         await callback.message.answer(
             f"تبلیغ هر چند پاسخ به کاربران نمایش داده شود؟ (فعلی: هر {ad_every_n(conn)} پاسخ)\n"
-            "یک عدد بین 1 تا 50 بنویسید:")
+            "یک عدد بین 1 تا 50 بنویسید:",
+            reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.ad_every)
     @menu_escape
@@ -1039,7 +1066,8 @@ def register(router: Router) -> None:
         await state.set_state(AdmStates.ad_edit)
         await state.update_data(ad_edit_id=ad_id, ad_edit_field=field)
         await callback.answer()
-        await callback.message.answer(AD_EDIT_PROMPTS[field])
+        await callback.message.answer(AD_EDIT_PROMPTS[field],
+                                        reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.ad_edit)
     @menu_escape
@@ -1085,7 +1113,8 @@ def register(router: Router) -> None:
                              config, state: FSMContext):
         await state.set_state(AdmStates.key_input)
         await callback.answer()
-        await callback.message.answer(f"{KEY_PROMPT}\n{KEY_NOTE}")
+        await callback.message.answer(f"{KEY_PROMPT}\n{KEY_NOTE}",
+                                        reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.key_input, F.text)
     @menu_escape
@@ -1189,7 +1218,8 @@ def register(router: Router) -> None:
         await state.set_state(AdmStates.set_value)
         await state.update_data(set_key=key)
         await callback.answer()
-        await callback.message.answer(f"{setting_label(key)}\nمقدار جدید را بنویسید:")
+        await callback.message.answer(f"{setting_label(key)}\nمقدار جدید را بنویسید:",
+                                        reply_markup=_cancel_kb())
 
     @ar.message(AdmStates.set_value, F.text)
     @menu_escape

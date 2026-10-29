@@ -45,6 +45,7 @@ from aiogram.types import (
 )
 
 from ..bot.audio_send import send_song_audio
+from ..bot.logic import menu_escape
 from ..config import Config
 
 # --------------------------------------------------------------------------
@@ -1071,6 +1072,17 @@ def register(router: Router) -> None:
         await callback.answer()
         await _send_panel(callback.message, config, edit=True)
 
+    @fr.callback_query(F.data == "bank:cancel")
+    async def _bank_cancel(callback: CallbackQuery, conn: sqlite3.Connection,
+                           config: Config, state: FSMContext):
+        """Cancel a bank add/edit prompt: clear the stale state and land
+        back on the bank panel. Both awaiting prompts offer this."""
+        if not await _owner_only(callback, config):
+            return
+        await state.clear()
+        await callback.answer()
+        await _send_panel(callback.message, config, edit=True)
+
     @fr.callback_query(F.data == "bank:close")
     async def _bank_close(callback: CallbackQuery, conn: sqlite3.Connection,
                           config: Config):
@@ -1135,14 +1147,22 @@ def register(router: Router) -> None:
             return
         await state.set_state(BankStates.add_identifier)
         await state.update_data(kind=kind)
+        # In-bot cancel: without it the owner waits in add_identifier with
+        # no visible way back (and a menu-button tap would be eaten as the
+        # identifier — see @menu_escape below).
+        _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="لغو", callback_data="bank:cancel")]])
         if kind == "channel":
             await callback.message.answer(
-                "یوزرنیم چنل را بفرستید (مثلاً: AiMusical)")
+                "یوزرنیم چنل را بفرستید (مثلاً: AiMusical)",
+                reply_markup=_cancel_kb)
         else:
             await callback.message.answer(
-                "دامنه سایت را بفرستید (مثلاً: suno.com)")
+                "دامنه سایت را بفرستید (مثلاً: suno.com)",
+                reply_markup=_cancel_kb)
 
     @fr.message(BankStates.add_identifier, F.text)
+    @menu_escape
     async def _bank_add_identifier(message: Message, conn: sqlite3.Connection,
                                    config: Config, state: FSMContext):
         if not _is_owner(getattr(message.from_user, "id", None), config):
@@ -1246,9 +1266,13 @@ def register(router: Router) -> None:
         await state.set_state(BankStates.edit_identifier)
         await state.update_data(row_id=row_id)
         kind_fa = "یوزرنیم چنل" if row["kind"] == "channel" else "دامنه سایت"
-        await callback.message.answer(f"{kind_fa} جدید را بفرستید:")
+        await callback.message.answer(
+            f"{kind_fa} جدید را بفرستید:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="لغو", callback_data="bank:cancel")]]))
 
     @fr.message(BankStates.edit_identifier, F.text)
+    @menu_escape
     async def _bank_edit_identifier(message: Message, conn: sqlite3.Connection,
                                     config: Config, state: FSMContext):
         if not _is_owner(getattr(message.from_user, "id", None), config):
