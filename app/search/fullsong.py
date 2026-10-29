@@ -68,6 +68,21 @@ def _fingerprint_duration(data: bytes) -> float:
     return float(fp.get("duration_sec") or 0.0)
 
 
+def _looks_like_audio(data: bytes) -> bool:
+    """Strict magic-byte gate: a real audio container only (MP3 incl.
+    ID3/frame-sync, MP4/M4A ftyp, Ogg, WAV, FLAC). Never trusts the URL
+    extension or the content-type header."""
+    if not data or len(data) < 16:
+        return False
+    head = data[:16]
+    return (head[:3] == b"ID3"
+            or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)
+            or head[4:8] == b"ftyp"
+            or head[:4] == b"OggS"
+            or (head[:4] == b"RIFF" and data[8:12] == b"WAVE")
+            or head[:4] == b"fLaC")
+
+
 async def find_full_song_file(artist: str, title: str) -> dict | None:
     """Return {"data", "ext", "duration_sec", "source"} or None.
 
@@ -115,18 +130,33 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
                             continue
                         if not carries_version_tokens(title, ptitle):
                             continue
-                        # Post page -> real file links.
+                        # Post page -> real file links. These sites strip the
+                        # download links from the WP API content, so when
+                        # the API content yields none, fall back to the
+                        # post's public HTML page (search result `url`).
+                        file_urls: list[str] = []
                         try:
                             pr = await client.get(
                                 f"{site}/wp-json/wp/v2/posts/{pid}",
                                 params={"_fields": "title,content"}, timeout=15)
-                            if pr.status_code != 200:
-                                continue
-                            content = ((pr.json() or {}).get("content") or {}).get("rendered") or ""
+                            if pr.status_code == 200:
+                                content = ((pr.json() or {}).get("content") or {}).get("rendered") or ""
+                                file_urls = [m.group(0) for m in _FILE_RE.finditer(content)]
                         except Exception:
+                            file_urls = []
+                        if not file_urls:
+                            page_url = p.get("url") or ""
+                            if page_url.startswith("http"):
+                                try:
+                                    hr = await client.get(page_url, timeout=20)
+                                    if hr.status_code == 200:
+                                        file_urls = [m.group(0)
+                                                     for m in _FILE_RE.finditer(hr.text)]
+                                except Exception:
+                                    file_urls = []
+                        if not file_urls:
                             continue
-                        for m in _FILE_RE.finditer(content):
-                            url = m.group(0)
+                        for url in file_urls:
                             fname = url.rsplit("/", 1)[-1]
                             if not carries_version_tokens(title, fname):
                                 continue
@@ -147,6 +177,11 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
                     continue
                 data = resp.content
                 if not (100_000 <= len(data) <= FULL_SONG_MAX_MB * 1024 * 1024):
+                    continue
+                # Content validation: real audio container (magic bytes),
+                # then real audio duration (landmark probe, >= 85 s) so a
+                # short clip or a mislabelled file is never delivered.
+                if not _looks_like_audio(data):
                     continue
                 duration = _fingerprint_duration(data)
                 if duration < FULL_SONG_MIN_SECONDS:

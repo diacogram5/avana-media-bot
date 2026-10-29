@@ -42,10 +42,20 @@ def capabilities_menu(conn) -> list[dict]:
 
 
 def menu_title_key(conn, text: str) -> str | None:
-    """Map a message text to a feature key when it exactly matches a
-    visible menu button title (handles admin renames)."""
+    """Map a message text to a feature key when it matches a visible menu
+    button title (handles admin renames).
+
+    Both sides are stripped before comparing: a stored title with stray
+    leading/trailing whitespace (e.g. the seeded ' 🎵 حرفه ای') must still
+    match the stripped text that arrives when the button is tapped.
+    Without this, the tap misses the lookup and falls through to a
+    catalog search instead of opening the feature.
+    """
+    want = (text or "").strip()
+    if not want:
+        return None
     for f in capabilities_menu(conn):
-        if f.get("title") == text:
+        if (f.get("title") or "").strip() == want:
             return f["key"]
     return None
 

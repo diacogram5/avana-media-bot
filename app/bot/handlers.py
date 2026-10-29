@@ -1116,14 +1116,31 @@ def _link_platform_name(kind: str) -> str:
             "aparat": "آپارات", "tiktok": "تیک‌تاک"}.get(kind, "این سرویس")
 
 
-def _link_needs_file_card(outcome) -> str:
+def _link_needs_file_card(outcome, cause: str = "") -> str:
     """The single compact card for a link whose media the platform did
-    not hand over: video-link line + one honest line. One message,
-    never a stack of video-link + nag + channel notice."""
-    platform = _link_platform_name(outcome.kind)
-    return ("🎬 ویدیوی همان لینک:\n" + outcome.official_url +
-            f"\n\n⚠️ {platform} فایل ویدیو را به بات نداد؛ "
-            "برای شناسایی آهنگ، خود ویدیو را مستقیم بفرستید.")
+    not hand over: video-link line + one honest taxonomy line. One
+    message, never a stack of video-link + nag + channel notice.
+
+    ``cause`` is the 5-way taxonomy code from _identify_link_audio
+    ("age_gated" | "unavailable" | "empty_shell" | "timeout" |
+    "network_error"); the card states the TRUE cause, never a generic
+    line. Empty cause keeps the legacy generic line (non-Instagram
+    platforms have no taxonomy)."""
+    cause_line = {
+        "age_gated": dlfeat.AGE_GATED,
+        "unavailable": dlfeat.UNAVAILABLE,
+        "empty_shell": dlfeat.EMPTY_SHELL,
+        "timeout": dlfeat.FETCH_TIMEOUT,
+        "network_error": dlfeat.FETCH_NETWORK,
+    }.get(cause or "", "")
+    if not cause_line:
+        platform = _link_platform_name(outcome.kind)
+        cause_line = f"⚠️ {platform} فایل ویدیو را به بات نداد."
+    card = ("🎬 ویدیوی همان لینک:\n" + outcome.official_url +
+            "\n\n" + cause_line)
+    if "مستقیم بفرستید" not in cause_line:
+        card += "\nبرای شناسایی آهنگ، خود ویدیو را مستقیم بفرستید."
+    return card
 
 
 async def _identify_link_audio(outcome, config: Config):
@@ -1179,7 +1196,13 @@ async def _identify_link_audio(outcome, config: Config):
             page_text = extract_page_text(page)
         except Exception:
             media_url = None
+    # Bytes were REALLY fetched: an unidentified or failed lookup is
+    # never "the video was not handed over". Remember the real status +
+    # bytes; AudD below still gets its fallback chance, but the final
+    # fallthrough must not collapse this into needs_file.
+    fetched: tuple[str, bytes] | None = None
     if media_url:
+        data = b""
         try:
             headers = {"User-Agent": "Mozilla/5.0",
                        "Referer": "https://www.instagram.com/"}
@@ -1187,12 +1210,14 @@ async def _identify_link_audio(outcome, config: Config):
                 resp = await client.get(media_url, headers=headers)
                 resp.raise_for_status()
                 data = resp.content
-            if len(data) <= config.max_file_mb * 1024 * 1024:
-                result = await _identify_audio(data, "clip.mp4", config)
-                if result.status == "identified":
-                    return ("identified", result.title, result.artist, False, page_text, data)
         except Exception:
-            pass
+            data = b""
+        if data and len(data) <= config.max_file_mb * 1024 * 1024:
+            result = await _identify_audio(data, "clip.mp4", config)
+            if result.status == "identified":
+                return ("identified", result.title, result.artist, False, page_text, data)
+            if result.status in ("not_found", "error"):
+                fetched = (result.status, data)
     if config.audd_token:
         try:
             result = await identify_url(url, config.audd_token)
@@ -1200,7 +1225,28 @@ async def _identify_link_audio(outcome, config: Config):
             result = None
         if result is not None and result.status == "identified":
             return ("identified", result.title, result.artist, False, page_text, b"")
-    return ("needs_file", "", "", True, page_text, b"")
+    if fetched is not None:
+        # The media was fetched but not identified (or the lookup
+        # failed): carry the real status and the bytes so the bank
+        # sample arms on real audio. A lookup error is never reported
+        # as "not found", and neither is reported as "video not handed
+        # over".
+        return (fetched[0], "", "", False, page_text, fetched[1])
+    # Nothing fetchable: classify the miss with the real 5-way taxonomy
+    # (age-gated / private-deleted / empty shell / timeout / network) so
+    # the card states the true cause, never a generic line.
+    cause = ""
+    if outcome.kind == "instagram":
+        try:
+            from ..services.instagram import check_instagram_gating
+            gating = await check_instagram_gating(url)
+        except Exception:
+            gating = None
+        cause = {"age_gated": "age_gated",
+                 "private_or_deleted": "unavailable",
+                 "timeout": "timeout",
+                 "network_error": "network_error"}.get(gating or "", "empty_shell")
+    return ("needs_file", "", "", True, page_text, b"", cause)
 
 
 async def _run_link_channel_stage(message, conn, config, page_text: str) -> bool:
@@ -1578,6 +1624,7 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         status, title, artist, needs_file = _link_res[:4]
         page_text = _link_res[4] if len(_link_res) > 4 else ""
         heard = _link_res[5] if len(_link_res) > 5 else b""
+        cause = _link_res[6] if len(_link_res) > 6 else ""
         if status == "identified":
             dbmod.set_cached_search(
                 conn, f"link:{outcome.official_url}",
@@ -1592,26 +1639,40 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         elif needs_file:
             _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                           heard or None, outcome.official_url, page_text)
-            # ONE compact card: fold the fallback into the already-sent
-            # video message instead of stacking three messages. Media
-            # messages take edit_caption; text messages take edit_text.
-            card = _link_needs_file_card(outcome)
-            kb = _bank_button(_tok)
-            folded = False
-            if video_msg is not None:
-                try:
-                    if getattr(video_msg, "video", None) or getattr(video_msg, "audio", None):
-                        await video_msg.edit_caption(caption=card, reply_markup=kb)
-                    else:
+            if (video_msg is not None
+                    and (getattr(video_msg, "video", None)
+                         or getattr(video_msg, "audio", None))):
+                # The video WAS delivered; only its audio stream is
+                # unreachable. Never overwrite its caption with the
+                # "video not handed over" card — one honest line instead.
+                await _answer(message, conn, t("link_audio_missing", "fa"))
+            else:
+                # ONE compact card: fold the fallback into the already-sent
+                # video message instead of stacking three messages. Media
+                # messages take edit_caption; text messages take edit_text.
+                card = _link_needs_file_card(outcome, cause)
+                kb = _bank_button(_tok)
+                folded = False
+                if video_msg is not None:
+                    try:
                         await video_msg.edit_text(card, reply_markup=kb)
-                    folded = True
-                except Exception:
-                    folded = False
-            if not folded:
-                await _answer(message, conn, card, reply_markup=kb)
+                        folded = True
+                    except Exception:
+                        folded = False
+                if not folded:
+                    await _answer(message, conn, card, reply_markup=kb)
             # Channel stage was previously never run on links: run it
             # now on the page's advertised text; it stays silent unless
             # it has a real post to show (no public nag).
+            await _run_link_channel_stage(message, conn, config, page_text)
+        elif status == "error":
+            # The media was fetched but the lookup failed: an honest
+            # error line, never "not found", with the bank armed on the
+            # real bytes when any were heard.
+            _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
+                                          heard or None, outcome.official_url, page_text)
+            await _answer(message, conn, t("link_identify_error", "fa"),
+                          reply_markup=_bank_button(_tok))
             await _run_link_channel_stage(message, conn, config, page_text)
         else:
             _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
