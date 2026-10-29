@@ -22,11 +22,21 @@ from app.bot import handlers as H  # noqa: E402
 from app.bot import media_send as ms  # noqa: E402
 from app.bot.ads import ad_due, ad_every_n, pick_active_ad  # noqa: E402
 from app.bot.logic import capabilities_menu, menu_escape, menu_title_key  # noqa: E402
+from app import db as dbmod  # noqa: E402
 from app.features import downloader as dl  # noqa: E402
 from app.features import pro as profeat  # noqa: E402
 from app.search import SearchResult  # noqa: E402
 from app.services.link_media import extract_video_qualities  # noqa: E402
 from app.services.link_media import extract_dash_video_url  # noqa: E402
+
+
+class _SentMessage:
+    def __init__(self, message_id):
+        self.message_id = message_id
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeMessage:
@@ -35,12 +45,15 @@ class FakeMessage:
         self.from_user = SimpleNamespace(id=user_id)
         self.chat = SimpleNamespace(id=user_id)
         self.calls = []
+        self.sent_messages = []
         self.video = None
         self.audio = None
 
     async def answer(self, text, **kwargs):
+        sent = _SentMessage(len(self.calls) + 1)
         self.calls.append(("answer", text, kwargs))
-        return SimpleNamespace(message_id=1)
+        self.sent_messages.append(sent)
+        return sent
 
     async def answer_audio(self, audio, **kwargs):
         self.calls.append(("answer_audio", audio, kwargs))
@@ -90,8 +103,13 @@ async def test_suggest_each_result_gets_own_button(monkeypatch, db):
     monkeypatch.setattr(H, "suggest_songs", fake_suggest)
     msg = FakeMessage("یه آهنگ غمگین")
     await H._run_suggest(msg, db, "یه آهنگ غمگین", SimpleNamespace(owner_id=1, bot_id=""))
-    assert len(msg.calls) == 1
-    _k, text, kwargs = msg.calls[0]
+    # ONE progress status, dismissed before the result card lands.
+    assert len(msg.calls) == 2
+    _k0, status_text, _kw0 = msg.calls[0]
+    assert "در حال پیدا کردن" in status_text
+    assert msg.sent_messages[0].deleted is True  # status dismissed
+    assert msg.sent_messages[1].deleted is False  # result card stays
+    _k, text, kwargs = msg.calls[1]
     assert "3 پیشنهاد" in text
     kb = kwargs["reply_markup"]
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
@@ -110,7 +128,7 @@ async def test_suggest_dedupes_and_is_honest_about_count(monkeypatch, db):
     monkeypatch.setattr(H, "suggest_songs", fake_suggest)
     msg = FakeMessage("شاد")
     await H._run_suggest(msg, db, "شاد", SimpleNamespace(owner_id=1, bot_id=""))
-    _k, text, kwargs = msg.calls[0]
+    _k, text, kwargs = msg.calls[1]
     assert "2 پیشنهاد" in text  # duplicate collapsed, honestly 2
     kb2 = kwargs["reply_markup"]
     datas = [b.callback_data for row in kb2.inline_keyboard for b in row]
@@ -124,7 +142,7 @@ async def test_suggest_more_pagination(monkeypatch, db):
     monkeypatch.setattr(H, "suggest_songs", fake_suggest)
     msg = FakeMessage("x")
     await H._run_suggest(msg, db, "x", SimpleNamespace(owner_id=1, bot_id=""))
-    datas = [b.callback_data for row in msg.calls[0][2]["reply_markup"].inline_keyboard
+    datas = [b.callback_data for row in msg.calls[1][2]["reply_markup"].inline_keyboard
              for b in row]
     more = next(d for d in datas if d.startswith("sg:more:"))
     tok = more.split("sg:more:", 1)[1]
@@ -250,12 +268,22 @@ async def test_dl_pick_format_uses_chosen_quality_url(db):
 # --------------------------------------------------------------- menu/ads
 
 def test_persistent_menu_has_ten_buttons(db):
+    # OPEN (default) state: the 10 admin-managed feature buttons EXACTLY
+    # as before (same count/order/columns) plus one small toggle row.
     kb = H._main_reply_kb(db)
     assert kb.is_persistent is True
     assert kb.resize_keyboard is True
     buttons = [b.text for row in kb.keyboard for b in row]
-    assert len(buttons) == 10
+    assert len(buttons) == 11
     assert "دریافت از لینک" in buttons and "شناسایی آهنگ از فایل" in buttons
+    assert buttons[-1] == "🔽 بستن منو"
+    # The feature rows are untouched: pairs of two in menu order.
+    feature_buttons = buttons[:-1]
+    assert len(feature_buttons) == 10
+    for row in kb.keyboard[:-1]:
+        assert len(row) == 2
+    # A fresh user (and unknown user_id) gets the open menu.
+    assert not dbmod.menu_collapsed(db, 12345)
 
 
 def test_bot_commands_minimal():
@@ -325,7 +353,8 @@ async def test_menu_main_resets_to_main_menu(db):
     _k, text, kwargs = cb_msg.calls[0]
     assert "🤖 @TestBot" in text  # the one deliberate signature place
     buttons = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
-    assert len(buttons) == 10
+    assert len(buttons) == 11
+    assert buttons[-1] == "🔽 بستن منو"
 
 
 # ------------------------------------------------------------------ copy

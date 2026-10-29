@@ -132,22 +132,29 @@ def transcode_to_wav(data: bytes, max_seconds: int = 90) -> bytes | None:
             pass
 
 
-def analyze_audio(data: bytes) -> dict:
-    """Validate extracted audio before it reaches the lookup service.
+def analyze_audio_with_wav(data: bytes) -> tuple:
+    """Validate extracted audio AND keep the signable WAV.
 
-    Returns {ok, reason, duration_s, sample_rate, channels, rms_db}.
-    ``reason`` is one of: ok | undecodable | silent | too_short |
-    unverified_no_ffmpeg. An unsuitable sample is reported with its own
-    reason — never misreported downstream as "song not identified".
+    Speed: the WAV produced here (mono 22050Hz PCM) is exactly what the
+    Shazam signature core needs, so the lookup can reuse it instead of
+    transcoding the same input a second (or third) time. Returns
+    (analysis, wav_bytes_or_None). The analysis dict is identical to
+    ``analyze_audio``'s; wav is None when ffmpeg is missing or the
+    transcode failed.
     """
     wav = transcode_to_wav(data, max_seconds=120)
     if wav is None:
         if shutil.which("ffmpeg") is None:
-            return {"ok": True, "reason": "unverified_no_ffmpeg",
-                    "duration_s": 0, "sample_rate": 0, "channels": 0,
-                    "rms_db": 0}
-        return {"ok": False, "reason": "undecodable",
-                "duration_s": 0, "sample_rate": 0, "channels": 0, "rms_db": 0}
+            return ({"ok": True, "reason": "unverified_no_ffmpeg",
+                     "duration_s": 0, "sample_rate": 0, "channels": 0,
+                     "rms_db": 0}, None)
+        return ({"ok": False, "reason": "undecodable",
+                 "duration_s": 0, "sample_rate": 0, "channels": 0,
+                 "rms_db": 0}, None)
+    return (_analyze_wav(wav), wav)
+
+
+def _analyze_wav(wav: bytes) -> dict:
     try:
         # Proper WAV parse: locate the "data" chunk (ffmpeg emits extra
         # LIST/INFO chunks, so the audio rarely starts at byte 44).
@@ -189,10 +196,68 @@ def analyze_audio(data: bytes) -> dict:
         log_event(log, "analyze_error",
                   error=f"{type(exc).__name__}: {str(exc)[:100]}")
         return {"ok": False, "reason": "undecodable",
-                "duration_s": 0, "sample_rate": 0, "channels": 0, "rms_db": 0}
+                "duration_s": 0, "sample_rate": 0, "channels": 0,
+                "rms_db": 0}
 
 
-async def identify_bytes_shazam(data: bytes) -> ShazamIdResult:
+def wav_time_slice(wav: bytes, start_frac: float, end_frac: float):
+    """Cut a time window out of a mono-22050Hz-16bit WAV (the exact
+    format ``transcode_to_wav`` emits) and re-wrap it with a valid
+    44-byte header.
+
+    Why: slicing raw container bytes at 1/3 and 2/3 points usually
+    breaks the container (moov atom lost) so those windows could never
+    decode; slicing PCM is always valid audio, giving each window a
+    real chance at a match. Returns None when the input is not the
+    expected WAV layout.
+    """
+    try:
+        if len(wav) < 44 or wav[0:4] != b"RIFF" or wav[8:12] != b"WAVE":
+            return None
+        # Locate the data chunk (ffmpeg may emit LIST/INFO chunks first).
+        pos = 12
+        data_off = 0
+        while pos + 8 <= len(wav):
+            chunk_id = wav[pos:pos + 4]
+            chunk_size = struct.unpack("<I", wav[pos + 4:pos + 8])[0]
+            if chunk_id == b"data":
+                data_off = pos + 8
+                break
+            pos += 8 + chunk_size + (chunk_size % 2)
+        if not data_off:
+            return None
+        pcm = wav[data_off:]
+        n_samples = len(pcm) // 2
+        s0 = int(n_samples * max(0.0, start_frac))
+        s1 = int(n_samples * min(1.0, end_frac))
+        if s1 - s0 < 22050:  # need >= 1s of audio per window
+            return None
+        cut = pcm[s0 * 2:s1 * 2]
+        data_len = len(cut)
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + data_len, b"WAVE",
+            b"fmt ", 16, 1, 1, 22050, 22050 * 2, 2, 16,
+            b"data", data_len)
+        return header + cut
+    except Exception:
+        return None
+
+
+def analyze_audio(data: bytes) -> dict:
+    """Validate extracted audio before it reaches the lookup service.
+
+    Returns {ok, reason, duration_s, sample_rate, channels, rms_db}.
+    ``reason`` is one of: ok | undecodable | silent | too_short |
+    unverified_no_ffmpeg. An unsuitable sample is reported with its own
+    reason — never misreported downstream as "song not identified".
+    """
+    analysis, _wav = analyze_audio_with_wav(data)
+    return analysis
+
+
+async def identify_bytes_shazam(data: bytes,
+                                prepared_wav: bytes | None = None) -> ShazamIdResult:
     """Identify raw audio/video bytes via a Shazam signature.
 
     `data` is the Telegram file bytes or a downloaded media file. When
@@ -200,6 +265,10 @@ async def identify_bytes_shazam(data: bytes) -> ShazamIdResult:
     Instagram DASH, Opus voice notes, …), the bytes are transcoded to
     WAV once and the lookup is retried — previously this whole class of
     inputs failed with a bare "error" before any lookup happened.
+
+    `prepared_wav`: a caller that already validated the input via
+    ``analyze_audio_with_wav`` can pass its WAV (mono 22050Hz PCM) to
+    skip the redundant second transcode of the same input.
     """
     if not data:
         return ShazamIdResult(status="error")
@@ -211,11 +280,19 @@ async def identify_bytes_shazam(data: bytes) -> ShazamIdResult:
     try:
         payload, unsupported = await _recognize_bytes(data)
         if unsupported:
-            log_event(log, "shazam_transcode", input_bytes=len(data))
-            wav = transcode_to_wav(data)
+            if prepared_wav is not None:
+                # The validation stage already produced the exact WAV the
+                # signature core needs: reuse it, no second transcode.
+                log_event(log, "shazam_transcode_reused",
+                          wav_bytes=len(prepared_wav))
+                wav = prepared_wav
+            else:
+                log_event(log, "shazam_transcode", input_bytes=len(data))
+                wav = transcode_to_wav(data)
+                if wav:
+                    log_event(log, "shazam_transcode_ok", wav_bytes=len(wav))
             if not wav:
                 return ShazamIdResult(status="error")
-            log_event(log, "shazam_transcode_ok", wav_bytes=len(wav))
             payload, unsupported = await _recognize_bytes(wav)
             if unsupported:
                 log_event(log, "shazam_error",

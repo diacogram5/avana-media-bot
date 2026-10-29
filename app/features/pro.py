@@ -1,4 +1,4 @@
-# «🎵 حرفه ای» — merged user section: favorites + playlists.
+# «🎵 حرفه‌ای» — merged user section: favorites + playlists.
 #
 # Owner: pro agent (see INTEGRATION_CONTRACT.md).
 # The integrator wires song-card buttons to remember_result()/get_result()
@@ -16,6 +16,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .. import db as dbmod
 from ..bot.audio_send import send_song_audio
 from ..bot.logic import menu_escape
+from ..i18n import t
 
 # ---------------------------------------------------------------------------
 # Song-result store (integrator wires song-card buttons to this)
@@ -36,50 +37,69 @@ def get_result(key: str) -> dict | None:
     return RESULTS.get(key)
 
 
-def build_song_card_buttons(key: str, is_fav: bool) -> list[list[InlineKeyboardButton]]:
+def build_song_card_buttons(key: str, is_fav: bool,
+                            lang: str = "fa") -> list[list[InlineKeyboardButton]]:
     """Minimal song-card buttons: favorite heart, then lyrics + add-to-playlist."""
     heart = "❤️" if is_fav else "🤍"
     return [
         [InlineKeyboardButton(text=heart, callback_data=f"fav:toggle:{key}")],
         [
-            InlineKeyboardButton(text="📝 متن آهنگ", callback_data=f"ly:{key}"),
-            InlineKeyboardButton(text="🎶 افزودن به پلی‌لیست", callback_data=f"pro:pick:{key}"),
+            InlineKeyboardButton(text=t("pro_lyrics_btn", lang), callback_data=f"ly:{key}"),
+            InlineKeyboardButton(text=t("pro_add_to_pl", lang), callback_data=f"pro:pick:{key}"),
         ],
     ]
 
 
 # ---------------------------------------------------------------------------
-# Exact texts (from web-ui-spec.md section 10)
+# Exact texts (single-sourced from app/i18n.py; the constants below are the
+# fa values so existing references keep working).
 # ---------------------------------------------------------------------------
 
-T_SECTION_TITLE = "🎵 حرفه ای — علاقه‌مندی‌ها"
-T_PANEL_TITLE = "پلی‌لیست‌های من"
-T_FAV_EMPTY = (
-    "هنوز آهنگی ذخیره نشده است. کنار هر آهنگ در نتایج جستجو یا شناسایی، "
-    "دکمه قلب را بزنید تا اینجا ذخیره شود و بعد بدون جستجوی دوباره پخش و دانلود کنید."
-)
-T_PL_EMPTY = (
-    "هنوز پلی‌لیستی ندارید. با «پلی‌لیست جدید» یکی بسازید؛ "
-    "بعد کنار هر آهنگ، دکمه «افزودن به پلی‌لیست» را بزنید تا داخلش قرار بگیرد."
-)
-T_PL_VIEW_EMPTY = "هنوز آهنگی در این پلی‌لیست نیست؛ کنار هر آهنگ در نتایج، «افزودن به پلی‌لیست» را بزنید."
-T_NEW_NAME = "نام پلی‌لیست؛ مثلاً: غمگین، باشگاه، رانندگی"
-T_NEW_DESC = "توضیح کوتاه (اختیاری)"
-T_PICK_TITLE = "افزودن «{title}» به کدام پلی‌لیست؟"
-T_NO_PLAYLISTS = "هنوز پلی‌لیستی ندارید؛ از «قابلیت‌ها ← 🎵 حرفه ای» اول یکی بسازید."
-T_ADDED = "«{title}» به پلی‌لیست «{name}» اضافه شد."
-T_ALREADY = "«{title}» از قبل در پلی‌لیست «{name}» هست."
-T_FAV_ADD = "افزودن «{title}» به علاقه‌مندی‌ها"
-T_FAV_DEL = "حذف «{title}» از علاقه‌مندی‌ها"
+T_SECTION_TITLE = t("pro_section_title")
+T_PANEL_TITLE = t("pro_panel_title")
+T_FAV_EMPTY = t("pro_fav_empty")
+T_PL_EMPTY = t("pro_pl_empty")
+T_PL_VIEW_EMPTY = t("pro_pl_view_empty")
+T_NEW_NAME = t("pro_name_prompt")
+T_NEW_DESC = t("pro_desc_prompt")
+T_PICK_TITLE = t("pro_pick_title")
+T_NO_PLAYLISTS = t("pro_no_pl_yet")
+T_ADDED = t("pro_added")
+T_ALREADY = t("pro_already")
+T_FAV_ADD = t("pro_fav_add")
+T_FAV_DEL = t("pro_fav_del")
 
 BRIEF = {
-    "fav_save": "ذخیره نشد؛ دوباره تلاش کنید.",
-    "playlist_add": "افزودن به پلی‌لیست انجام نشد؛ دوباره تلاش کنید.",
-    "not_owner": "این مورد متعلق به شما نیست.",
-    "generic": "انجام نشد؛ دوباره تلاش کنید.",
+    "fav_save": t("pro_brief_fav_save"),
+    "playlist_add": t("pro_brief_pl_add"),
+    "not_owner": t("pro_brief_not_owner"),
+    "generic": t("pro_brief_generic"),
 }
 
 COLORS = ["نارنجی", "آبی", "سبز", "بنفش", "صورتی", "زرد", "فیروزه‌ای", "خاکستری"]
+# COLORS stay Persian: they are stable storage values and callback_data.
+# Only the displayed picker labels are localized.
+_COLOR_KEY = {
+    "نارنجی": "pro_color_orange", "آبی": "pro_color_blue",
+    "سبز": "pro_color_green", "بنفش": "pro_color_purple",
+    "صورتی": "pro_color_pink", "زرد": "pro_color_yellow",
+    "فیروزه‌ای": "pro_color_teal", "خاکستری": "pro_color_gray",
+}
+
+
+def _color_label(color: str, lang: str) -> str:
+    return t(_COLOR_KEY.get(color, ""), lang) or color
+
+
+def _color_picker_rows(lang: str) -> list:
+    rows = [[InlineKeyboardButton(text=_color_label(c, lang),
+                                  callback_data=f"pro:color:{c}")]
+            for c in COLORS]
+    rows.append([InlineKeyboardButton(text=t("pro_no_color", lang),
+                                      callback_data="pro:color:")])
+    rows.append([InlineKeyboardButton(text=t("adm_cancel", lang),
+                                      callback_data="pro:cancel")])
+    return rows
 
 MAX_FAV_ROWS = 20
 MAX_PL_ROWS = 20
@@ -150,9 +170,9 @@ def _title_line(title: str, artist: str) -> str:
     return f"{title} – {artist}" if artist else title
 
 
-def _cancel_kb() -> InlineKeyboardMarkup:
+def _cancel_kb(lang: str = "fa") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="لغو", callback_data="pro:cancel")],
+        [InlineKeyboardButton(text=t("adm_cancel", lang), callback_data="pro:cancel")],
     ])
 
 
@@ -160,12 +180,13 @@ def _cancel_kb() -> InlineKeyboardMarkup:
 # Renderers
 # ---------------------------------------------------------------------------
 
-def _render_pro_view(conn: sqlite3.Connection, telegram_id: int):
-    """Return (text, keyboard) for the merged «🎵 حرفه ای» section."""
+def _render_pro_view(conn: sqlite3.Connection, telegram_id: int,
+                     lang: str = "fa"):
+    """Return (text, keyboard) for the merged «🎵 حرفه‌ای» section."""
     favs = dbmod.list_favorites(conn, telegram_id)[:MAX_FAV_ROWS]
     pls = dbmod.list_playlists(conn, telegram_id)[:MAX_PL_ROWS]
 
-    lines = [T_SECTION_TITLE, ""]
+    lines = [t("pro_section_title", lang), ""]
     kb: list[list[InlineKeyboardButton]] = []
 
     if favs:
@@ -176,27 +197,29 @@ def _render_pro_view(conn: sqlite3.Connection, telegram_id: int):
                 InlineKeyboardButton(text="❌", callback_data=f"fav:del:{f['id']}"),
             ])
     else:
-        lines.append(T_FAV_EMPTY)
+        lines.append(t("pro_fav_empty", lang))
 
-    lines += ["", T_PANEL_TITLE, ""]
+    lines += ["", t("pro_panel_title", lang), ""]
     if pls:
         for pl in pls:
             n = len(dbmod.playlist_items(conn, pl["id"]))
-            lines.append(f"▫️ {pl['name']} — {n} آهنگ")
+            lines.append(t("pro_pl_row", lang).format(name=pl["name"], n=n))
             kb.append([InlineKeyboardButton(
-                text=f"📂 {pl['name']} — {n} آهنگ", callback_data=f"plv:{pl['id']}")])
+                text=t("pro_pl_head", lang).format(name=pl["name"], n=n),
+                callback_data=f"plv:{pl['id']}")])
     else:
-        lines.append(T_PL_EMPTY)
+        lines.append(t("pro_pl_empty", lang))
 
-    kb.append([InlineKeyboardButton(text="➕ پلی‌لیست جدید", callback_data="pro:new")])
-    kb.append(_main_menu_row())
+    kb.append([InlineKeyboardButton(text=t("pro_new_playlist", lang), callback_data="pro:new")])
+    kb.append(_main_menu_row(lang))
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def _render_playlist_view(conn: sqlite3.Connection, pl: dict):
+def _render_playlist_view(conn: sqlite3.Connection, pl: dict,
+                          lang: str = "fa"):
     """Return (text, keyboard) for one playlist."""
     items = dbmod.playlist_items(conn, pl["id"])[:MAX_ITEM_ROWS]
-    lines = [f"📂 {pl['name']} — {len(items)} آهنگ"]
+    lines = [t("pro_pl_head", lang).format(name=pl["name"], n=len(items))]
     if pl.get("description"):
         lines.append(pl["description"])
 
@@ -211,17 +234,17 @@ def _render_playlist_view(conn: sqlite3.Connection, pl: dict):
                 InlineKeyboardButton(text="❌", callback_data=f"pro:rm:{it['id']}"),
             ])
     else:
-        lines += ["", T_PL_VIEW_EMPTY]
+        lines += ["", t("pro_pl_view_empty", lang)]
 
     kb.append([
-        InlineKeyboardButton(text="▶️ پخش پشت سر هم", callback_data=f"pro:playall:{pl['id']}"),
+        InlineKeyboardButton(text=t("pro_play_all", lang), callback_data=f"pro:playall:{pl['id']}"),
     ])
     kb.append([
-        InlineKeyboardButton(text="✏️ ویرایش", callback_data=f"pro:edit:{pl['id']}"),
-        InlineKeyboardButton(text="🗑 حذف", callback_data=f"pro:del:{pl['id']}"),
+        InlineKeyboardButton(text=t("pro_edit", lang), callback_data=f"pro:edit:{pl['id']}"),
+        InlineKeyboardButton(text=t("pro_delete", lang), callback_data=f"pro:del:{pl['id']}"),
     ])
-    kb.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data="pro:open")])
-    kb.append(_main_menu_row())
+    kb.append([InlineKeyboardButton(text=t("pro_back", lang), callback_data="pro:open")])
+    kb.append(_main_menu_row(lang))
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -239,8 +262,8 @@ async def _edit_or_answer(callback: CallbackQuery, text: str, kb: InlineKeyboard
         pass
 
 
-def _main_menu_row() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:main")]
+def _main_menu_row(lang: str = "fa") -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text=t("pro_main_menu", lang), callback_data="menu:main")]
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +276,8 @@ def register(router: Router) -> None:
     # --- favorites ---------------------------------------------------------
     @r.callback_query(F.data == "pro:open")
     async def pro_open(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
-        text, kb = _render_pro_view(conn, callback.from_user.id)
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
+        text, kb = _render_pro_view(conn, callback.from_user.id, lang)
         await _edit_or_answer(callback, text, kb)
         await callback.answer()
 
@@ -261,51 +285,53 @@ def register(router: Router) -> None:
     async def fav_toggle(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
         key = callback.data.split("fav:toggle:", 1)[1]
         res = get_result(key)
-        if not res:
-            await callback.answer(BRIEF["generic"], show_alert=True)
-            return
         uid = callback.from_user.id
+        lang = dbmod.user_lang_or_default(conn, uid)
+        if not res:
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
+            return
         title, artist = res["title"], res.get("artist", "")
         try:
             existing = _find_favorite(conn, uid, title, artist)
             if existing:
                 dbmod.remove_favorite(conn, existing["id"])
                 is_fav = False
-                msg = T_FAV_DEL.format(title=title)
+                msg = t("pro_fav_del", lang).format(title=title)
             else:
                 ok = dbmod.add_favorite(
                     conn, uid, title, artist, res.get("url", ""), res.get("preview_url", ""))
                 if not ok:
-                    await callback.answer(BRIEF["fav_save"], show_alert=True)
+                    await callback.answer(t("pro_brief_fav_save", lang), show_alert=True)
                     return
                 is_fav = True
-                msg = T_FAV_ADD.format(title=title)
+                msg = t("pro_fav_add", lang).format(title=title)
         except Exception:
-            await callback.answer(BRIEF["fav_save"], show_alert=True)
+            await callback.answer(t("pro_brief_fav_save", lang), show_alert=True)
             return
         await callback.answer(msg)
         try:
             await callback.message.edit_reply_markup(
                 reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=build_song_card_buttons(key, is_fav)))
+                    inline_keyboard=build_song_card_buttons(key, is_fav, lang)))
         except Exception:
             pass
 
     @r.callback_query(F.data.startswith("fav:play:"))
     async def fav_play(callback: CallbackQuery, conn: sqlite3.Connection,
                       config) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             fav_id = int(callback.data.split("fav:play:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         fav = _owns_favorite(conn, fav_id, callback.from_user.id)
         if not fav:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         audio = (fav.get("preview_url") or fav.get("url") or "").strip()
         if not audio:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         try:
             sent = await send_song_audio(
@@ -314,38 +340,42 @@ def register(router: Router) -> None:
             if sent is None:
                 raise RuntimeError("send failed")
         except Exception:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         await callback.answer()
 
     @r.callback_query(F.data.startswith("fav:del:"))
     async def fav_del(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             fav_id = int(callback.data.split("fav:del:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         fav = _owns_favorite(conn, fav_id, callback.from_user.id)
         if not fav:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         dbmod.remove_favorite(conn, fav_id)
-        await callback.answer(T_FAV_DEL.format(title=fav["title"]))
-        text, kb = _render_pro_view(conn, callback.from_user.id)
+        await callback.answer(t("pro_fav_del", lang).format(title=fav["title"]))
+        text, kb = _render_pro_view(conn, callback.from_user.id, lang)
         await _edit_or_answer(callback, text, kb)
 
     # --- create playlist ---------------------------------------------------
     @r.callback_query(F.data == "pro:new")
-    async def pro_new(callback: CallbackQuery, state: FSMContext) -> None:
+    async def pro_new(callback: CallbackQuery, state: FSMContext,
+                      conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         await state.set_state(ProStates.create_name)
-        await _edit_or_answer(callback, T_NEW_NAME, _cancel_kb())
+        await _edit_or_answer(callback, t("pro_name_prompt", lang), _cancel_kb(lang))
         await callback.answer()
 
     @r.callback_query(F.data == "pro:cancel")
     async def pro_cancel(callback: CallbackQuery, state: FSMContext,
                         conn: sqlite3.Connection) -> None:
         await state.clear()
-        text, kb = _render_pro_view(conn, callback.from_user.id)
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
+        text, kb = _render_pro_view(conn, callback.from_user.id, lang)
         await _edit_or_answer(callback, text, kb)
         await callback.answer()
 
@@ -353,49 +383,49 @@ def register(router: Router) -> None:
     @menu_escape
     async def pro_got_name(message: Message, state: FSMContext,
                            conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, message.from_user.id)
         name = (message.text or "").strip()
         if not name:
-            await message.answer(BRIEF["generic"])
+            await message.answer(t("pro_brief_generic", lang))
             return
         await state.update_data(name=name)
         await state.set_state(ProStates.create_desc)
         skip_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="رد کردن", callback_data="pro:skipdesc")],
-            [InlineKeyboardButton(text="لغو", callback_data="pro:cancel")],
+            [InlineKeyboardButton(text=t("pro_skip", lang), callback_data="pro:skipdesc")],
+            [InlineKeyboardButton(text=t("adm_cancel", lang), callback_data="pro:cancel")],
         ])
-        await message.answer(T_NEW_DESC, reply_markup=skip_kb)
+        await message.answer(t("pro_desc_prompt", lang), reply_markup=skip_kb)
 
     @r.callback_query(ProStates.create_desc, F.data == "pro:skipdesc")
-    async def pro_skip_desc(callback: CallbackQuery, state: FSMContext) -> None:
+    async def pro_skip_desc(callback: CallbackQuery, state: FSMContext,
+                          conn: sqlite3.Connection) -> None:
         await state.update_data(desc="")
-        await _ask_color(callback, state)
+        await _ask_color(callback, state, conn)
 
     @r.message(ProStates.create_desc)
     @menu_escape
     async def pro_got_desc(message: Message, state: FSMContext,
                            conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, message.from_user.id)
         await state.update_data(desc=(message.text or "").strip())
         await state.set_state(ProStates.create_color)
-        rows = [[InlineKeyboardButton(text=c, callback_data=f"pro:color:{c}")]
-                for c in COLORS]
-        rows.append([InlineKeyboardButton(text="بدون رنگ", callback_data="pro:color:")])
-        rows.append([InlineKeyboardButton(text="لغو", callback_data="pro:cancel")])
-        await message.answer("🎨 رنگ پلی‌لیست (اختیاری):",
+        rows = _color_picker_rows(lang)
+        await message.answer(t("pro_color_prompt", lang),
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
-    async def _ask_color(callback: CallbackQuery, state: FSMContext) -> None:
+    async def _ask_color(callback: CallbackQuery, state: FSMContext,
+                         conn: sqlite3.Connection) -> None:
         await state.set_state(ProStates.create_color)
-        rows = [[InlineKeyboardButton(text=c, callback_data=f"pro:color:{c}")]
-                for c in COLORS]
-        rows.append([InlineKeyboardButton(text="بدون رنگ", callback_data="pro:color:")])
-        rows.append([InlineKeyboardButton(text="لغو", callback_data="pro:cancel")])
-        await _edit_or_answer(callback, "🎨 رنگ پلی‌لیست (اختیاری):",
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
+        rows = _color_picker_rows(lang)
+        await _edit_or_answer(callback, t("pro_color_prompt", lang),
                               InlineKeyboardMarkup(inline_keyboard=rows))
         await callback.answer()
 
     @r.callback_query(ProStates.create_color, F.data.startswith("pro:color:"))
     async def pro_got_color(callback: CallbackQuery, state: FSMContext,
                             conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         color = callback.data.split("pro:color:", 1)[1]
         if color not in COLORS:
             color = ""
@@ -406,12 +436,12 @@ def register(router: Router) -> None:
                 conn, callback.from_user.id, data.get("name", ""),
                 data.get("desc", ""), color)
         except Exception:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
-        text = f"✅ پلی‌لیست «{pl['name']}» ساخته شد."
+        text = t("pro_created", lang).format(name=pl["name"])
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📂 مشاهده", callback_data=f"plv:{pl['id']}")],
-            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="pro:open")],
+            [InlineKeyboardButton(text=t("pro_view", lang), callback_data=f"plv:{pl['id']}")],
+            [InlineKeyboardButton(text=t("pro_back", lang), callback_data="pro:open")],
         ])
         await _edit_or_answer(callback, text, kb)
         await callback.answer()
@@ -419,35 +449,37 @@ def register(router: Router) -> None:
     # --- playlist view ------------------------------------------------------
     @r.callback_query(F.data.startswith("plv:"))
     async def pl_view(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("plv:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not pl:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
-        text, kb = _render_playlist_view(conn, pl)
+        text, kb = _render_playlist_view(conn, pl, lang)
         await _edit_or_answer(callback, text, kb)
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:rm:"))
     async def pl_remove_item(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             item_id = int(callback.data.split("pro:rm:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         item = _owns_item(conn, item_id, callback.from_user.id)
         if not item:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         dbmod.remove_from_playlist(conn, item_id)
         pl = _owns_playlist(conn, item["playlist_id"], callback.from_user.id)
-        await callback.answer("حذف شد.")
+        await callback.answer(t("pro_deleted", lang))
         if pl:
-            text, kb = _render_playlist_view(conn, pl)
+            text, kb = _render_playlist_view(conn, pl, lang)
             await _edit_or_answer(callback, text, kb)
 
     @r.callback_query(F.data.startswith("pro:up:"))
@@ -459,19 +491,20 @@ def register(router: Router) -> None:
         await _move_item(callback, conn, +1)
 
     async def _move_item(callback: CallbackQuery, conn: sqlite3.Connection, delta: int) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             item_id = int(callback.data.rsplit(":", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         item = _owns_item(conn, item_id, callback.from_user.id)
         if not item:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         items = dbmod.playlist_items(conn, item["playlist_id"])
         idx = next((i for i, it in enumerate(items) if it["id"] == item_id), None)
         if idx is None:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         j = idx + delta
         if not (0 <= j < len(items)):
@@ -481,27 +514,28 @@ def register(router: Router) -> None:
         dbmod.reorder_playlist(conn, item["playlist_id"], [it["id"] for it in items])
         pl = _owns_playlist(conn, item["playlist_id"], callback.from_user.id)
         if pl:
-            text, kb = _render_playlist_view(conn, pl)
+            text, kb = _render_playlist_view(conn, pl, lang)
             await _edit_or_answer(callback, text, kb)
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:playall:"))
     async def pl_play_all(callback: CallbackQuery, conn: sqlite3.Connection,
                          config) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("pro:playall:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not pl:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         items = dbmod.playlist_items(conn, pid)
         if not items:
-            await callback.answer(T_PL_VIEW_EMPTY, show_alert=True)
+            await callback.answer(t("pro_pl_view_empty", lang), show_alert=True)
             return
-        await callback.answer("در حال پخش…")
+        await callback.answer(t("pro_playing", lang))
         played = 0
         for it in items:
             audio = (it.get("preview_url") or it.get("url") or "").strip()
@@ -517,29 +551,30 @@ def register(router: Router) -> None:
             except Exception:
                 break
         if not played:
-            await callback.message.answer("پخش انجام نشد؛ دوباره تلاش کنید.")
+            lang2 = dbmod.user_lang_or_default(conn, callback.from_user.id)
+            await callback.message.answer(t("pro_play_failed", lang2))
 
     # --- edit playlist ------------------------------------------------------
     @r.callback_query(F.data.startswith("pro:edit:"))
     async def pl_edit_menu(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("pro:edit:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not pl:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
-        text = (f"✏️ ویرایش «{pl['name']}»\n"
-                f"نام: {pl['name']}\n"
-                f"توضیح: {pl['description'] or '—'}\n"
-                f"رنگ: {pl['color'] or '—'}")
+        text = t("pro_edit_head", lang).format(
+            name=pl["name"], desc=pl["description"] or "—",
+            color=_color_label(pl["color"], lang) if pl["color"] else "—")
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="ویرایش نام", callback_data=f"pro:editname:{pid}")],
-            [InlineKeyboardButton(text="ویرایش توضیح", callback_data=f"pro:editdesc:{pid}")],
-            [InlineKeyboardButton(text="تغییر رنگ", callback_data=f"pro:editcolor:{pid}")],
-            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"plv:{pid}")],
+            [InlineKeyboardButton(text=t("pro_edit_name", lang), callback_data=f"pro:editname:{pid}")],
+            [InlineKeyboardButton(text=t("pro_edit_desc", lang), callback_data=f"pro:editdesc:{pid}")],
+            [InlineKeyboardButton(text=t("pro_edit_color", lang), callback_data=f"pro:editcolor:{pid}")],
+            [InlineKeyboardButton(text=t("pro_back", lang), callback_data=f"plv:{pid}")],
         ])
         await _edit_or_answer(callback, text, kb)
         await callback.answer()
@@ -547,75 +582,82 @@ def register(router: Router) -> None:
     @r.callback_query(F.data.startswith("pro:editname:"))
     async def pl_edit_name_start(callback: CallbackQuery, state: FSMContext,
                                 conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("pro:editname:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         if not _owns_playlist(conn, pid, callback.from_user.id):
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         await state.update_data(pid=pid)
         await state.set_state(ProStates.edit_name)
-        await _edit_or_answer(callback, "نام جدید پلی‌لیست", _cancel_kb())
+        await _edit_or_answer(callback, t("pro_new_name", lang), _cancel_kb(lang))
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:editdesc:"))
     async def pl_edit_desc_start(callback: CallbackQuery, state: FSMContext,
                                 conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("pro:editdesc:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         if not _owns_playlist(conn, pid, callback.from_user.id):
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         await state.update_data(pid=pid)
         await state.set_state(ProStates.edit_desc)
-        await _edit_or_answer(callback, "توضیح جدید پلی‌لیست", _cancel_kb())
+        await _edit_or_answer(callback, t("pro_new_desc", lang), _cancel_kb(lang))
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:editcolor:"))
     async def pl_edit_color_start(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         try:
             pid = int(callback.data.split("pro:editcolor:", 1)[1])
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         if not _owns_playlist(conn, pid, callback.from_user.id):
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
-        rows = [[InlineKeyboardButton(text=c, callback_data=f"pro:setcolor:{c}:{pid}")]
+        rows = [[InlineKeyboardButton(text=_color_label(c, lang),
+                                       callback_data=f"pro:setcolor:{c}:{pid}")]
                 for c in COLORS]
-        rows.append([InlineKeyboardButton(text="بدون رنگ", callback_data=f"pro:setcolor::{pid}")])
-        rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"pro:edit:{pid}")])
-        await _edit_or_answer(callback, "🎨 رنگ پلی‌لیست (اختیاری):",
+        rows.append([InlineKeyboardButton(text=t("pro_no_color", lang),
+                                          callback_data=f"pro:setcolor::{pid}")])
+        rows.append([InlineKeyboardButton(text=t("pro_back", lang),
+                                          callback_data=f"pro:edit:{pid}")])
+        await _edit_or_answer(callback, t("pro_color_prompt", lang),
                               InlineKeyboardMarkup(inline_keyboard=rows))
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:setcolor:"))
     async def pl_set_color(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         parts = callback.data.split("pro:setcolor:", 1)[1].rsplit(":", 1)
         if len(parts) != 2:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         color, pid_s = parts
         try:
             pid = int(pid_s)
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not pl:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         if color and color not in COLORS:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         set_playlist_color(conn, pid, color)
-        await callback.answer("ذخیره شد.")
-        text, kb = _render_playlist_view(conn, _owns_playlist(conn, pid, callback.from_user.id))
+        await callback.answer(t("pro_saved", lang))
+        text, kb = _render_playlist_view(conn, _owns_playlist(conn, pid, callback.from_user.id), lang)
         await _edit_or_answer(callback, text, kb)
 
     @r.message(ProStates.edit_name)
@@ -625,17 +667,18 @@ def register(router: Router) -> None:
         data = await state.get_data()
         pid = data.get("pid")
         await state.clear()
+        lang = dbmod.user_lang_or_default(conn, message.from_user.id)
         if not pid or not _owns_playlist(conn, pid, message.from_user.id):
-            await message.answer(BRIEF["not_owner"])
+            await message.answer(t("pro_brief_not_owner", lang))
             return
         name = (message.text or "").strip()
         if not name:
-            await message.answer(BRIEF["generic"])
+            await message.answer(t("pro_brief_generic", lang))
             return
         dbmod.rename_playlist(conn, pid, name)
         pl = _owns_playlist(conn, pid, message.from_user.id)
-        text, kb = _render_playlist_view(conn, pl)
-        await message.answer("ذخیره شد.")
+        text, kb = _render_playlist_view(conn, pl, lang)
+        await message.answer(t("pro_saved", lang))
         await message.answer(text, reply_markup=kb)
 
     @r.message(ProStates.edit_desc)
@@ -645,100 +688,104 @@ def register(router: Router) -> None:
         data = await state.get_data()
         pid = data.get("pid")
         await state.clear()
+        lang = dbmod.user_lang_or_default(conn, message.from_user.id)
         if not pid or not _owns_playlist(conn, pid, message.from_user.id):
-            await message.answer(BRIEF["not_owner"])
+            await message.answer(t("pro_brief_not_owner", lang))
             return
         pl = _owns_playlist(conn, pid, message.from_user.id)
         dbmod.rename_playlist(conn, pid, pl["name"], (message.text or "").strip())
         pl = _owns_playlist(conn, pid, message.from_user.id)
-        text, kb = _render_playlist_view(conn, pl)
-        await message.answer("ذخیره شد.")
+        text, kb = _render_playlist_view(conn, pl, lang)
+        await message.answer(t("pro_saved", lang))
         await message.answer(text, reply_markup=kb)
 
     # --- delete playlist ----------------------------------------------------
     @r.callback_query(F.data.startswith("pro:del:"))
     async def pl_del_confirm(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         rest = callback.data.split("pro:del:", 1)[1]
         if rest.startswith("yes:"):
             try:
                 pid = int(rest.split("yes:", 1)[1])
             except ValueError:
-                await callback.answer(BRIEF["generic"], show_alert=True)
+                await callback.answer(t("pro_brief_generic", lang), show_alert=True)
                 return
             pl = _owns_playlist(conn, pid, callback.from_user.id)
             if not pl:
-                await callback.answer(BRIEF["not_owner"], show_alert=True)
+                await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
                 return
             dbmod.delete_playlist(conn, pid)
-            await callback.answer("حذف شد.")
-            text, kb = _render_pro_view(conn, callback.from_user.id)
+            await callback.answer(t("pro_deleted", lang))
+            text, kb = _render_pro_view(conn, callback.from_user.id, lang)
             await _edit_or_answer(callback, text, kb)
             return
         try:
             pid = int(rest)
         except ValueError:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not pl:
-            await callback.answer(BRIEF["not_owner"], show_alert=True)
+            await callback.answer(t("pro_brief_not_owner", lang), show_alert=True)
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="بله، حذف شود",
+            [InlineKeyboardButton(text=t("pro_yes_delete", lang),
                                   callback_data=f"pro:del:yes:{pid}")],
-            [InlineKeyboardButton(text="لغو", callback_data=f"plv:{pid}")],
+            [InlineKeyboardButton(text=t("adm_cancel", lang), callback_data=f"plv:{pid}")],
         ])
-        await _edit_or_answer(callback, f"«{pl['name']}» حذف شود؟", kb)
+        await _edit_or_answer(callback, t("pro_confirm_del", lang).format(name=pl["name"]), kb)
         await callback.answer()
 
     # --- add to playlist -----------------------------------------------------
     @r.callback_query(F.data.startswith("pro:pick:"))
     async def pl_pick(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         key = callback.data.split("pro:pick:", 1)[1]
         res = get_result(key)
         if not res:
-            await callback.answer(BRIEF["generic"], show_alert=True)
+            await callback.answer(t("pro_brief_generic", lang), show_alert=True)
             return
         pls = dbmod.list_playlists(conn, callback.from_user.id)
         title = res["title"]
         if not pls:
-            await callback.answer(T_NO_PLAYLISTS, show_alert=True)
+            await callback.answer(t("pro_no_pl_yet", lang), show_alert=True)
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=pl["name"], callback_data=f"pro:add:{pl['id']}:{key}")]
             for pl in pls
         ])
-        await _edit_or_answer(callback, T_PICK_TITLE.format(title=title), kb)
+        await _edit_or_answer(callback, t("pro_pick_title", lang).format(title=title), kb)
         await callback.answer()
 
     @r.callback_query(F.data.startswith("pro:add:"))
     async def pl_add(callback: CallbackQuery, conn: sqlite3.Connection) -> None:
+        lang = dbmod.user_lang_or_default(conn, callback.from_user.id)
         rest = callback.data.split("pro:add:", 1)[1]
         try:
             pid_s, key = rest.split(":", 1)
             pid = int(pid_s)
         except ValueError:
-            await callback.answer(BRIEF["playlist_add"], show_alert=True)
+            await callback.answer(t("pro_brief_pl_add", lang), show_alert=True)
             return
         res = get_result(key)
         pl = _owns_playlist(conn, pid, callback.from_user.id)
         if not res or not pl:
-            await callback.answer(BRIEF["playlist_add"], show_alert=True)
+            await callback.answer(t("pro_brief_pl_add", lang), show_alert=True)
             return
         try:
             added = dbmod.add_to_playlist(
                 conn, pid, res["title"], res.get("artist", ""),
                 res.get("url", ""), res.get("preview_url", ""))
         except Exception:
-            await callback.answer(BRIEF["playlist_add"], show_alert=True)
+            await callback.answer(t("pro_brief_pl_add", lang), show_alert=True)
             return
         if added:
-            await callback.answer(T_ADDED.format(title=res["title"], name=pl["name"]),
+            await callback.answer(t("pro_added", lang).format(title=res["title"], name=pl["name"]),
                                   show_alert=True)
         else:
-            await callback.answer(T_ALREADY.format(title=res["title"], name=pl["name"]),
+            await callback.answer(t("pro_already", lang).format(title=res["title"], name=pl["name"]),
                                   show_alert=True)
-        text, kb = _render_playlist_view(conn, pl)
+        text, kb = _render_playlist_view(conn, pl, lang)
         await _edit_or_answer(callback, text, kb)
 
     router.include_router(r)

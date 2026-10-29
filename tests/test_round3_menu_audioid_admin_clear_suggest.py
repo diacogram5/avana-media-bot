@@ -186,7 +186,7 @@ def test_owner_only_decorator_denies_non_owner(db):
 
     denied = []
 
-    async def _deny(event):
+    async def _deny(event, lang="fa"):
         denied.append(True)
 
     orig = adminfeat._deny_owner

@@ -1,4 +1,4 @@
-"""Tests for app/features/pro.py — «🎵 حرفه ای» (favorites + playlists).
+"""Tests for app/features/pro.py — «🎵 حرفه‌ای» (favorites + playlists).
 No network; uses the tmp-sqlite `db` fixture from tests/conftest.py.
 """
 import re
@@ -107,12 +107,12 @@ def test_ownership_guard_user_b_cannot_touch_user_a(db):
 
 def test_colors_and_spec_texts():
     assert pro.COLORS == ["نارنجی", "آبی", "سبز", "بنفش", "صورتی", "زرد", "فیروزه‌ای", "خاکستری"]
-    assert pro.T_SECTION_TITLE == "🎵 حرفه ای — علاقه‌مندی‌ها"
+    assert pro.T_SECTION_TITLE == "🎵 حرفه‌ای — علاقه‌مندی‌ها"
     assert pro.T_FAV_EMPTY.startswith("هنوز آهنگی ذخیره نشده است.")
     assert "پلی‌لیست جدید" in pro.T_PL_EMPTY
     assert pro.T_PL_VIEW_EMPTY.startswith("هنوز آهنگی در این پلی‌لیست نیست؛")
     assert pro.T_PICK_TITLE.format(title="دوست دارم") == "افزودن «دوست دارم» به کدام پلی‌لیست؟"
-    assert pro.T_NO_PLAYLISTS == "هنوز پلی‌لیستی ندارید؛ از «قابلیت‌ها ← 🎵 حرفه ای» اول یکی بسازید."
+    assert pro.T_NO_PLAYLISTS == "هنوز پلی‌لیستی ندارید؛ از «قابلیت‌ها ← 🎵 حرفه‌ای» اول یکی بسازید."
     assert pro.T_ADDED.format(title="ت", name="ن") == "«ت» به پلی‌لیست «ن» اضافه شد."
     assert pro.T_ALREADY.format(title="ت", name="ن") == "«ت» از قبل در پلی‌لیست «ن» هست."
     assert pro.T_FAV_ADD.format(title="ت") == "افزودن «ت» به علاقه‌مندی‌ها"
@@ -124,7 +124,7 @@ def test_pro_view_renders_favorites_and_playlists(db):
     pl = dbmod.create_playlist(db, 111, "غمگین")
     dbmod.add_to_playlist(db, pl["id"], "یک", "الف")
     text, kb = pro._render_pro_view(db, 111)
-    assert "🎵 حرفه ای — علاقه‌مندی‌ها" in text
+    assert "🎵 حرفه‌ای — علاقه‌مندی‌ها" in text
     assert "پلی‌لیست‌های من" in text
     assert "دوست دارم – مهدی احمدوند" in text
     assert "غمگین — 1 آهنگ" in text

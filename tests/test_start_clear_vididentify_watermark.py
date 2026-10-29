@@ -107,6 +107,8 @@ class _FakeState:
 
 def test_cmd_start_sends_welcome_and_menu_and_clears_state(db):
     cfg = Config(bot_token="x", owner_id=1)
+    # Returning user (language already chosen): welcome + menu, no picker.
+    dbmod.set_user_language(db, 11, "fa")
     msg = _FakeMessage(uid=11)
     state = _FakeState()
     asyncio.run(handlers.cmd_start(msg, db, cfg, state))

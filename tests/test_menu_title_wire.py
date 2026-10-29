@@ -1,11 +1,12 @@
 """Focused tests for the persistent-menu button wiring fix (2026-10-29).
 
-Regression: the seeded «professional» title is ' 🎵 حرفه ای' (leading
-space, see migrations/009_menu_features.sql). ``text_handler`` strips
-incoming text, so the exact-match lookup in ``menu_title_key`` missed and
-a tap on «🎵 حرفه‌ای» fell through to a catalog search instead of opening
-the professional (favorites + playlists) view. The lookup now compares
-stripped titles on both sides.
+Regression: the seeded «professional» title used to be ' 🎵 حرفه ای'
+(leading space, see migrations/009_menu_features.sql); migration 014
+normalised it to '🎵 حرفه‌ای'. ``text_handler`` strips incoming text, so
+the exact-match lookup in ``menu_title_key`` missed and a tap on
+«🎵 حرفه‌ای» fell through to a catalog search instead of opening the
+professional (favorites + playlists) view. The lookup now compares
+stripped titles on both sides, so legacy stored titles still match.
 
 No network is used: the pro view is DB-only.
 """
@@ -77,7 +78,11 @@ def test_every_visible_title_round_trips_to_its_key(db):
 
 
 def test_menu_title_key_strips_both_sides(db):
-    assert _pro_title(db).startswith(" "), "seed precondition changed"
+    # The seed is normalised to '🎵 حرفه‌ای' (migration 014); a legacy DB
+    # may still hold the old spaced title — the lookup must match both.
+    assert _pro_title(db) == "🎵 حرفه‌ای"
+    db.execute("UPDATE features SET title=' 🎵 حرفه ای' WHERE key='professional'")
+    db.commit()
     assert menu_title_key(db, _pro_title(db)) == "professional"
     assert menu_title_key(db, _pro_title(db).strip()) == "professional"
     assert menu_title_key(db, "  ") is None
@@ -90,7 +95,7 @@ def test_professional_button_tap_opens_pro_view_not_search(db):
     asyncio.run(handlers.text_handler(msg, db, cfg, _FakeState()))
     assert msg.answers, "button tap produced no reply"
     text, kwargs = msg.answers[0]
-    assert "حرفه ای" in text, f"pro view not rendered: {text[:60]!r}"
+    assert "حرفه‌ای" in text, f"pro view not rendered: {text[:60]!r}"
     assert "در حال جستجو" not in text, "tap fell through to search!"
     kb = kwargs.get("reply_markup")
     assert isinstance(kb, InlineKeyboardMarkup)
@@ -113,4 +118,4 @@ def test_professional_title_escapes_mid_flow_state(db):
     asyncio.run(handlers.text_handler(msg, db, cfg, state))
     assert msg.answers, "no reply"
     text, _ = msg.answers[0]
-    assert "حرفه ای" in text, f"did not escape to pro view: {text[:60]!r}"
+    assert "حرفه‌ای" in text, f"did not escape to pro view: {text[:60]!r}"

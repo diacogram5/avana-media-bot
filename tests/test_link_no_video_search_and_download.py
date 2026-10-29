@@ -113,7 +113,7 @@ async def test_link_handler_no_video_search_and_own_video(monkeypatch, db):
 
     seen = {}
 
-    async def fake_identify_link(outcome, cfg):
+    async def fake_identify_link(outcome, cfg, *args, **kwargs):
         seen["link_url"] = outcome.official_url
         return ("identified", "Dooset Daram", "Mehdi Ahmadvand", False)
 
@@ -142,7 +142,7 @@ async def test_link_handler_no_video_search_and_own_video(monkeypatch, db):
 async def test_link_handler_platform_video_official_only(monkeypatch, db):
     config = Config()
 
-    async def fake_identify_link(outcome, cfg):
+    async def fake_identify_link(outcome, cfg, *args, **kwargs):
         return ("needs_file", "", "", True)
 
     monkeypatch.setattr(handlers, "_identify_link_audio", fake_identify_link)

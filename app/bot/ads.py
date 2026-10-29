@@ -16,6 +16,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Awaitable, Callable
 
+from ..i18n import t
+
 DEFAULT_EVERY_N = 5
 
 
@@ -53,12 +55,12 @@ def ad_text(ad: dict) -> str:
     return f"📢 تبلیغ\n{ad.get('title', '')}\n{ad.get('text', '')}".strip()
 
 
-def ad_keyboard(ad: dict):
+def ad_keyboard(ad: dict, lang: str = "fa"):
     link = (ad.get("link") or "").strip()
     if not link:
         return None
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    label = (ad.get("button_text") or "مشاهده").strip() or "مشاهده"
+    label = (ad.get("button_text") or "").strip() or t("ad_view_btn", lang)
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=label, url=link)]])
 

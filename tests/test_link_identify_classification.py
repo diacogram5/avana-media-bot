@@ -81,7 +81,7 @@ def _patch_gating(monkeypatch, value, seen=None):
 
 
 def _patch_identify_audio(monkeypatch, status, detail="lookup_error"):
-    async def fake_identify(data, filename, config):
+    async def fake_identify(data, filename, config, *args, **kwargs):
         assert data == AUDIO_BYTES
         return AudioIdResult(status=status, detail=detail)
     monkeypatch.setattr(H, "_identify_audio", fake_identify)

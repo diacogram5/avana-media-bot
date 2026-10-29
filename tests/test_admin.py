@@ -322,8 +322,14 @@ def test_clear_view_exact_texts():
     assert adm.CLEAR_TITLE in text
     assert adm.CLEAR_EXPLAINER in text
     assert adm.CLEAR_SEPARATE in text
+    assert adm.CLEAR_48H in text
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "adm:clear:yes" in datas and "adm:wipe" in datas
+    # Three visually distinct operations: state / messages / saved data.
+    assert "adm:clear:state" in datas
+    assert "adm:clear:msgs" in datas
+    assert "adm:wipe" in datas
+    assert "adm:clear:no" in datas
+    assert "adm:clear:yes" not in datas, "the conflated clear button is gone"
 
 
 # --- delete-all-my-data ----------------------------------------------------------------------

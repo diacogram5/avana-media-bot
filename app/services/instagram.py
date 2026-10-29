@@ -125,6 +125,8 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
     """
     base = _base(page_url)
     page_text = ""
+    import time as _time
+    _t0 = _time.time()
     try:
         async with httpx.AsyncClient(timeout=_STRATEGY_TIMEOUT,
                                      follow_redirects=True) as client:
@@ -140,7 +142,8 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                     page_text = extract_page_text(page)
                 media_url = extract_media_url(page)
                 if media_url:
-                    log_event(log, "instagram_resolve", strategy=name)
+                    log_event(log, "instagram_resolve", strategy=name,
+                              ms=int((_time.time() - _t0) * 1000))
                     return media_url, media_url, page_text, name
             # Last resort: crawler view embeds the DASH manifest with
             # separate audio/video streams.
@@ -151,9 +154,12 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                 audio_url = extract_dash_audio_url(page)
                 video_url = extract_dash_video_url(page)
                 if audio_url or video_url:
-                    log_event(log, "instagram_resolve", strategy="crawler_dash")
+                    log_event(log, "instagram_resolve",
+                              strategy="crawler_dash",
+                              ms=int((_time.time() - _t0) * 1000))
                     return audio_url, video_url, page_text, "crawler_dash"
     except Exception as exc:
         log_event(log, "instagram_resolve_error", error=str(exc)[:100])
-    log_event(log, "instagram_resolve", strategy="none")
+    log_event(log, "instagram_resolve", strategy="none",
+              ms=int((_time.time() - _t0) * 1000))
     return None, None, page_text, "none"

@@ -9,7 +9,7 @@ from __future__ import annotations
 import functools
 
 from .. import db as dbmod
-from ..i18n import t
+from ..i18n import t, toggle_texts
 
 # Legacy alias: the live user menu is the dynamic «قابلیت‌ها» menu built
 # from the features table (see capabilities_menu). Kept so existing
@@ -41,7 +41,58 @@ def capabilities_menu(conn) -> list[dict]:
             if f.get("enabled") and f.get("visible")]
 
 
-def menu_title_key(conn, text: str) -> str | None:
+# Persistent-menu collapse toggle labels. The Persian constants stay as the
+# fa source of truth (existing callers/tests); rendering uses
+# ``toggle_close_text(lang)`` / ``toggle_open_text(lang)``. A tap is
+# recognised in ANY language variant, because the user taps the button in
+# whatever language it was last rendered in.
+MENU_TOGGLE_CLOSE = "🔽 بستن منو"
+MENU_TOGGLE_OPEN = "☰ منو"
+
+
+def toggle_close_text(lang: str = "fa") -> str:
+    return t("m_toggle_close", lang)
+
+
+def toggle_open_text(lang: str = "fa") -> str:
+    return t("m_toggle_open", lang)
+
+
+def _all_toggle_texts() -> set[str]:
+    out = set()
+    for kind in ("close", "open"):
+        out.update(toggle_texts(kind).values())
+    return out
+
+
+def is_menu_toggle(text: str) -> bool:
+    """True when the text is one of the menu-collapse toggle labels, in any
+    of the three UI languages."""
+    return (text or "").strip() in _all_toggle_texts()
+
+
+def is_menu_toggle_close(text: str) -> bool:
+    """True when the text is a «close menu» label in any language."""
+    return (text or "").strip() in set(toggle_texts("close").values())
+
+
+def feature_title_localized(conn, key: str, lang: str) -> str | None:
+    """Localized title for a persistent-menu feature button.
+
+    Persian ("fa") keeps the admin-managed DB title byte-identical
+    (admins can rename buttons); other languages render the fixed
+    ``ftitle_<key>`` chrome string. Custom (admin-added) features have no
+    fixed translation and keep their DB title in every language.
+    """
+    if lang == "fa":
+        return None
+    title = t("ftitle_" + key, lang)
+    if title == "ftitle_" + key:
+        return None  # no fixed translation (custom feature) -> DB title
+    return title
+
+
+def menu_title_key(conn, text: str, lang: str = "fa") -> str | None:
     """Map a message text to a feature key when it matches a visible menu
     button title (handles admin renames).
 
@@ -50,6 +101,9 @@ def menu_title_key(conn, text: str) -> str | None:
     match the stripped text that arrives when the button is tapped.
     Without this, the tap misses the lookup and falls through to a
     catalog search instead of opening the feature.
+
+    In non-Persian UI languages the tap carries the LOCALIZED title, so
+    those variants are matched too (fa keeps matching the DB title).
     """
     want = (text or "").strip()
     if not want:
@@ -57,6 +111,10 @@ def menu_title_key(conn, text: str) -> str | None:
     for f in capabilities_menu(conn):
         if (f.get("title") or "").strip() == want:
             return f["key"]
+        if lang != "fa":
+            loc = feature_title_localized(conn, f["key"], lang)
+            if loc is not None and loc.strip() == want:
+                return f["key"]
     return None
 
 
@@ -66,6 +124,11 @@ def menu_escape(handler):
     input. The stale FSM state is cleared and the menu action runs, so
     the user can never be trapped in a dead-end step.
 
+    The menu-collapse toggle («🔽 بستن منو» / «☰ منو») is intercepted here
+    too, so it works from every screen: it only flips the keyboard and
+    never clears the flow state (a collapse tap is a display change, not
+    a navigation away from the flow).
+
     The ``handlers`` import is deferred to call time because
     ``app.bot.handlers`` imports the feature modules.
     """
@@ -74,17 +137,25 @@ def menu_escape(handler):
         conn = kwargs.get("conn")
         state = kwargs.get("state")
         text = (getattr(message, "text", None) or "").strip()
-        if conn is not None and state is not None and text:
-            key = menu_title_key(conn, text)
-            if key is not None:
-                try:
-                    await state.clear()
-                except Exception:
-                    pass
-                from . import handlers as _H
-                await _H._run_menu_title(
-                    message, conn, kwargs.get("config"), state, key)
+        if conn is not None and text:
+            from . import handlers as _H
+            if is_menu_toggle(text):
+                # Pure display change: flip the keyboard, keep the flow.
+                await _H._run_menu_toggle(
+                    message, conn, kwargs.get("config"), text)
                 return
+            if state is not None:
+                ulang = dbmod.user_lang_or_default(
+                    conn, getattr(getattr(message, "from_user", None), "id", None))
+                key = menu_title_key(conn, text, ulang)
+                if key is not None:
+                    try:
+                        await state.clear()
+                    except Exception:
+                        pass
+                    await _H._run_menu_title(
+                        message, conn, kwargs.get("config"), state, key)
+                    return
         return await handler(message, *args, **kwargs)
     return wrapper
 
@@ -114,6 +185,17 @@ def clean_title(result) -> str:
 
 
 BRIEF_ERRORS = {
+    "search": "err_search",
+    "identify": "err_identify",
+    "file": "err_file",
+    "lyrics": "err_lyrics",
+    "voice": "err_voice",
+    "translate": "err_translate",
+    "suggest": "err_suggest",
+    "not_found": "no_results",
+}
+# fa literals kept for any direct reference; rendering goes through t().
+BRIEF_ERRORS_FA = {
     "search": "⚠️ جستجو با خطا مواجه شد. دوباره تلاش کنید.",
     "identify": "⚠️ شناسایی آهنگ با خطا مواجه شد. ویدیو را مستقیم بفرستید.",
     "file": "⚠️ ارسال فایل با خطا مواجه شد. دوباره تلاش کنید.",
@@ -125,9 +207,13 @@ BRIEF_ERRORS = {
 }
 
 
-def brief_error(kind: str) -> str:
-    """One short Persian line for a failure: what failed + what to do."""
-    return BRIEF_ERRORS.get(kind, BRIEF_ERRORS["search"])
+def brief_error(kind: str, lang: str = "fa") -> str:
+    """One short line for a failure: what failed + what to do.
+
+    UI chrome only — never a traceback, never translated song content.
+    """
+    key = BRIEF_ERRORS.get(kind, BRIEF_ERRORS["search"])
+    return t(key, lang)
 
 
 def attach_bot_id(text: str, bot_id: str) -> str:
@@ -165,7 +251,7 @@ def is_video_file_url(url: str) -> bool:
     return path.endswith(VIDEO_EXTENSIONS)
 
 
-def link_video_delivery(outcome) -> tuple[str, str]:
+def link_video_delivery(outcome, lang: str = "fa") -> tuple[str, str]:
     """How the video of a sent link is delivered — never a catalog search.
 
     - Direct public video file: the same file, sent for download.
@@ -179,12 +265,12 @@ def link_video_delivery(outcome) -> tuple[str, str]:
     url = outcome.official_url or ""
     if outcome.kind == "direct_file" and is_video_file_url(url):
         return ("direct_video_file",
-                "🎬 ویدیوی همان لینک برای دانلود:\n" + url)
+                t("m_link_video_dl_head", lang).format(url=url))
     if outcome.kind in ("youtube", "instagram", "aparat", "video"):
         # Professional minimal: the official video itself, nothing else.
         # No lecture paragraph, no extra sections. Private/protected
         # content is still never bypassed (see media policy in code).
-        return ("platform_official", "🎬 ویدیوی همان لینک:\n" + url)
+        return ("platform_official", t("m_link_video_head", lang) + url)
     return ("official_link", "")
 
 

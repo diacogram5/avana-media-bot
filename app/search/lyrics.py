@@ -34,6 +34,8 @@ from __future__ import annotations
 import html
 import re
 
+from ..i18n import t
+
 import httpx
 
 # ------------------------------------------------------------------ LANGS
@@ -85,14 +87,13 @@ def language_picker_rows(page: int = 0, key: str = "",
 
 
 # ------------------------------------------------------------ NOT-FOUND TEXT
-def lyrics_not_found_text(query: str) -> str:
+def lyrics_not_found_text(query: str, lang: str = "fa") -> str:
     """Exact spec text: honest not-found for a lyrics request."""
-    return (f"متن ترانه «{query}» در منابع متن آهنگ پیدا نشد. "
-            f"نام خواننده و آهنگ را با هم بنویسید، مثلاً: «مهدی احمدوند - دوست دارم».")
+    return t("lyr_not_found", lang).format(query=query)
 
 
 # ------------------------------------------------------- SAME-LANGUAGE GUARD
-SAME_LANGUAGE_MSG = "متن آهنگ از قبل به همین زبان است."
+SAME_LANGUAGE_MSG = t("lyr_same_lang")
 
 _PERSIAN_ONLY_LETTERS = frozenset("گچپژ")
 _ARABIC_SCRIPT = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
@@ -114,7 +115,8 @@ def guess_script_lang(text: str) -> str | None:
     return "fa" if any(ch in _PERSIAN_ONLY_LETTERS for ch in letters) else "ar"
 
 
-def same_language_notice(text: str, target_lang: str) -> str | None:
+def same_language_notice(text: str, target_lang: str,
+                       lang: str = "fa") -> str | None:
     """Return SAME_LANGUAGE_MSG when the text already looks like the
     target language (script-based guess); None otherwise. Call this
     BEFORE translate_text so the caller can say so honestly instead of
@@ -123,7 +125,7 @@ def same_language_notice(text: str, target_lang: str) -> str | None:
         return None
     base = LANG_CODES.get(target_lang, target_lang).split("-")[0].lower()
     if guess_script_lang(text) == base:
-        return SAME_LANGUAGE_MSG
+        return t("lyr_same_lang", lang)
     return None
 
 

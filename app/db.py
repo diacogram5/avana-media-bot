@@ -24,7 +24,7 @@ DEFAULT_FEATURES = [
     ("song_search", "جستجوی آهنگ و ویدیو", 1, 1, 1),
     ("suggest", "درخواست آهنگ", 2, 1, 1),
     ("downloader", "دانلودر هوشمند", 3, 1, 1),
-    ("professional", " 🎵 حرفه ای", 4, 1, 1),
+    ("professional", "🎵 حرفه‌ای", 4, 1, 1),
     ("lyrics", "متن آهنگ", 5, 1, 1),
     ("clear_chat", "پاک‌سازی وضعیت گفت‌وگو", 6, 1, 1),
     ("history", "تاریخچه جستجو", 7, 1, 1),
@@ -172,6 +172,66 @@ def set_feature(conn, key: str, enabled: bool | None = None, visible: bool | Non
     )
     audit(conn, by_id, "set_feature", f"{key} enabled={enabled} visible={visible}")
     conn.commit()
+
+
+# --- persistent menu collapse (per user) ----------------------------------
+def menu_collapsed(conn, telegram_id: int) -> bool:
+    """True when this user collapsed the bottom menu (only «☰ منو» shown).
+
+    Stored in the DB, so it survives bot code restarts. Honest limit: on
+    Render's free tier bot.db itself is ephemeral, so a restart/redeploy
+    resets this to open (False) — see migrations/013_menu_collapse.sql.
+    """
+    row = conn.execute(
+        "SELECT collapsed FROM menu_collapse WHERE telegram_id=?",
+        (telegram_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def set_menu_collapsed(conn, telegram_id: int, collapsed: bool) -> None:
+    conn.execute(
+        "INSERT INTO menu_collapse (telegram_id, collapsed) VALUES (?,?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET collapsed=excluded.collapsed",
+        (telegram_id, 1 if collapsed else 0))
+    conn.commit()
+
+
+# --- per-user UI language (fa/en/ar) --------------------------------------
+SUPPORTED_LANGS = ("fa", "en", "ar")
+
+
+def user_language(conn, telegram_id: int) -> str | None:
+    """The user's chosen UI language, or None when never chosen.
+
+    Stored in the DB (migration 016), same pattern as menu_collapse.
+    Returns None (not "fa") when the user never picked: callers show the
+    language picker on first /start and fall back to "fa" elsewhere.
+    Honest limit: on Render's free tier bot.db is ephemeral, so a
+    restart/redeploy resets this to None — same as every other per-user
+    setting. The language never affects download/identify logic.
+    """
+    row = conn.execute(
+        "SELECT lang FROM user_language WHERE telegram_id=?",
+        (telegram_id,)).fetchone()
+    lang = row[0] if row else None
+    return lang if lang in SUPPORTED_LANGS else None
+
+
+def set_user_language(conn, telegram_id: int, lang: str) -> None:
+    if lang not in SUPPORTED_LANGS:
+        raise ValueError(f"unsupported language: {lang!r}")
+    conn.execute(
+        "INSERT INTO user_language (telegram_id, lang) VALUES (?,?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET lang=excluded.lang",
+        (telegram_id, lang))
+    conn.commit()
+
+
+def user_lang_or_default(conn, telegram_id: int | None) -> str:
+    """UI language for rendering: stored choice, else Persian ("fa")."""
+    if telegram_id is None:
+        return "fa"
+    return user_language(conn, telegram_id) or "fa"
 
 
 # --- settings -------------------------------------------------------------
@@ -355,6 +415,58 @@ def set_cached_search(conn, key: str, result_json: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET result_json=excluded.result_json, created_at=excluded.created_at",
         (key, result_json, int(time.time())))
     conn.commit()
+
+
+# Audio-content-hash identify cache.
+#
+# Keys: "hash:<sha256 of the input audio bytes>" (content-keyed, stable
+# across re-uploads) or "url:<source url>" (lets a later flow skip the
+# download entirely when the same audio URL is seen again, e.g. the
+# one-click identify button after a link identify).
+# Only terminal results ("identified" / "not_found") are stored —
+# lookup/transport errors are never cached, so a transient failure can
+# never turn into a permanent answer.
+IDENTIFY_CACHE_TTL = 7 * 86400       # hash keys: audio content is immutable
+IDENTIFY_CACHE_URL_TTL = 86400       # url keys: signed CDN URLs rotate
+IDENTIFY_CACHE_MAX_ROWS = 1000       # cap; oldest rows evicted first
+
+
+def get_identify_cache(conn, key: str, max_age: int = IDENTIFY_CACHE_TTL) -> dict | None:
+    row = conn.execute(
+        "SELECT status, title, artist, created_at FROM identify_cache WHERE key=?",
+        (key,)).fetchone()
+    if not row or int(time.time()) - int(row[3]) > max_age:
+        return None
+    return {"status": row[0], "title": row[1] or "", "artist": row[2] or ""}
+
+
+def set_identify_cache(conn, key: str, status: str,
+                       title: str = "", artist: str = "") -> None:
+    """Store a terminal identify result. Silently ignores anything that
+    is not identified/not_found (honesty: errors are never cached)."""
+    if status not in ("identified", "not_found"):
+        return
+    conn.execute(
+        "INSERT INTO identify_cache (key, status, title, artist, created_at) "
+        "VALUES (?,?,?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET status=excluded.status, title=excluded.title, "
+        "artist=excluded.artist, created_at=excluded.created_at",
+        (key, status, title or "", artist or "", int(time.time())))
+    conn.commit()
+    _prune_identify_cache(conn)
+
+
+def _prune_identify_cache(conn) -> None:
+    """Keep the table small: drop the oldest rows beyond the cap."""
+    try:
+        conn.execute(
+            "DELETE FROM identify_cache WHERE key NOT IN "
+            "(SELECT key FROM identify_cache "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?)",
+            (IDENTIFY_CACHE_MAX_ROWS,))
+        conn.commit()
+    except Exception:
+        pass
 
 
 def get_bot_id(conn, config) -> str:

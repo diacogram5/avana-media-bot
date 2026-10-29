@@ -126,10 +126,14 @@ class _SentMessage:
     def __init__(self, text):
         self.text = text
         self.reply_markup = None
+        self.deleted = False
 
     async def edit_text(self, text, reply_markup=None):
         self.text = text
         self.reply_markup = reply_markup
+
+    async def delete(self):
+        self.deleted = True
 
 
 class _LinkFakeMessage:
@@ -137,11 +141,13 @@ class _LinkFakeMessage:
         self.text = text
         self.from_user = type("U", (), {"id": 42, "username": "t", "first_name": "T"})()
         self.answers = []
+        self.sent = []
         self.last_sent = None
 
     async def answer(self, text, reply_markup=None):
         self.answers.append(text)
         self.last_sent = _SentMessage(text)
+        self.sent.append(self.last_sent)
         return self.last_sent
 
     async def answer_video(self, video, caption=None, reply_markup=None):
@@ -155,16 +161,22 @@ async def test_link_handler_needs_file_single_compact_card(db, monkeypatch):
     nag, no stacked messages."""
     from app.config import Config
 
-    async def fake_identify(outcome, cfg):
+    async def fake_identify(outcome, cfg, *args, **kwargs):
         return ("needs_file", "", "", True, "Some Reel Song")
     monkeypatch.setattr(handlers, "_identify_link_audio", fake_identify)
     msg = _LinkFakeMessage("https://www.instagram.com/reel/De99zjKIQe5/")
     await handlers.text_handler(msg, db, Config())
-    card = msg.last_sent.text
+    # The transient "identifying" status is dismissed; the only live card
+    # is the folded compact one (video line + one honest line).
+    dismissed = [m for m in msg.sent if m.deleted]
+    assert any("در حال شناسایی" in m.text for m in dismissed), \
+        "the progress status must be dismissed, not stacked"
+    live = [m for m in msg.sent if not m.deleted]
+    card = live[-1].text
     assert "🎬 ویدیوی همان لینک:" in card
     assert "https://www.instagram.com/reel/De99zjKIQe5/" in card
     assert "مستقیم بفرستید" in card
-    joined = "\n".join(msg.answers)
+    joined = "\n".join(m.text for m in live)
     assert "تنظیم نشده" not in joined
     assert "CHANNEL_USERNAMES" not in joined
 

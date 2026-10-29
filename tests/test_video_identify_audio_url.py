@@ -77,7 +77,7 @@ def test_callback_identifies_audio_url_bytes_not_video_file():
         assert url == "https://cdn.example/reel_audio.mp4"
         return audio_bytes
 
-    async def fake_identify(data, filename, config):
+    async def fake_identify(data, filename, config, *args, **kwargs):
         seen["data"] = data
         seen["filename"] = filename
         from app.services.audio_id import AudioIdResult
@@ -137,7 +137,7 @@ def test_callback_without_audio_url_falls_back_to_telegram_file():
         async def download_file(self, path, buf):
             buf.write(video_bytes)
 
-    async def fake_identify(data, filename, config):
+    async def fake_identify(data, filename, config, *args, **kwargs):
         seen["data"] = data
         from app.services.audio_id import AudioIdResult
         return AudioIdResult(status="error", detail="lookup_error")

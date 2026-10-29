@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from aiogram.types import BufferedInputFile, LinkPreviewOptions, Message
 
 from .audio_send import _safe_filename_part, detect_audio_ext
+from ..i18n import t
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -195,17 +196,19 @@ def transcode_mp3(data: bytes, src_ext: str,
 
 
 def _quality_label(converted: bool, src_br: int | None,
-                   out_br: int | None) -> str:
-    """Honest Persian quality label. 320 is claimed only when the output
-    was truly produced and verified at 320; a low-quality source keeps
-    its real number and is never labelled native 320."""
+                   out_br: int | None, lang: str = "fa") -> str:
+    """Honest quality label (UI chrome; never translated song content).
+    320 is claimed only when the output was truly produced and verified
+    at 320; a low-quality source keeps its real number and is never
+    labelled native 320."""
+    conv_mark = t("m_converted", lang) if converted else ""
     if out_br and out_br >= 300:
-        return "MP3 · 320kbps" + (" (تبدیل‌شده)" if converted else "")
+        return "MP3 · 320kbps" + conv_mark
     if out_br:
         if converted and src_br:
-            return f"MP3 · {out_br}kbps (کیفیت اصلی منبع: {src_br}kbps)"
+            return t("m_quality_label", lang).format(out=out_br, src=src_br)
         return f"MP3 · {out_br}kbps"
-    return "MP3" + (" (تبدیل‌شده)" if converted else "")
+    return "MP3" + conv_mark
 
 
 @dataclass
@@ -222,12 +225,15 @@ class PreparedMusic:
 
 def _music_filename(title: str, artist: str, ext: str) -> str:
     t = _safe_filename_part(title)
-    a = _safe_filename_part(artist)
+    # An empty artist must not become the literal "song" suffix: the
+    # extracted-audio file must be exactly "صدای استخراج‌شده از ویدیو.mp3".
+    a = _safe_filename_part(artist) if (artist or "").strip() else ""
     base = f"{t} - {a}" if a and a != t else t
     return f"{base}.{ext}"
 
 
-def prepare_music(data: bytes, title: str, artist: str) -> PreparedMusic | None:
+def prepare_music(data: bytes, title: str, artist: str,
+                  lang: str = "fa") -> PreparedMusic | None:
     """Prepare song bytes for delivery: real MP3, honest specs.
 
     - Real MP3 sources are kept untouched (never re-encoded).
@@ -249,10 +255,10 @@ def prepare_music(data: bytes, title: str, artist: str) -> PreparedMusic | None:
         if conv[0]:
             out, out_br, out_dur = conv
             out_ext, converted = "mp3", True
-    label = _quality_label(converted, src_br, out_br)
+    label = _quality_label(converted, src_br, out_br, lang)
     if not converted and out_ext != "mp3":
         # Honest fallback: playable original, true extension, no MP3 claim.
-        label = f"{out_ext.upper()} (بدون تبدیل)"
+        label = f"{out_ext.upper()}{t('m_no_convert', lang)}"
     return PreparedMusic(
         data=out, ext=out_ext,
         filename=_music_filename(title, artist, out_ext),
@@ -265,12 +271,13 @@ async def send_music(message: Message, data: bytes, title: str, artist: str = ""
                      caption: str | None = None, reply_markup=None,
                      duration: int | float | None = None,
                      allow_links: bool = False,
-                     show_quality: bool = True) -> Message | None:
+                     show_quality: bool = True,
+                     lang: str = "fa") -> Message | None:
     """Send song bytes as a proper Telegram AUDIO message via the unified
     pipeline. Returns the sent message, or None on failure."""
     if not data or len(data) > _TELEGRAM_AUDIO_LIMIT:
         return None
-    prep = prepare_music(data, title, artist)
+    prep = prepare_music(data, title, artist, lang)
     if prep is None:
         return None
     cap = clean_caption(caption, allow_links)

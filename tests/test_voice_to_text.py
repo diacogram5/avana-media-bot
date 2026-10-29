@@ -33,7 +33,7 @@ def test_user_menu_hides_voice_to_text_and_no_stats(db):
     labels = main_menu_labels(db)
     assert "تبدیل ویس به متن" not in labels
     assert "تبدیل متن به ویس" not in labels
-    assert " 🎵 حرفه ای" in labels
+    assert "🎵 حرفه‌ای" in labels
     assert not any("آمار" in label for label in labels), \
         "user menu must not contain a stats button"
 

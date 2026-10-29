@@ -100,13 +100,92 @@ def _looks_like_audio(data: bytes) -> bool:
             or head[:4] == b"fLaC")
 
 
-async def find_full_song_file(artist: str, title: str) -> dict | None:
+async def _site_candidates(client: httpx.AsyncClient, base: str, style: str,
+                         q: str, artist: str, title: str) -> list[tuple[float, str, str]]:
+    """Ranked (rank, file_url, site) candidates from ONE wp site and ONE
+    query. Extracted so the registry can expose each MUSIC_SITES entry as
+    its own file source; the bundle path below calls it identically."""
+    out: list[tuple[float, str, str]] = []
+    try:
+        resp = await client.get(
+            _search_url(base, style),
+            params={"search": q, "per_page": 5})
+    except Exception:
+        return out
+    if resp.status_code != 200:
+        return out
+    try:
+        data = resp.json()
+    except Exception:
+        return out
+    if not isinstance(data, list):
+        return out
+    site = base.replace("https://", "")
+    for p in data[:5]:
+        if not isinstance(p, dict):
+            continue
+        pid, ptitle = p.get("id"), p.get("title") or ""
+        if not isinstance(pid, int) or not isinstance(ptitle, str):
+            continue
+        if ("آهنگ" not in ptitle and "ریمیکس" not in ptitle):
+            continue
+        if "بهترین" in ptitle:
+            continue
+        if not (token_overlap_ratio(artist, ptitle) >= 0.5
+                or token_overlap_ratio(title, ptitle) >= 0.5):
+            continue
+        if not carries_version_tokens(title, ptitle):
+            continue
+        # Post page -> real file links. These sites strip the
+        # download links from the WP API content, so when
+        # the API content yields none, fall back to the
+        # post's public HTML page (search result `url`).
+        file_urls: list[str] = []
+        try:
+            pr = await client.get(
+                _post_url(base, style, pid),
+                params={"_fields": "title,content"}, timeout=15)
+            if pr.status_code == 200:
+                content = ((pr.json() or {}).get("content") or {}).get("rendered") or ""
+                file_urls = [m.group(0) for m in _FILE_RE.finditer(content)]
+        except Exception:
+            file_urls = []
+        if not file_urls:
+            page_url = p.get("url") or ""
+            if page_url.startswith("http"):
+                try:
+                    hr = await client.get(page_url, timeout=20)
+                    if hr.status_code == 200:
+                        file_urls = [m.group(0)
+                                     for m in _FILE_RE.finditer(hr.text)]
+                except Exception:
+                    file_urls = []
+        if not file_urls:
+            continue
+        for url in file_urls:
+            fname = url.rsplit("/", 1)[-1]
+            if not carries_version_tokens(title, fname):
+                continue
+            rank = token_overlap_ratio(f"{artist} {title}", fname)
+            out.append((rank, url, site))
+    return out
+
+
+async def find_full_song_file(artist: str, title: str,
+                              sites: tuple | None = None) -> dict | None:
     """Return {"data", "ext", "duration_sec", "source"} or None.
 
     Only the same recording: the version gate rejects other-remix files,
     and the duration probe rejects short clips.
+
+    `sites` is an extension hook for the source registry: pass a subset
+    of MUSIC_SITES to search only those. Default None searches all
+    sites exactly as before.
     """
+    sites = MUSIC_SITES if sites is None else tuple(sites)
     key = f"fullsong:{artist}|{title}".lower()
+    if len(sites) == 1:
+        key += f"|{sites[0][0]}"
     hit = _cache_get(key)
     if hit:
         data, ext, duration, source = hit
@@ -117,68 +196,9 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=15, headers=_UA, follow_redirects=True) as client:
             for q in queries:
-                for base, style in MUSIC_SITES:
-                    try:
-                        resp = await client.get(
-                            _search_url(base, style),
-                            params={"search": q, "per_page": 5})
-                    except Exception:
-                        continue
-                    if resp.status_code != 200:
-                        continue
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        continue
-                    if not isinstance(data, list):
-                        continue
-                    for p in data[:5]:
-                        if not isinstance(p, dict):
-                            continue
-                        pid, ptitle = p.get("id"), p.get("title") or ""
-                        if not isinstance(pid, int) or not isinstance(ptitle, str):
-                            continue
-                        if ("آهنگ" not in ptitle and "ریمیکس" not in ptitle):
-                            continue
-                        if "بهترین" in ptitle:
-                            continue
-                        if not (token_overlap_ratio(artist, ptitle) >= 0.5
-                                or token_overlap_ratio(title, ptitle) >= 0.5):
-                            continue
-                        if not carries_version_tokens(title, ptitle):
-                            continue
-                        # Post page -> real file links. These sites strip the
-                        # download links from the WP API content, so when
-                        # the API content yields none, fall back to the
-                        # post's public HTML page (search result `url`).
-                        file_urls: list[str] = []
-                        try:
-                            pr = await client.get(
-                                _post_url(base, style, pid),
-                                params={"_fields": "title,content"}, timeout=15)
-                            if pr.status_code == 200:
-                                content = ((pr.json() or {}).get("content") or {}).get("rendered") or ""
-                                file_urls = [m.group(0) for m in _FILE_RE.finditer(content)]
-                        except Exception:
-                            file_urls = []
-                        if not file_urls:
-                            page_url = p.get("url") or ""
-                            if page_url.startswith("http"):
-                                try:
-                                    hr = await client.get(page_url, timeout=20)
-                                    if hr.status_code == 200:
-                                        file_urls = [m.group(0)
-                                                     for m in _FILE_RE.finditer(hr.text)]
-                                except Exception:
-                                    file_urls = []
-                        if not file_urls:
-                            continue
-                        for url in file_urls:
-                            fname = url.rsplit("/", 1)[-1]
-                            if not carries_version_tokens(title, fname):
-                                continue
-                            rank = token_overlap_ratio(f"{artist} {title}", fname)
-                            candidates.append((rank, url, base.replace("https://", "")))
+                for base, style in sites:
+                    candidates.extend(
+                        await _site_candidates(client, base, style, q, artist, title))
                     if candidates:
                         break
                 if candidates:
