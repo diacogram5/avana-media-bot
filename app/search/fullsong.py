@@ -20,10 +20,27 @@ from ..bot.logic import (
 )
 
 MUSIC_SITES = (
-    "https://musics-fa.com",
-    "https://minevisam.ir",
-    "https://musicviral.ir",
+    # (base_url, api_style): "wp-json" uses /wp-json/wp/v2/... pretty URLs;
+    # "rest_route" uses ?rest_route=/wp/v2/... for sites with pretty
+    # permalinks disabled on the API (musicsweb.ir — proven live 2026-10-29:
+    # WP search + post HTML + real 9.6 MB / 220 s MP3 download).
+    ("https://musics-fa.com", "wp-json"),
+    ("https://minevisam.ir", "wp-json"),
+    ("https://musicviral.ir", "wp-json"),
+    ("https://musicsweb.ir", "rest_route"),
 )
+
+
+def _search_url(base: str, style: str) -> str:
+    if style == "rest_route":
+        return f"{base}/?rest_route=/wp/v2/search"
+    return f"{base}/wp-json/wp/v2/search"
+
+
+def _post_url(base: str, style: str, pid: int) -> str:
+    if style == "rest_route":
+        return f"{base}/?rest_route=/wp/v2/posts/{pid}"
+    return f"{base}/wp-json/wp/v2/posts/{pid}"
 
 FULL_SONG_MIN_SECONDS = 85
 FULL_SONG_MAX_MB = 30
@@ -100,10 +117,10 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=15, headers=_UA, follow_redirects=True) as client:
             for q in queries:
-                for site in MUSIC_SITES:
+                for base, style in MUSIC_SITES:
                     try:
                         resp = await client.get(
-                            f"{site}/wp-json/wp/v2/search",
+                            _search_url(base, style),
                             params={"search": q, "per_page": 5})
                     except Exception:
                         continue
@@ -137,7 +154,7 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
                         file_urls: list[str] = []
                         try:
                             pr = await client.get(
-                                f"{site}/wp-json/wp/v2/posts/{pid}",
+                                _post_url(base, style, pid),
                                 params={"_fields": "title,content"}, timeout=15)
                             if pr.status_code == 200:
                                 content = ((pr.json() or {}).get("content") or {}).get("rendered") or ""
@@ -161,7 +178,7 @@ async def find_full_song_file(artist: str, title: str) -> dict | None:
                             if not carries_version_tokens(title, fname):
                                 continue
                             rank = token_overlap_ratio(f"{artist} {title}", fname)
-                            candidates.append((rank, url, site.replace("https://", "")))
+                            candidates.append((rank, url, base.replace("https://", "")))
                     if candidates:
                         break
                 if candidates:
