@@ -126,7 +126,7 @@ async def test_professional_card_full_version_first(monkeypatch, db):
                 "duration_sec": 210.0, "source": "s"}
 
     monkeypatch.setattr(handlers, "smart_search", fake_smart_exact)
-    monkeypatch.setattr(handlers, "find_full_song_file", fake_full)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", fake_full)
     msg = _FakeMessage()
     await handlers._send_professional_song_card(msg, db, "Dooset Daram", "Mehdi Ahmadvand")
     assert msg.audios, "the full version must be sent"
@@ -148,7 +148,7 @@ async def test_professional_card_full_version_first(monkeypatch, db):
         return None
 
     monkeypatch.setattr(handlers, "smart_search", fake_smart_nearest)
-    monkeypatch.setattr(handlers, "find_full_song_file", fake_full_none)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", fake_full_none)
     msg2 = _FakeMessage()
     await handlers._send_professional_song_card(msg2, db, "Dooset Daram", "Mehdi Ahmadvand")
     assert not msg2.audios  # a preview is never presented as the song
@@ -197,7 +197,7 @@ async def test_media_handler_uses_shazam_before_audd(monkeypatch, db):
         return {"data": b"F" * 200000, "ext": "mp3",
                 "duration_sec": 210.0, "source": "s"}
 
-    monkeypatch.setattr(handlers, "find_full_song_file", fake_full)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", fake_full)
 
     class FakeFile:
         file_path = "clip.mp4"

@@ -123,7 +123,7 @@ def _patch_card(monkeypatch):
     monkeypatch.setattr(H, "smart_search", fake_smart_search)
     monkeypatch.setattr(H, "match_identified_song", lambda results, t, a: None)
     fake_full = AsyncMock()
-    monkeypatch.setattr(H, "find_full_song_file", fake_full)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", fake_full)
     return fake_full
 
 

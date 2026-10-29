@@ -1826,13 +1826,30 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         (getattr(match, "preview_url", "") or "") if match else "")
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    # 1) FULL VERSION FIRST. (Argument order is (artist, title); a swapped
-    # call silently searched the wrong query and never found anything.)
+    # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
+    # (Argument order is (artist, title); a swapped call silently searched
+    # the wrong query and never found anything.)
+    from ..search.adapters import find_full_song_file_v2
     full = None
     try:
-        full = await find_full_song_file(artist, title)
+        full = await find_full_song_file_v2(artist, title)
     except Exception:
         full = None
+    if full:
+        try:
+            sent = await message.answer_audio(
+                BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
+                caption=t("h_song_full_caption", ulang).format(
+                    label=t("m_full_duration_long", ulang),
+                    title=title, artist=artist),
+                title=title, performer=artist,
+                duration=int(full["duration_sec"]),
+                reply_markup=kb)
+            if sent is not None:
+                _track(conn, message, sent)
+                return
+        except Exception:
+            pass
     # 1b) BANK: indexed channel audio (forwarded files) by title/artist.
     # The bank is a real source in the chain, not a separate button.
     if not full:
