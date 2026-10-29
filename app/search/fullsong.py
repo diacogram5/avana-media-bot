@@ -18,6 +18,9 @@ from ..bot.logic import (
     carries_version_tokens,
     token_overlap_ratio,
 )
+from ..logging_config import get_logger, log_event
+
+log = get_logger("fullsong")
 
 MUSIC_SITES = (
     # (base_url, api_style): "wp-json" uses /wp-json/wp/v2/... pretty URLs;
@@ -225,16 +228,22 @@ async def find_full_song_file(artist: str, title: str,
     hit = _cache_get(key)
     if hit:
         data, ext, duration, source = hit
+        log_event(log, "fullsong", stage="cache_hit", source=source,
+                  duration_s=round(duration, 1))
         return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
 
     queries = [q for q in (f"{artist} {title}".strip(), title.strip()) if len(q) >= 2]
     candidates: list[tuple[float, str, str]] = []  # (rank, file_url, site)
+    t0 = time.time()
     try:
         async with httpx.AsyncClient(timeout=15, headers=_UA, follow_redirects=True) as client:
             for q in queries:
                 for base, style in sites:
-                    candidates.extend(
-                        await _site_candidates(client, base, style, q, artist, title))
+                    c = await _site_candidates(client, base, style, q, artist, title)
+                    log_event(log, "fullsong", stage="site_search",
+                              site=base.replace("https://", ""),
+                              query=q[:40], candidates=len(c))
+                    candidates.extend(c)
                     if candidates:
                         break
                 if candidates:
@@ -266,11 +275,23 @@ async def find_full_song_file(artist: str, title: str,
                 br = _probe_bitrate_kbps(data, ext) or 0
                 valid.append((br, data, ext, duration, source))
             if not valid:
+                log_event(log, "fullsong", stage="not_found",
+                          ms=int((time.time() - t0) * 1000),
+                          candidates=len(candidates))
                 return None
             valid.sort(key=lambda v: v[0], reverse=True)
             _br, data, ext, duration, source = valid[0]
+            log_event(log, "fullsong", stage="found",
+                      ms=int((time.time() - t0) * 1000),
+                      source=source, bitrate_kbps=_br,
+                      duration_s=round(duration, 1),
+                      bytes=len(data))
             _cache_put(key, data, ext, duration, source)
             return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
-    except Exception:
+    except Exception as exc:
+        log_event(log, "fullsong", stage="error",
+                  error=f"{type(exc).__name__}: {str(exc)[:80]}")
         return None
+    log_event(log, "fullsong", stage="not_found",
+              ms=int((time.time() - t0) * 1000), candidates=len(candidates))
     return None
