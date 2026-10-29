@@ -1003,6 +1003,141 @@ def _found_card_kb(outcome: dict, lang: str = "fa") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
+# ---------------------------------------------------------------------------
+# Text search for the full-song chain (after Shazam identification).
+# Searches indexed bank audio by normalized title/artist; version-aware.
+# Returns the best hit dict or None. Never raises.
+# ---------------------------------------------------------------------------
+
+def _norm_text(s: str) -> str:
+    import re as _re
+    return _re.sub(r"\s+", " ", (s or "").lower().strip())
+
+
+def search_bank_by_text(conn, title: str, artist: str = "") -> dict | None:
+    """Find an indexed bank file by title/artist.
+
+    Returns {id, title, artist, channel, file_id, file_url, post_url} or None.
+    The caller decides how to deliver it (file_id re-send preferred).
+    """
+    try:
+        nt = _norm_text(title)
+        na = _norm_text(artist)
+        if len(nt) < 2:
+            return None
+        rows = conn.execute(
+            "SELECT id, title, artist, channel, file_id, file_url, post_url"
+            " FROM audio_bank ORDER BY id DESC LIMIT 500").fetchall()
+        best = None
+        best_score = 0.0
+        for r in rows:
+            rt = _norm_text(r["title"] or "")
+            ra = _norm_text(r["artist"] or "")
+            if not rt:
+                continue
+            # title must contain all distinctive title tokens (or vice versa)
+            import re as _re
+            wt = set(_re.findall(r"[\w\u0600-\u06ff]+", nt))
+            ct = set(_re.findall(r"[\w\u0600-\u06ff]+", rt))
+            wt = {w for w in wt if len(w) >= 2}
+            if not wt:
+                continue
+            overlap = len(wt & ct) / len(wt)
+            if overlap < 0.99:
+                continue
+            score = overlap
+            # artist bonus: same artist strengthens, different artist weakens
+            if na and ra:
+                wa = set(_re.findall(r"[\w\u0600-\u06ff]+", na))
+                ca = set(_re.findall(r"[\w\u0600-\u06ff]+", ra))
+                wa = {w for w in wa if len(w) >= 2}
+                if wa and not (wa & ca):
+                    score *= 0.5
+                elif wa & ca:
+                    score += 0.2
+            # prefer rows that can actually be sent
+            if r["file_id"]:
+                score += 0.3
+            if score > best_score:
+                best_score = score
+                best = dict(r)
+        return best
+    except Exception:
+        return None
+
+
+def set_source_health(conn, identifier: str, status: str,
+                      last_error: str = "", valid_count: int | None = None) -> None:
+    """Update per-source health; a dead source never blocks the others."""
+    import time as _time
+    try:
+        if valid_count is None:
+            conn.execute(
+                "UPDATE bank_sources SET status=?, last_check=?, last_error=?"
+                " WHERE lower(identifier)=lower(?)",
+                (status, int(_time.time()), last_error[:300], identifier))
+        else:
+            conn.execute(
+                "UPDATE bank_sources SET status=?, last_check=?, last_error=?,"
+                " valid_count=? WHERE lower(identifier)=lower(?)",
+                (status, int(_time.time()), last_error[:300],
+                 valid_count, identifier))
+        conn.commit()
+    except Exception:
+        pass
+
+
+def get_source_health(conn) -> list[dict]:
+    """Per-source status for the admin panel and health checks."""
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, kind, identifier, label, enabled, status,"
+            " last_check, last_error, valid_count FROM bank_sources"
+            " ORDER BY sort_order, id").fetchall()]
+    except Exception:
+        return []
+
+
+def add_bank_audio_from_forward(conn, title: str, artist: str, channel: str,
+                                file_id: str, post_url: str = "") -> int | None:
+    """Index a user-forwarded audio file. Returns row id or None.
+
+    Only the file_id is stored (Telegram re-send), never the bytes.
+    Deduplicates on (channel, title) to avoid repeats.
+    """
+    try:
+        nt = _norm_text(title)
+        if not nt or not file_id:
+            return None
+        dup = conn.execute(
+            "SELECT id FROM audio_bank WHERE lower(title)=lower(?)"
+            " AND lower(channel)=lower(?) LIMIT 1",
+            (title.strip(), channel)).fetchone()
+        if dup:
+            return dup["id"]
+        import time as _time
+        cur = conn.execute(
+            """INSERT INTO audio_bank
+               (source, channel, title, artist, chroma, file_url, post_url,
+                file_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            ("channel", channel, title.strip(), (artist or "").strip(),
+             "", "", post_url, file_id, int(_time.time())))
+        conn.commit()
+        # bump the source's valid count
+        try:
+            conn.execute(
+                "UPDATE bank_sources SET valid_count=valid_count+1"
+                " WHERE kind='channel' AND lower(identifier)=lower(?)",
+                (channel,))
+            conn.commit()
+        except Exception:
+            pass
+        return cur.lastrowid
+    except Exception:
+        return None
+
+
 def register(router: Router) -> None:
     fr = Router()
 

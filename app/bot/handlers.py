@@ -1825,6 +1825,29 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         full = await find_full_song_file(artist, title)
     except Exception:
         full = None
+    # 1b) BANK: indexed channel audio (forwarded files) by title/artist.
+    # The bank is a real source in the chain, not a separate button.
+    if not full:
+        try:
+            from ..features.bank import search_bank_by_text
+            hit = search_bank_by_text(conn, title, artist)
+            if hit and hit.get("file_id"):
+                log_event(log, "bank_text", stage="found",
+                          title=title[:40], channel=hit.get("channel", "")[:20])
+                sent = await message.answer_audio(
+                    hit["file_id"],
+                    caption=t("h_song_full_caption", ulang).format(
+                        label=t("m_full_duration_long", ulang),
+                        title=title, artist=artist),
+                    reply_markup=kb)
+                if sent is not None:
+                    _track(conn, message, sent)
+                    return
+            elif hit:
+                log_event(log, "bank_text", stage="no_file_id",
+                          title=title[:40])
+        except Exception:
+            pass
     if full:
         dur = full["duration_sec"]
         label = (t("h_song_dur", ulang).format(dur=f"{int(dur // 60)}:{int(dur % 60):02d}") if dur < 90
@@ -2248,6 +2271,31 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
     _track_incoming(conn, message)
     if _blocked(conn, message.from_user.id):
         await message.answer(t("blocked", ulang)); return
+    # Bank indexing: a forwarded audio from a registered channel is indexed
+    # for future bank searches (title/artist from caption or audio metadata).
+    # This is the ONLY way channel files enter the bank: the Bot API cannot
+    # read a channel's history unless the bot is its admin.
+    try:
+        _fwd_ch = _forward_channel(message)
+        if _fwd_ch and message.audio:
+            from ..features.bank import add_bank_audio_from_forward, list_bank_sources
+            _srcs = {str(s.get("identifier", "")).lower().lstrip("@")
+                     for s in list_bank_sources(conn)
+                     if s.get("kind") == "channel" and s.get("enabled")}
+            if _fwd_ch.lower().lstrip("@") in _srcs or not _srcs:
+                _atitle = (message.audio.title or "").strip()
+                _aartist = (message.audio.performer or "").strip()
+                if not _atitle and message.caption:
+                    _atitle = message.caption.strip().split("\n")[0][:120]
+                if _atitle:
+                    _bid = add_bank_audio_from_forward(
+                        conn, _atitle, _aartist, _fwd_ch,
+                        message.audio.file_id)
+                    if _bid:
+                        log_event(log, "bank_index", stage="forward_indexed",
+                                  channel=_fwd_ch[:20], title=_atitle[:40])
+    except Exception:
+        pass
     current_state = None
     try:
         current_state = await state.get_state()
