@@ -1805,6 +1805,14 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     query = f"{title} {artist}".strip()
+    # FAST FIRST: show the identification immediately (~10s), then search for
+    # the full version. The user sees progress instead of 30s of silence.
+    try:
+        await _answer(message, conn,
+                      t("h_song_identified_searching", ulang).format(
+                          title=title, artist=artist))
+    except Exception:
+        pass
     engine = SearchEngine([ITunesProvider(entity="song"), DeezerProvider()])
     try:
         results, _ = await smart_search(engine, query, limit=10)

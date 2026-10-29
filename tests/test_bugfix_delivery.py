@@ -159,11 +159,11 @@ async def test_no_full_no_media_honest_message_with_search_options(db, monkeypat
                                        own_media=None)
     answers = [c for c in msg.calls if c[0] == "answer"]
     assert answers, "expected the honest not-found message"
-    text = answers[0][1]
+    text = answers[-1][1]
     assert "نسخه کامل" in text and "پیدا نشد" in text
     # A preview must never be presented as the song.
     assert not any(c[0] == "answer_audio" for c in msg.calls)
-    kb = answers[0][2].get("reply_markup")
+    kb = answers[-1][2].get("reply_markup")
     assert kb is not None
     flat = [b.text for row in kb.inline_keyboard for b in row]
     assert any("مشابه" in t_ for t_ in flat)

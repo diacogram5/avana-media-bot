@@ -138,7 +138,8 @@ async def test_professional_card_full_version_first(monkeypatch, db):
     # Song card: heart (favorite) + lyrics + add-to-playlist.
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert labels == ["🤍", "📝 متن آهنگ", "🎶 افزودن به پلی‌لیست"]
-    assert not msg.answers  # no extra text messages
+    # one fast 'identified, searching...' notice is allowed before the audio
+    assert len(msg.answers) == 1 and "شناسایی شد" in msg.answers[0]
 
     async def fake_smart_nearest(engine, query, limit=10):
         return [_song(title="Sweet Dreams", artist="Eurythmics")], "Dooset Daram"

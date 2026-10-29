@@ -193,7 +193,14 @@ def test_search_suno_source_included(db, monkeypatch):
 
 
 # --- source management ----------------------------------------------------
+def _clear_bank_sources(db):
+    """Tests assume an empty bank; production seeds 4 verified channels."""
+    db.execute("DELETE FROM bank_sources")
+    db.commit()
+
+
 def test_channel_cap_and_duplicate(db):
+    _clear_bank_sources(db)
     for i, ch in enumerate(["chan_a", "chan_b", "chan_c", "chan_d", "chan_e"]):
         res = bank.add_bank_channel(db, ch)
         assert res["ok"] is True
@@ -208,6 +215,7 @@ def test_channel_cap_and_duplicate(db):
 
 
 def test_bad_username_rejected(db):
+    _clear_bank_sources(db)
     res = bank.add_bank_channel(db, "ab")
     assert res["ok"] is False
     assert res["message"] == "یوزرنیم چنل معتبر نیست."
@@ -243,6 +251,7 @@ def test_legacy_source_never_searched(db, monkeypatch):
 
 
 def test_source_edit_delete_toggle_move(db):
+    _clear_bank_sources(db)
     a = bank.add_bank_channel(db, "chan_a")["id"]
     b = bank.add_bank_channel(db, "chan_b")["id"]
     res = bank.update_bank_source(db, a, "chan_z")

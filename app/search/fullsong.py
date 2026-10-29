@@ -235,17 +235,38 @@ async def find_full_song_file(artist: str, title: str,
     queries = [q for q in (f"{artist} {title}".strip(), title.strip()) if len(q) >= 2]
     candidates: list[tuple[float, str, str]] = []  # (rank, file_url, site)
     t0 = time.time()
+    # Start YouTube NOW in parallel with WP sites (was: only after WP failed,
+    # adding 15-23s). WP is preferred for quality; YouTube is the safety net.
+    import asyncio as _aio
+    _yt_task = None
     try:
-        async with httpx.AsyncClient(timeout=15, headers=_UA, follow_redirects=True) as client:
+        from .youtube_full import find_youtube_audio as _yt_fn
+        _yt_task = _aio.create_task(_yt_fn(artist, title))
+    except Exception:
+        _yt_task = None
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_UA, follow_redirects=True) as client:
+            # PARALLEL: all sites queried at once (was sequential: 4 sites x
+            # 2 queries = ~16s). Each site has its own 10s timeout; one slow
+            # site never blocks the others.
             for q in queries:
-                for base, style in sites:
-                    c = await _site_candidates(client, base, style, q, artist, title)
-                    log_event(log, "fullsong", stage="site_search",
-                              site=base.replace("https://", ""),
-                              query=q[:40], candidates=len(c))
-                    candidates.extend(c)
-                    if candidates:
-                        break
+                async def _one_site(base, style):
+                    try:
+                        c = await _aio.wait_for(
+                            _site_candidates(client, base, style, q, artist, title),
+                            timeout=12)
+                        log_event(log, "fullsong", stage="site_search",
+                                  site=base.replace("https://", ""),
+                                  query=q[:40], candidates=len(c))
+                        return c
+                    except Exception:
+                        return []
+                results = await _aio.gather(
+                    *[_one_site(base, style) for base, style in sites],
+                    return_exceptions=True)
+                for r in results:
+                    if isinstance(r, list):
+                        candidates.extend(r)
                 if candidates:
                     break
             candidates.sort(key=lambda c: c[0], reverse=True)
@@ -287,21 +308,26 @@ async def find_full_song_file(artist: str, title: str,
                           duration_s=round(duration, 1),
                           bytes=len(data))
                 _cache_put(key, data, ext, duration, source)
+                # WP won: stop the parallel YouTube task to save time/bandwidth.
+                if _yt_task is not None and not _yt_task.done():
+                    _yt_task.cancel()
                 return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
     except Exception as exc:
         log_event(log, "fullsong", stage="wp_error",
                   error=f"{type(exc).__name__}: {str(exc)[:80]}")
-    # Fallback: YouTube (slower, universal coverage). Proven 2026-10-29.
-    try:
-        from .youtube_full import find_youtube_audio
-        yt = await find_youtube_audio(artist, title)
-    except Exception as exc:
-        log_event(log, "fullsong", stage="youtube_error",
-                  error=f"{type(exc).__name__}: {str(exc)[:60]}")
-        yt = None
-    if yt:
-        _cache_put(key, yt["data"], yt["ext"], yt["duration_sec"], yt["source"])
-        return yt
+    # Collect YouTube result (already running in parallel since the start).
+    _yt = None
+    if _yt_task is not None:
+        try:
+            _yt = await _aio.wait_for(_aio.shield(_yt_task), timeout=30)
+        except Exception as exc:
+            log_event(log, "fullsong", stage="youtube_error",
+                      error=f"{type(exc).__name__}: {str(exc)[:60]}")
+            _yt = None
+    if _yt:
+        # WP won on quality; cancel nothing (task already done).
+        _cache_put(key, _yt["data"], _yt["ext"], _yt["duration_sec"], _yt["source"])
+        return _yt
     # Fallback 2: Jamendo (CC/indie catalog, real downloads). Needs key.
     try:
         import os as _os
