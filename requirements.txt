@@ -6,3 +6,4 @@ shazamio==0.9.0
 pytest>=8.0
 pytest-asyncio>=0.23
 yt-dlp>=2024.8.6
+radiojavanapi>=0.7.0

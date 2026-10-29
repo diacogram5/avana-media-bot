@@ -460,7 +460,7 @@ def test_song_card_step2_video_really_sends_audio(db, media, monkeypatch):
         return _SentMessage()
 
     monkeypatch.setattr(handlers, "smart_search", _smart)
-    monkeypatch.setattr(handlers, "find_full_song_file", _full)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", _full)
     monkeypatch.setattr(handlers, "_arm_bank_sample", _arm)
     monkeypatch.setattr(handlers, "_extract_and_send_clip_audio", _extract)
 
@@ -489,7 +489,7 @@ def test_song_card_step2_extraction_impossible_honest_video(db, media, monkeypat
         return None
 
     monkeypatch.setattr(handlers, "smart_search", _smart)
-    monkeypatch.setattr(handlers, "find_full_song_file", _full)
+    monkeypatch.setattr("app.search.adapters.find_full_song_file_v2", _full)
     monkeypatch.setattr(handlers, "_arm_bank_sample", _arm)
     monkeypatch.setattr(handlers, "_extract_and_send_clip_audio", _extract)
 

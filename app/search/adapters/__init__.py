@@ -7,6 +7,7 @@ parallel. First valid file wins — no waiting for slow sources.
 from __future__ import annotations
 
 from .base import FileResult, search_parallel
+from .radiojavan import RadioJavanAdapter
 from .wordpress import WordPressAdapter
 from .youtube import YouTubeAdapter
 
@@ -14,6 +15,7 @@ from .youtube import YouTubeAdapter
 def _adapters() -> list:
     """All file-source adapters, fastest/most-reliable first."""
     return [
+        RadioJavanAdapter(),  # Persian music, direct downloads, ~0.5s
         WordPressAdapter(),   # Iranian catalogs, real MP3, ~4s
         YouTubeAdapter(),     # universal, slow, often IP-blocked
     ]
