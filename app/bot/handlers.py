@@ -934,7 +934,14 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             await _answer_identify_clip_fallback(
                 callback.message, conn, config, data, entry["file_id"])
         else:
-            await callback.message.answer(t("audio_error", "fa"))
+            # Distinct extraction/lookup causes — never one generic line.
+            _detail_msg = {
+                "silent": "🔇 صدای قابل‌استفاده‌ای در این ویدیو پیدا نشد.",
+                "undecodable": "⚠️ صدای این ویدیو خراب یا غیرقابل پردازش است.",
+                "too_short": "⚠️ صدای این ویدیو برای شناسایی خیلی کوتاه است.",
+            }.get(result.detail)
+            await callback.message.answer(
+                _detail_msg or t("audio_error", "fa"))
     finally:
         _VIDEO_IDENTIFY_RUNNING.discard(token)
 
@@ -942,41 +949,94 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
 async def _identify_audio(data: bytes, filename: str, config: Config) -> AudioIdResult:
     """Shazam signature first (no token), AudD with a token as fallback.
 
-    Shazam is tried on several windows (full, then later windows) so a
-    clip with speech over the start, a remix intro, or a shortened
-    copy has more than one chance; only an identified result is
-    accepted. Windows are tried through the handlers-level
-    identify_bytes_shazam (same function the shazam_id multi-window
-    helper uses) so a sliced window that fails to decode only yields
-    "error", never a false match. A catalog result is never involved
-    here, so nothing can be mislabelled as identified.
+    Pipeline stages (each logged with timing; errors carry their stage):
+      1. input validation gate — the extracted audio must be decodable,
+         non-silent and of sane duration, else a distinct extraction
+         error is returned (never "not_found");
+      2. Shazam on several windows (full, then later windows) so a clip
+         with speech over the start, a remix intro, or a shortened copy
+         has more than one chance; only an identified result is
+         accepted. A sliced window that fails to decode only yields
+         "error", never a false match. A catalog result is never
+         involved here, so nothing can be mislabelled as identified.
     """
+    import time as _time
+    from ..services.shazam_id import analyze_audio
+    t0 = _time.time()
+    log_event(log, "identify_stage", stage="input_received",
+              bytes=len(data or b""), filename=filename)
+    if not data:
+        log_event(log, "identify_stage", stage="validate", ok=False,
+                  reason="empty_input")
+        return AudioIdResult(status="error", detail="undecodable")
+    # Stage 1: validation gate.
+    t = _time.time()
+    try:
+        analysis = analyze_audio(data)
+    except Exception as exc:
+        log_event(log, "identify_stage", stage="validate", ok=False,
+                  reason=f"analyze_crashed:{type(exc).__name__}")
+        return AudioIdResult(status="error", detail="undecodable")
+    log_event(log, "identify_stage", stage="validate",
+              ms=int((_time.time() - t) * 1000), **analysis)
+    if not analysis.get("ok"):
+        reason = analysis.get("reason", "undecodable")
+        # Distinct extraction-stage error — never "not_found".
+        return AudioIdResult(status="error", detail=reason)
+    # Stage 2: Shazam windows.
     shazam = None
     windows = [data]
     if data and len(data) > 200_000:
         windows.append(data[len(data) // 3:])
         windows.append(data[2 * len(data) // 3:])
-    for window in windows:
+    log_event(log, "identify_stage", stage="input_prepared",
+              windows=len(windows), sizes=[len(w) for w in windows])
+    for i, window in enumerate(windows):
+        t = _time.time()
         try:
             candidate = await identify_bytes_shazam(window)
-        except Exception:
+            log_event(log, "identify_stage", stage="lookup_response",
+                      window=i, ms=int((_time.time() - t) * 1000),
+                      status=candidate.status if candidate else "none")
+        except Exception as exc:
+            log_event(log, "identify_stage", stage="lookup_error",
+                      window=i,
+                      error=f"{type(exc).__name__}: {str(exc)[:120]}")
             candidate = None
         if candidate is not None:
             shazam = candidate
             if candidate.status == "identified":
                 break
     if shazam is not None and shazam.status == "identified":
+        log_event(log, "identify_stage", stage="result_sent",
+                  ms=int((_time.time() - t0) * 1000), status="identified",
+                  title=shazam.title, artist=shazam.artist)
         return AudioIdResult(status="identified", title=shazam.title, artist=shazam.artist)
     if config.audd_token:
+        t = _time.time()
         try:
             audd = await identify_bytes(data, filename, config.audd_token)
-        except Exception:
+            log_event(log, "identify_stage", stage="lookup_response",
+                      window="audd", ms=int((_time.time() - t) * 1000),
+                      status=audd.status if audd else "none")
+        except Exception as exc:
+            log_event(log, "identify_stage", stage="lookup_error",
+                      window="audd",
+                      error=f"{type(exc).__name__}: {str(exc)[:120]}")
             audd = None
         if audd is not None and audd.status == "identified":
+            log_event(log, "identify_stage", stage="result_sent",
+                      ms=int((_time.time() - t0) * 1000), status="identified",
+                      title=audd.title, artist=audd.artist)
             return audd
     if shazam is not None and shazam.status == "not_found":
+        log_event(log, "identify_stage", stage="result_sent",
+                  ms=int((_time.time() - t0) * 1000), status="not_found")
         return AudioIdResult(status="not_found")
-    return AudioIdResult(status="error")
+    log_event(log, "identify_stage", stage="result_sent",
+              ms=int((_time.time() - t0) * 1000), status="error",
+              detail="lookup_error")
+    return AudioIdResult(status="error", detail="lookup_error")
 
 
 def _link_platform_name(kind: str) -> str:

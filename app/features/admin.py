@@ -135,11 +135,28 @@ async def _deny_owner(event) -> None:
 
 
 def _owner_only(handler):
-    """Decorator: non-owner callers get one short Persian line, nothing else."""
+    """Decorator: non-owner callers get one short Persian line, nothing else.
+
+    Root-cause fix (2026-10-29): aiogram may pass kwargs the handler did
+    not declare (live crash: ``panel() got an unexpected keyword argument
+    'dispatcher'``). The wrapper now filters forwarded kwargs to the
+    handler's declared parameters instead of crashing.
+    """
+    import inspect
+    try:
+        _params = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        _params = {}
+    _accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in _params.values())
+    _allowed = set(_params)
+
     async def wrapper(event, conn, config, *args, **kwargs):
         if not _is_owner(event, config):
             await _deny_owner(event)
             return None
+        if not _accepts_kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k in _allowed}
         return await handler(event, conn, config, *args, **kwargs)
     return wrapper
 

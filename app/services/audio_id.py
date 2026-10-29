@@ -28,6 +28,11 @@ class AudioIdResult:
     artist: str = ""
     album: str = ""
     raw: dict | None = None
+    # Machine-readable failure detail for the "error" status, so an
+    # extraction/validation failure is never misreported as "not_found".
+    # Values: "" | silent | undecodable | too_short | lookup_error |
+    #         service_error | no_ffmpeg
+    detail: str = ""
 
 
 def parse_audd_payload(payload: dict) -> AudioIdResult:

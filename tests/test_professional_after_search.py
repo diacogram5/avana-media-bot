@@ -177,6 +177,13 @@ async def test_media_handler_uses_shazam_before_audd(monkeypatch, db):
 
     monkeypatch.setattr(handlers, "identify_bytes_shazam", fake_shazam)
     monkeypatch.setattr(handlers, "identify_bytes", forbidden_audd)
+    # The validation gate (analyze_audio) would reject the 16 fake bytes;
+    # stub it so this test keeps proving Shazam-before-AudD ordering.
+    from app.services import shazam_id as _shazam_id
+    monkeypatch.setattr(
+        _shazam_id, "analyze_audio",
+        lambda data: {"ok": True, "reason": "ok", "duration_s": 10.0,
+                      "sample_rate": 22050, "channels": 1, "rms_db": -20.0})
 
     async def fake_smart(engine, query, limit=10):
         return [_song()], "Dooset Daram"
