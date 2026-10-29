@@ -81,60 +81,92 @@ def _title_ok(video_title: str, uploader: str, artist: str, title: str) -> bool:
     return True
 
 
-def _download(query: str, timeout_s: int = 90) -> tuple[bytes, str, str] | None:
-    """Blocking yt-dlp download of the top search hit.
-    Returns (bytes, video_title, uploader).
+def _download(query: str, artist: str, title: str,
+              timeout_s: int = 90) -> tuple[bytes, str, str] | None:
+    """Blocking yt-dlp download. Returns (bytes, video_title, uploader).
 
-    Tries multiple YouTube player clients in sequence: datacenter IPs are
-    often blocked on the web client ("Failed to extract any player
-    response") while android/ios clients still work.
+    Tries up to 5 search candidates (was: only the top hit). A video that
+    blocks datacenter IPs ("Failed to extract any player response") is
+    skipped and the next candidate is tried. For each candidate, tries
+    android/ios/web player clients.
     """
     import yt_dlp
 
     last_error = ""
-    for player_client in ("android", "ios", "web"):
-        tmpdir = tempfile.mkdtemp(prefix="ytfull_")
-        outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
-        opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 20,
-            "retries": 1,
-            "extractor_args": {"youtube": {"player_client": [player_client]}},
-        }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                entries = (info or {}).get("entries") or []
-                if not entries:
-                    continue
-                video = entries[0]
-                vtitle = video.get("title") or ""
-                uploader = video.get("uploader") or video.get("channel") or ""
-                url = video.get("webpage_url") or video.get("id") or ""
-                if not url:
-                    continue
-                info2 = ydl.extract_info(url, download=True)
-                if not info2:
-                    continue
-                for f in os.listdir(tmpdir):
-                    p = os.path.join(tmpdir, f)
-                    if os.path.isfile(p) and os.path.getsize(p) > 100_000:
-                        with open(p, "rb") as fh:
-                            data = fh.read()
-                        _cleanup(tmpdir)
-                        log_event(log, "youtube_full", stage="client_ok",
-                                  player_client=player_client)
-                        return data, vtitle, uploader
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {str(exc)[:80]}"
-        finally:
-            _cleanup(tmpdir)
+    # Get up to 5 candidates first (fast, no download)
+    candidates = []
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                               "socket_timeout": 20, "retries": 1}) as ydl:
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            for e in ((info or {}).get("entries") or [])[:5]:
+                url = e.get("webpage_url") or e.get("id") or ""
+                if url:
+                    candidates.append({
+                        "url": url,
+                        "title": e.get("title") or "",
+                        "uploader": e.get("uploader") or e.get("channel") or "",
+                    })
+    except Exception as exc:
+        log_event(log, "youtube_full", stage="search_failed",
+                  error=f"{type(exc).__name__}: {str(exc)[:60]}")
+        return None
+
+    if not candidates:
+        return None
+    # Title gate BEFORE download: skip candidates that don't match
+    # artist+title (saves 10-20s per wrong video).
+    filtered = [c for c in candidates
+                if _title_ok(c["title"], c["uploader"], artist, title)]
+    log_event(log, "youtube_full", stage="candidates",
+              count=len(candidates), title_ok=len(filtered))
+    if not filtered:
+        log_event(log, "youtube_full", stage="title_rejected_all")
+        return None
+    candidates = filtered
+
+    for idx, cand in enumerate(candidates):
+        for player_client in ("android", "ios", "web"):
+            tmpdir = tempfile.mkdtemp(prefix="ytfull_")
+            outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
+            opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": outtmpl,
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 20,
+                "retries": 1,
+                "extractor_args": {"youtube": {"player_client": [player_client]}},
+            }
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info2 = ydl.extract_info(cand["url"], download=True)
+                    if not info2:
+                        continue
+                    for f in os.listdir(tmpdir):
+                        p = os.path.join(tmpdir, f)
+                        if os.path.isfile(p) and os.path.getsize(p) > 100_000:
+                            with open(p, "rb") as fh:
+                                data = fh.read()
+                            _cleanup(tmpdir)
+                            log_event(log, "youtube_full", stage="client_ok",
+                                      player_client=player_client,
+                                      candidate_idx=idx)
+                            return data, cand["title"], cand["uploader"]
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {str(exc)[:80]}"
+                # "Failed to extract any player response" = this video blocks
+                # the IP; try next candidate instead of next client.
+                if "Failed to extract any player response" in str(exc):
+                    log_event(log, "youtube_full", stage="candidate_blocked",
+                              candidate_idx=idx)
+                    _cleanup(tmpdir)
+                    break
+            finally:
+                _cleanup(tmpdir)
     if last_error:
-        log_event(log, "youtube_full", stage="all_clients_failed",
+        log_event(log, "youtube_full", stage="all_candidates_failed",
                   error=last_error)
     return None
 
@@ -154,7 +186,7 @@ async def find_youtube_audio(artist: str, title: str) -> dict | None:
         return None
     t0 = asyncio.get_event_loop().time()
     try:
-        res = await asyncio.to_thread(_download, query)
+        res = await asyncio.to_thread(_download, query, artist, title)
     except Exception as exc:
         log_event(log, "youtube_full", stage="error",
                   error=f"{type(exc).__name__}: {str(exc)[:60]}")
