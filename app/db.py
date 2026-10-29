@@ -98,6 +98,24 @@ def _seed(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)", (key, value)
         )
+    # Verified public music channels (checked 2026-10-29 via t.me): these are
+    # real bank sources. Files enter the bank only via user forwards or when
+    # the bot is a channel admin (Bot API limitation).
+    for ident, label, order in [
+        ("melodio", "melobit | ملوبیت [Iranian]", 0),
+        ("AvangRecords", "Avang Music [Iranian]", 1),
+        ("radiojavan", "Radio Javan [Iranian]", 2),
+        ("imba_official", "IMBA Music [Foreign]", 3),
+    ]:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO bank_sources"
+                " (kind, identifier, label, enabled, sort_order, status, last_check)"
+                " VALUES ('channel', ?, ?, 1, ?, 'verified_public', ?)",
+                (ident, label, order, int(time.time())),
+            )
+        except Exception:
+            pass
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
