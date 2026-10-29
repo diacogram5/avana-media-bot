@@ -27,9 +27,13 @@ def test_stt_payload_parsing_never_invents_text():
     assert parse_stt_payload({"DisplayText": "  "}).status == "empty"
 
 
-def test_user_menu_has_voice_to_text_and_no_stats(db):
+def test_user_menu_hides_voice_to_text_and_no_stats(db):
+    # Voice-to-text / text-to-voice live behind the OpenAI key gate only;
+    # they are not in the default audience menu (user order).
     labels = main_menu_labels(db)
-    assert "🎙 تبدیل ویس به متن" in labels
+    assert "تبدیل ویس به متن" not in labels
+    assert "تبدیل متن به ویس" not in labels
+    assert " 🎵 حرفه ای" in labels
     assert not any("آمار" in label for label in labels), \
         "user menu must not contain a stats button"
 
@@ -124,6 +128,6 @@ async def test_voice_to_text_without_key_says_so_and_fabricates_nothing(monkeypa
     msg = _FakeMessage()
     await handlers.media_handler(msg, db, config, _FakeState("voice_to_text"))
     joined = "\n".join(msg.answers)
-    assert "نیازمند کلید" in joined or "تنظیم نشده" in joined
+    assert "هوش برتر وصل نیست" in joined
     # No fabricated transcript appears anywhere.
     assert "سلام" not in joined

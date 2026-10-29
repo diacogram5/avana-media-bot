@@ -117,9 +117,9 @@ async def test_professional_card_exact_match_only(monkeypatch, db):
     await handlers._send_professional_song_card(msg, db, "Dooset Daram", "Mehdi Ahmadvand")
     assert msg.audios and msg.audios[0][0] == "https://audio.example.com/preview.m4a"
     assert msg.audios[0][1].startswith("Dooset Daram – Mehdi Ahmadvand")
-    # New requirement: exactly two contextual buttons on the audio card.
+    # Song card: heart (favorite) + lyrics + add-to-playlist.
     labels = [b.text for row in msg.audios[0][2].inline_keyboard for b in row]
-    assert labels == ["📝 متن آهنگ", "🎶 افزودن به پلی‌لیست"]
+    assert labels == ["🤍", "📝 متن آهنگ", "🎶 افزودن به پلی‌لیست"]
     assert "https://music.apple.com/track/7" in msg.audios[0][1]
     assert not msg.answers  # no extra text messages, no buttons, no sections
 

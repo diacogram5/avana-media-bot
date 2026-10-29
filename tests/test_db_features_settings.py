@@ -16,7 +16,7 @@ def test_feature_toggle_hides_from_menu(db):
     labels = main_menu_labels(db)
     assert "🎵 جستجوی آهنگ" not in labels
     dbmod.set_feature(db, "song_search", enabled=True, by_id=1)
-    assert "🎵 جستجوی آهنگ" in main_menu_labels(db)
+    assert "جستجوی آهنگ و ویدیو" in main_menu_labels(db)
 
 
 def test_settings_persist_and_history(db):

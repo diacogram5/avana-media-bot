@@ -73,7 +73,7 @@ async def test_tts_mocked_ok_and_error():
 
 
 @pytest.mark.asyncio
-async def test_handler_speech_helpers_without_any_key_call_nothing(monkeypatch):
+async def test_handler_speech_helpers_without_any_key_call_nothing(monkeypatch, db):
     """With neither OpenAI nor Azure key, helpers return needs_key untouched."""
     config = Config()
     config.openai_api_key = ""
@@ -87,12 +87,12 @@ async def test_handler_speech_helpers_without_any_key_call_nothing(monkeypatch):
     monkeypatch.setattr(handlers, "transcribe_whisper", forbidden)
     monkeypatch.setattr(handlers, "synthesize", forbidden)
     monkeypatch.setattr(handlers, "transcribe_bytes", forbidden)
-    assert await handlers._synthesize_voice("سلام", "female", config) == ("needs_key", b"")
-    assert await handlers._transcribe_voice(b"voice", "voice.ogg", config) == ("needs_key", "")
+    assert await handlers._synthesize_voice("سلام", "female", config, db) == ("needs_key", b"")
+    assert await handlers._transcribe_voice(b"voice", "voice.ogg", config, db) == ("needs_key", "")
 
 
 @pytest.mark.asyncio
-async def test_handler_speech_helpers_prefer_openai(monkeypatch):
+async def test_handler_speech_helpers_prefer_openai(monkeypatch, db):
     """With an OpenAI key, Whisper/TTS are tried first and Azure is untouched."""
     config = Config()
     config.openai_api_key = "fake-openai-key"
@@ -114,5 +114,5 @@ async def test_handler_speech_helpers_prefer_openai(monkeypatch):
     monkeypatch.setattr(handlers, "transcribe_whisper", fake_whisper)
     monkeypatch.setattr(handlers, "synthesize", forbidden_azure)
     monkeypatch.setattr(handlers, "transcribe_bytes", forbidden_azure)
-    assert await handlers._synthesize_voice("سلام", "female", config) == ("ok", b"openai-mp3")
-    assert await handlers._transcribe_voice(b"voice", "voice.ogg", config) == ("ok", "سلام")
+    assert await handlers._synthesize_voice("سلام", "female", config, db) == ("ok", b"openai-mp3")
+    assert await handlers._transcribe_voice(b"voice", "voice.ogg", config, db) == ("ok", "سلام")

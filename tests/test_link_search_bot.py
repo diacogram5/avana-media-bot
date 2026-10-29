@@ -74,7 +74,7 @@ async def test_search_failure_isolation_and_pagination():
 
 
 def test_menu_and_feature_gate(db):
-    assert "🎵 جستجوی آهنگ" in main_menu_labels(db)
+    assert "جستجوی آهنگ و ویدیو" in main_menu_labels(db)
     allowed, _ = can_use_feature(db, 1, "song_search")
     assert allowed
     from app import db as dbmod

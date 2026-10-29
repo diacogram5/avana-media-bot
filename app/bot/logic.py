@@ -9,22 +9,11 @@ from __future__ import annotations
 from .. import db as dbmod
 from ..i18n import t
 
-# User menu only: core features. No stats button and no other
-# useless buttons — voice-to-text replaces them.
-MENU_ITEMS = [
-    ("song_search", "menu_song"),
-    ("link_fetch", "menu_link"),
-    ("voice_to_text", "menu_voice_to_text"),
-    ("help_support", "menu_help"),
-]
-
-
+# Legacy alias: the live user menu is the dynamic «قابلیت‌ها» menu built
+# from the features table (see capabilities_menu). Kept so existing
+# callers/tests keep working; titles come from the DB (Persian).
 def main_menu_labels(conn, lang: str = "fa") -> list[str]:
-    labels = []
-    for feature_key, text_key in MENU_ITEMS:
-        if dbmod.feature_enabled(conn, feature_key):
-            labels.append(t(text_key, lang))
-    return labels
+    return [f["title"] for f in capabilities_menu(conn)]
 
 
 def welcome_text(conn, lang: str = "fa") -> str:
@@ -35,11 +24,19 @@ def welcome_text(conn, lang: str = "fa") -> str:
 
 
 def can_use_feature(conn, telegram_id: int, feature_key: str, daily_limit: int = 50) -> tuple[bool, str]:
-    # MVP: only the DB feature toggle gates a feature. No daily limit,
-    # channel gate, or block system in MVP.
-    if not dbmod.feature_enabled(conn, feature_key):
+    # Gating is on `enabled` only. `visible` controls the «قابلیت‌ها» menu
+    # display: buttonless/auto features (audio_id, link_fetch, tts,
+    # voice_to_text) stay enabled while hidden from the menu.
+    feat = dbmod.get_feature(conn, feature_key)
+    if feat is None or not feat.get("enabled"):
         return False, "feature_disabled"
     return True, ""
+
+
+def capabilities_menu(conn) -> list[dict]:
+    """Dynamic «قابلیت‌ها» menu: visible+enabled features in menu order."""
+    return [f for f in dbmod.list_features(conn)
+            if f.get("enabled") and f.get("visible")]
 
 
 def format_results(results, page: int = 1, page_size: int = 5) -> str:
@@ -159,20 +156,113 @@ def _normalise(text: str) -> str:
 def match_identified_song(results, title: str, artist: str):
     """Pick the catalog result that IS the identified song, or None.
 
-    Exact-ish match on normalised title + artist. A merely similar
-    catalog result is never returned as the identified song — the caller
-    then sends only the clean identified title with an honest note that
-    no official preview/download was found in the catalog.
+    Version-aware acceptance (web parity): the card must carry the
+    identity's version tokens (remix/live/…), add no extra distinctive
+    title words, and match title+artist at >=0.99 token overlap. A
+    merely similar catalog result is never returned as the identified
+    song — the caller then uses the identified-but-no-file state.
     """
-    want_title = _normalise(title)
-    want_artist = _normalise(artist)
     for item in results:
-        if _normalise(item.title) != want_title:
-            continue
-        if want_artist and _normalise(item.artist) and _normalise(item.artist) != want_artist:
-            continue
-        return item
+        if identified_card_acceptable(title, artist, item.title, item.artist,
+                                      getattr(item, "album", "") or ""):
+            return item
     return None
+
+
+# --- version-aware acceptance (exact-match only, no language bias) --------
+import re as _re
+
+_FA_CHAR_MAP = {
+    "ا": "a", "آ": "a", "ب": "b", "پ": "p", "ت": "t", "ث": "s", "ج": "j",
+    "چ": "ch", "ح": "h", "خ": "kh", "د": "d", "ذ": "z", "ر": "r", "ز": "z",
+    "ژ": "zh", "س": "s", "ش": "sh", "ص": "s", "ض": "z", "ط": "t", "ظ": "z",
+    "ع": "a", "غ": "gh", "ف": "f", "ق": "gh", "ک": "k", "گ": "g", "ل": "l",
+    "م": "m", "ن": "n", "و": "o", "ه": "h", "ی": "i", "ي": "i", "ك": "k",
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4", "۵": "5",
+    "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+}
+
+_PACKAGING_STOPWORDS = frozenset({
+    "official", "video", "music", "audio", "lyric", "lyrics", "hd", "hq",
+    "4k", "clip", "song", "track", "new", "2024", "2025", "2026",
+})
+
+
+def _skeleton_token(token: str) -> str:
+    """Phonetic skeleton so Persian and Finglish spellings can meet."""
+    out = []
+    for ch in token.lower():
+        if ch in _FA_CHAR_MAP:
+            out.append(_FA_CHAR_MAP[ch])
+        elif ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+def _distinctive_tokens(text: str) -> list[str]:
+    toks = []
+    for raw in _re.findall(r"[\w\u0600-\u06ff]+", (text or "").lower()):
+        sk = _skeleton_token(raw)
+        if len(sk) >= 2 and sk not in _PACKAGING_STOPWORDS:
+            toks.append(sk)
+    return toks
+
+
+def token_overlap_ratio(want_text: str, cand_text: str) -> float:
+    """Fraction of the wanted distinctive tokens found in the candidate."""
+    want = _distinctive_tokens(want_text)
+    if not want:
+        return 0.0
+    cand = set(_distinctive_tokens(cand_text))
+    hit = sum(1 for t in want if t in cand)
+    return hit / len(want)
+
+
+def _strip_brackets(text: str) -> str:
+    return _re.sub(r"[\(\[].*?[\)\]]", " ", text or "")
+
+
+def identified_version_tokens(title: str) -> list[str]:
+    """Version words are part of the identity: raw tokens minus the
+    bracket-stripped (packaging) tokens. E.g. «Vay Az Dastet (Arash
+    Mohseni Remix)» -> [arash, mohseni, remix]."""
+    raw = set(_distinctive_tokens(title))
+    clean = set(_distinctive_tokens(_strip_brackets(title)))
+    return sorted(raw - clean)
+
+
+def carries_version_tokens(title: str, hay_text: str) -> bool:
+    """Every version token of the identity must appear in the candidate."""
+    vt = identified_version_tokens(title)
+    if not vt:
+        return True
+    hay = set(_distinctive_tokens(hay_text))
+    return all(t in hay for t in vt)
+
+
+def title_has_extra_tokens(want_title: str, card_title: str) -> bool:
+    """The card's own title must carry no extra distinctive words —
+    «Kheili Dooset Daram Ye Rooz» is not «Dooset Daram»."""
+    want = set(_distinctive_tokens(want_title))
+    version = set(identified_version_tokens(want_title))
+    extra = [t for t in _distinctive_tokens(card_title)
+             if t not in want and t not in version]
+    return bool(extra)
+
+
+def identified_card_acceptable(title: str, artist: str, card_title: str,
+                               card_artist: str, card_album: str = "") -> bool:
+    """Two-directional, field-aware acceptance of an identified card."""
+    hay = f"{card_title} {card_album}"
+    if not carries_version_tokens(title, hay):
+        return False
+    if title_has_extra_tokens(title, card_title):
+        return False
+    if token_overlap_ratio(title, hay) < 0.99:
+        return False
+    if (artist or "").strip() and token_overlap_ratio(artist, card_artist) < 0.99:
+        return False
+    return True
 
 
 def format_user_line(user: dict) -> str:

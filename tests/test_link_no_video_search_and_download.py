@@ -88,11 +88,11 @@ class _FakeMessage:
     async def answer(self, text, reply_markup=None):
         self.answers.append(text)
 
-    async def answer_video(self, video, caption=None):
+    async def answer_video(self, video, caption=None, reply_markup=None):
         self.videos.append((video, caption))
 
-    async def answer_audio(self, audio, caption=None):
-        self.audios.append((audio, caption))
+    async def answer_audio(self, audio, caption=None, reply_markup=None):
+        self.audios.append((audio, caption, reply_markup))
 
 
 @pytest.mark.asyncio

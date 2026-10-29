@@ -114,7 +114,7 @@ class _LinkFakeMessage:
     async def answer(self, text, reply_markup=None):
         self.answers.append(text)
 
-    async def answer_video(self, video, caption=None):
+    async def answer_video(self, video, caption=None, reply_markup=None):
         pass
 
 
