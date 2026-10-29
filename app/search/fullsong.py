@@ -275,23 +275,22 @@ async def find_full_song_file(artist: str, title: str,
                 br = _probe_bitrate_kbps(data, ext) or 0
                 valid.append((br, data, ext, duration, source))
             if not valid:
-                log_event(log, "fullsong", stage="not_found",
+                log_event(log, "fullsong", stage="wp_not_found",
                           ms=int((time.time() - t0) * 1000),
                           candidates=len(candidates))
-                return None
-            valid.sort(key=lambda v: v[0], reverse=True)
-            _br, data, ext, duration, source = valid[0]
-            log_event(log, "fullsong", stage="found",
-                      ms=int((time.time() - t0) * 1000),
-                      source=source, bitrate_kbps=_br,
-                      duration_s=round(duration, 1),
-                      bytes=len(data))
-            _cache_put(key, data, ext, duration, source)
-            return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
+            else:
+                valid.sort(key=lambda v: v[0], reverse=True)
+                _br, data, ext, duration, source = valid[0]
+                log_event(log, "fullsong", stage="found",
+                          ms=int((time.time() - t0) * 1000),
+                          source=source, bitrate_kbps=_br,
+                          duration_s=round(duration, 1),
+                          bytes=len(data))
+                _cache_put(key, data, ext, duration, source)
+                return {"data": data, "ext": ext, "duration_sec": duration, "source": source}
     except Exception as exc:
-        log_event(log, "fullsong", stage="error",
+        log_event(log, "fullsong", stage="wp_error",
                   error=f"{type(exc).__name__}: {str(exc)[:80]}")
-        return None
     # Fallback: YouTube (slower, universal coverage). Proven 2026-10-29.
     try:
         from .youtube_full import find_youtube_audio

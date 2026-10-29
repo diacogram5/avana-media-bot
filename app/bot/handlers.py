@@ -1655,7 +1655,7 @@ def _notfound_result_kb(bank_token: str | None, page_text: str = "",
     if len(words) >= 3:
         rows.append([InlineKeyboardButton(
             text=t("similar_songs", lang),
-            callback_data=f"similar:{' '.join(words[:3])[:60]}")])
+            callback_data=_cb_query(" ".join(words[:3])))])
     bb = _bank_button(bank_token, lang)
     if bb:
         rows.extend(bb.inline_keyboard)
@@ -1881,7 +1881,7 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     # preview is never presented as the song.
     more_kb_rows = list(kb.inline_keyboard)
     more_kb_rows.append([InlineKeyboardButton(
-        text=t("similar_songs", ulang), callback_data=f"similar:{query[:60]}")])
+        text=t("similar_songs", ulang), callback_data=_cb_query(query))])
     if bank_token:
         more_kb_rows.append([InlineKeyboardButton(
             text=t("m_bank_search_btn", ulang),
@@ -1953,6 +1953,18 @@ async def _transcribe_voice(data: bytes, filename: str, config: Config, conn):
     return "needs_key", ""
 
 
+def _cb_query(query: str, prefix: str = "similar:") -> str:
+    """Byte-safe callback_data: Telegram allows 64 bytes; Persian chars are
+    2 bytes each, so truncate by bytes and never split a UTF-8 char."""
+    b = f"{prefix}{query}".encode("utf-8")[:64]
+    while b:
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return prefix.rstrip(":")
+
+
 async def _do_search(message: Message, conn, query: str, include_video: bool = True, config=None):
     """Professional minimal text search: clean list + one song card.
 
@@ -1993,7 +2005,7 @@ async def _do_search(message: Message, conn, query: str, include_video: bool = T
     kb = None
     if len(results) > 5:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=t("m_next_page", ulang), callback_data=f"search:next:{query[:60]}")]])
+            InlineKeyboardButton(text=t("m_next_page", ulang), callback_data=_cb_query(query, prefix="search:next:"))]])
     await _answer(message, conn, text, reply_markup=kb)
     song = next((r for r in results if r.kind == "music"), None)
     if song is not None:
@@ -2036,7 +2048,7 @@ async def _no_results_with_channel(message, conn, query: str, config=None):
                     f"{t('channel_post', ulang)}\n{post['post_url']}\n{post['text'][:300]}")
                 return
     await message.answer(t("no_results", ulang), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=t("similar_songs", ulang), callback_data=f"similar:{query[:60]}")]]))
+        InlineKeyboardButton(text=t("similar_songs", ulang), callback_data=_cb_query(query))]]))
 
 
 @router.callback_query(F.data.startswith("search:next:"))
@@ -2457,7 +2469,7 @@ async def _run_suggest_body(message, conn, text: str, config):
         kb_rows.append([InlineKeyboardButton(text=label,
                                             callback_data=f"sg:get:{key}")])
     extra_row = [InlineKeyboardButton(text=t("m_similar_songs", ulang),
-                                      callback_data=f"similar:{text[:50]}")]
+                                      callback_data=_cb_query(text))]
     if more_tok:
         extra_row.append(InlineKeyboardButton(text=t("m_more_suggestions", ulang),
                                               callback_data=f"sg:more:{more_tok}"))

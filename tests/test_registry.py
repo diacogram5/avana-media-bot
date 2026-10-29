@@ -132,6 +132,10 @@ def test_per_site_file_source_runs_real_pipeline(monkeypatch):
     (mocked) download through all honesty gates."""
     import app.search.fullsong as fs
     import app.search.sources  # noqa: F401
+    from app.search import youtube_full as ytf
+    async def _no_yt(a, t):
+        return None
+    monkeypatch.setattr(ytf, "find_youtube_audio", _no_yt)
 
     MP3_BYTES = b"ID3\x04\x00" + b"\x00" * 300_000
 

@@ -11,6 +11,14 @@ No network: httpx is faked; _fingerprint_duration is stubbed.
 import pytest
 
 from app.search import fullsong as fs
+from app.search import youtube_full as ytf
+
+
+@pytest.fixture(autouse=True)
+def _no_youtube(monkeypatch):
+    async def _none(a, t):
+        return None
+    monkeypatch.setattr(ytf, 'find_youtube_audio', _none)
 
 ARTIST, TITLE = "Test Artist", "Test Song"
 POST_TITLE = "دانلود آهنگ Test Song از Test Artist"

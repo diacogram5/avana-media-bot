@@ -98,9 +98,13 @@ class _FakeClient:
 
 def _fullsong_client(monkeypatch, routes):
     from app.search import fullsong
+    from app.search import youtube_full as ytf
     monkeypatch.setattr(fullsong.httpx, "AsyncClient",
                         lambda *a, **k: _FakeClient(routes))
     monkeypatch.setattr(fullsong, "_fingerprint_duration", lambda data: 200.0)
+    async def _no_yt(a, t):
+        return None
+    monkeypatch.setattr(ytf, "find_youtube_audio", _no_yt)
     fullsong._CACHE.clear()
     return fullsong
 
