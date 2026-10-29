@@ -83,54 +83,68 @@ def _title_ok(video_title: str, uploader: str, artist: str, title: str) -> bool:
 
 def _download(query: str, timeout_s: int = 90) -> tuple[bytes, str, str] | None:
     """Blocking yt-dlp download of the top search hit.
-    Returns (bytes, video_title, uploader)."""
+    Returns (bytes, video_title, uploader).
+
+    Tries multiple YouTube player clients in sequence: datacenter IPs are
+    often blocked on the web client ("Failed to extract any player
+    response") while android/ios clients still work.
+    """
     import yt_dlp
 
-    tmpdir = tempfile.mkdtemp(prefix="ytfull_")
-    outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
-    opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 20,
-        "retries": 1,
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            entries = (info or {}).get("entries") or []
-            if not entries:
-                return None
-            video = entries[0]
-            vtitle = video.get("title") or ""
-            uploader = video.get("uploader") or video.get("channel") or ""
-            url = video.get("webpage_url") or video.get("id") or ""
-            if not url:
-                return None
-            info2 = ydl.extract_info(url, download=True)
-            if not info2:
-                return None
-            # find the downloaded file
-            for f in os.listdir(tmpdir):
-                p = os.path.join(tmpdir, f)
-                if os.path.isfile(p) and os.path.getsize(p) > 100_000:
-                    with open(p, "rb") as fh:
-                        return fh.read(), vtitle, uploader
-            return None
-    except Exception:
-        return None
-    finally:
-        for f in os.listdir(tmpdir):
-            try:
-                os.remove(os.path.join(tmpdir, f))
-            except OSError:
-                pass
+    last_error = ""
+    for player_client in ("android", "ios", "web"):
+        tmpdir = tempfile.mkdtemp(prefix="ytfull_")
+        outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+            "retries": 1,
+            "extractor_args": {"youtube": {"player_client": [player_client]}},
+        }
         try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+                entries = (info or {}).get("entries") or []
+                if not entries:
+                    continue
+                video = entries[0]
+                vtitle = video.get("title") or ""
+                uploader = video.get("uploader") or video.get("channel") or ""
+                url = video.get("webpage_url") or video.get("id") or ""
+                if not url:
+                    continue
+                info2 = ydl.extract_info(url, download=True)
+                if not info2:
+                    continue
+                for f in os.listdir(tmpdir):
+                    p = os.path.join(tmpdir, f)
+                    if os.path.isfile(p) and os.path.getsize(p) > 100_000:
+                        with open(p, "rb") as fh:
+                            data = fh.read()
+                        _cleanup(tmpdir)
+                        log_event(log, "youtube_full", stage="client_ok",
+                                  player_client=player_client)
+                        return data, vtitle, uploader
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:80]}"
+        finally:
+            _cleanup(tmpdir)
+    if last_error:
+        log_event(log, "youtube_full", stage="all_clients_failed",
+                  error=last_error)
+    return None
+
+
+def _cleanup(tmpdir: str) -> None:
+    import shutil
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 async def find_youtube_audio(artist: str, title: str) -> dict | None:
