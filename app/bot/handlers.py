@@ -704,6 +704,17 @@ def _looks_like_video(data: bytes) -> bool:
     return head[4:8] == b"ftyp" or head[:4] == b"\x00\x00\x00\x18"
 
 
+def _looks_like_audio(data: bytes) -> bool:
+    """Magic-byte check for audio bytes (mp4/m4a container, MP3, WAV,
+    AAC ADTS) — never trusts extensions or content-type alone."""
+    if not data or len(data) < 16:
+        return False
+    head = data[:16]
+    return (head[4:8] == b"ftyp" or head[:3] == b"ID3"
+            or head[:4] == b"RIFF"
+            or (head[0] == 0xFF and (head[1] & 0xF0) == 0xF0))
+
+
 async def _send_instagram_video_file(message: Message, conn, outcome,
                                      config=None):
     """Fetch the reel's real video file (anonymous resolver) and send it.
@@ -716,7 +727,7 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
 
     try:
         from ..services.instagram import resolve_instagram_media
-        _audio_url, video_url, _page_text, _strategy = \
+        audio_url, video_url, _page_text, _strategy = \
             await resolve_instagram_media(outcome.official_url)
     except Exception:
         return None
@@ -739,7 +750,10 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         caption="🎬 ویدیوی همان لینک برای دانلود")
     if sent is not None:
         _track(conn, message, sent)
-        await _attach_identify_button(message, conn, sent)
+        # Pass the reel's separate audio-stream URL so the one-click
+        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio —
+        # the sent video file is the video-only DASH stream (no audio).
+        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
     return sent
 
 
@@ -801,16 +815,20 @@ def _bank_button(token: str | None):
 
 
 # --- one-click «🎵 شناسایی موسیقی» under received videos -------------------------
-# Server-side registry: token -> {"user_id", "file_id", "kind"}. The button
-# never carries a path — only an opaque token — and the callback re-checks
-# ownership, so concurrent users/videos can never be mixed up. Tokens live
-# in memory only: after a restart a tap gets the distinct "expired" message.
+# Server-side registry: token -> {"user_id", "file_id", "kind", "audio_url"}.
+# The button never carries a path — only an opaque token — and the callback
+# re-checks ownership, so concurrent users/videos can never be mixed up.
+# Tokens live in memory only: after a restart a tap gets the distinct
+# "expired" message. "audio_url" is set only for link-fetched videos whose
+# sent file is a video-only stream; the reel's real audio then comes from
+# that URL instead of the (audio-less) Telegram file.
 _VIDEO_IDENTIFY: dict[str, dict] = {}
 _VIDEO_IDENTIFY_RUNNING: set[str] = set()
 
 
 def _video_identify_kb(user_id: int, file_id: str, kind: str,
-                       label: str = "🎵 شناسایی موسیقی") -> InlineKeyboardMarkup:
+                       label: str = "🎵 شناسایی موسیقی",
+                       audio_url: str | None = None) -> InlineKeyboardMarkup:
     """Build the one-click music-identification button for a video — or,
     with kind="audio" and a «🔄 تلاش مجدد» label, the retry button for an
     audio/voice file whose identification failed.
@@ -818,16 +836,19 @@ def _video_identify_kb(user_id: int, file_id: str, kind: str,
     ``kind`` is "link" (video fetched from a sent link), "file" (video
     the user sent directly), or "audio" (audio/voice the user sent). The
     registry entry is keyed by an opaque token; the Telegram file_id is
-    resolved server-side on click."""
+    resolved server-side on click. ``audio_url`` (link kind only) points
+    at the reel's separate audio stream — the callback identifies THOSE
+    bytes, because the sent video file itself is video-only."""
     token = secrets.token_hex(8)
     _VIDEO_IDENTIFY[token] = {"user_id": user_id, "file_id": file_id,
-                              "kind": kind}
+                              "kind": kind, "audio_url": audio_url}
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=label,
                              callback_data=f"vid:id:{token}")]])
 
 
-async def _attach_identify_button(message: Message, conn, sent) -> None:
+async def _attach_identify_button(message: Message, conn, sent,
+                                  audio_url: str | None = None) -> None:
     """Attach the one-click identification button under a bot-sent video
     message (best effort; the video must have a downloadable file_id)."""
     try:
@@ -835,10 +856,29 @@ async def _attach_identify_button(message: Message, conn, sent) -> None:
         file_id = getattr(video, "file_id", None) if video else None
         if not file_id or not message.from_user:
             return
-        kb = _video_identify_kb(message.from_user.id, file_id, "link")
+        kb = _video_identify_kb(message.from_user.id, file_id, "link",
+                                audio_url=audio_url)
         await sent.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass
+
+
+async def _download_link_audio(url: str, config) -> bytes:
+    """Download a reel's separate audio stream for identification.
+
+    Same validation as the video path: size cap, real container bytes —
+    never a renamed or empty payload."""
+    headers = {"User-Agent": "Mozilla/5.0",
+               "Referer": "https://www.instagram.com/"}
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.content
+    max_mb = getattr(config, "max_file_mb", 50)
+    if not data or len(data) > max_mb * 1024 * 1024 \
+            or not _looks_like_audio(data):
+        raise ValueError("audio bytes failed validation")
+    return data
 
 
 async def _answer_identify_clip_fallback(message, conn, config, data: bytes,
@@ -898,11 +938,19 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     _VIDEO_IDENTIFY_RUNNING.add(token)
     await callback.answer("🎧 در حال شناسایی آهنگ از روی صدای ویدیو…")
     try:
+        # For link-fetched videos the sent file is the video-ONLY stream:
+        # identify the reel's real audio from its separate audio URL.
+        # User-sent files have no audio_url and fall back to the Telegram
+        # file, exactly as before.
+        audio_url = entry.get("audio_url")
         try:
-            tg_file = await callback.bot.get_file(entry["file_id"])
-            buf = io.BytesIO()
-            await callback.bot.download_file(tg_file.file_path, buf)
-            data = buf.getvalue()
+            if audio_url:
+                data = await _download_link_audio(audio_url, config)
+            else:
+                tg_file = await callback.bot.get_file(entry["file_id"])
+                buf = io.BytesIO()
+                await callback.bot.download_file(tg_file.file_path, buf)
+                data = buf.getvalue()
         except Exception:
             await callback.message.answer(
                 "⚠️ دریافت فایل ویدیو ممکن نشد؛ دوباره تلاش کنید.")

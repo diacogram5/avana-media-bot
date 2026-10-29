@@ -167,7 +167,8 @@ def test_video_identify_registry_and_guards():
     assert btn.callback_data.startswith("vid:id:")
     token = btn.callback_data.split("vid:id:", 1)[1]
     entry = handlers._VIDEO_IDENTIFY[token]
-    assert entry == {"user_id": 123, "file_id": "fileABC", "kind": "link"}
+    assert entry == {"user_id": 123, "file_id": "fileABC", "kind": "link",
+                     "audio_url": None}
     # ownership is enforced server-side on click, not from the button
     assert entry["user_id"] != 999
 
