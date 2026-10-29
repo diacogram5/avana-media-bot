@@ -123,6 +123,36 @@ def probe_audio(data: bytes, ext: str) -> tuple[int | None, float | None]:
     return bitrate, duration
 
 
+def has_audio_stream(data: bytes) -> bool | None:
+    """True if the container has an audio stream, False if it definitely
+    has none, None when unmeasurable (no ffprobe available). Used to give
+    the distinct honest cause for a silent/unprocessable video instead of
+    a generic identification error."""
+    if not _ffprobe_available() or not data:
+        return None
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as fh:
+            fh.write(data)
+            path = fh.name
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            timeout=30, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return bool(proc.stdout.strip())
+        return None
+    except Exception:
+        return None
+    finally:
+        if path:
+            try:
+                import os
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 def transcode_mp3(data: bytes, src_ext: str,
                   target_kbps: int = _TARGET_KBPS) -> tuple[bytes | None, int | None, float | None]:
     """Genuinely re-encode audio bytes to MP3 at ``target_kbps``.

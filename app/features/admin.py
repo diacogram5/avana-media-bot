@@ -469,7 +469,9 @@ def setting_label(key: str) -> str:
 
 # --- outbox / clear-chat --------------------------------------------------------
 def track(conn: sqlite3.Connection, user_id: int, chat_id: int, message_id: int) -> None:
-    """Record an outgoing bot message so «پاک‌سازی گفتگو» can delete it later."""
+    """Record a message (outgoing bot message or incoming user message) so
+    «پاک‌سازی گفتگو» can delete it later. Favorites, playlists, history,
+    settings and the bank are never stored here and never deleted by it."""
     conn.execute(
         "INSERT INTO outbox (user_id, chat_id, message_id, created_at) VALUES (?,?,?,?)",
         (user_id, chat_id, message_id, int(time.time())),
@@ -480,6 +482,23 @@ def track(conn: sqlite3.Connection, user_id: int, chat_id: int, message_id: int)
 def list_outbox(conn: sqlite3.Connection, user_id: int) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM outbox WHERE user_id=? ORDER BY id", (user_id,))]
+
+
+async def delete_tracked_messages(bot, rows: list[dict]) -> tuple[int, int]:
+    """Delete tracked chat messages, counting real outcomes.
+
+    Returns (deleted, failed). A failure (e.g. Telegram's 48-hour delete
+    limit) is counted, never silently claimed as deleted and never a
+    reason to abort the remaining deletions.
+    """
+    deleted = failed = 0
+    for row in rows:
+        try:
+            await bot.delete_message(row["chat_id"], row["message_id"])
+            deleted += 1
+        except Exception:
+            failed += 1
+    return deleted, failed
 
 
 def clear_chat_data(conn: sqlite3.Connection, user_id: int) -> int:
@@ -585,14 +604,36 @@ AD_FLOW = [
 def _panel_view(conn: sqlite3.Connection, config) -> tuple[str, InlineKeyboardMarkup]:
     status = key_status(conn, config)
     lines = ["🛡 پنل مدیریت", f"🧠 کلید هوش برتر: {status}", ""]
+    from . import watermark as _wm
+    _wm_state = "فعال" if _wm.is_enabled(conn) else "غیرفعال — به‌زودی"
     kb = _kb([
         [_btn("🧩 ویرایش دکمه‌ها", "adm:feats")],
         [_btn("📢 تبلیغات", "adm:ads")],
         [_btn("🧠 کلید هوش برتر", "adm:keybox")],
         [_btn("👥 کاربران", "adm:users")],
         [_btn("⚙️ تنظیمات", "adm:settings")],
+        [_btn(f"🖼 حذف نوشته روی ویدیو: {_wm_state}", "adm:watermark")],
     ])
     return "\n".join(lines), kb
+
+
+def _watermark_view(conn: sqlite3.Connection) -> tuple[str, InlineKeyboardMarkup]:
+    from . import watermark as _wm
+    en = _wm.is_enabled(conn)
+    lines = [
+        "🖼 حذف نوشته و شناسه روی ویدیو",
+        "",
+        f"وضعیت: {'فعال' if en else 'غیرفعال — به‌زودی'}",
+        "",
+        "در نسخه فعلی این قابلیت غیرفعال است و هیچ پردازشی انجام نمی‌شود؛ "
+        "دانلود عادی ویدیو کاملاً مستقل از آن کار می‌کند. فعال‌سازی آینده "
+        "فقط با همین تنظیم صریح مدیر ممکن است.",
+    ]
+    rows = []
+    rows.append([_btn("⏸ غیرفعال‌سازی", "adm:watermark:off")] if en
+                else [_btn("✅ فعال‌سازی", "adm:watermark:on")])
+    rows.append([_btn("⬅ بازگشت به پنل", "adm:panel")])
+    return "\n".join(lines), _kb(rows)
 
 
 def register(router: Router) -> None:
@@ -603,6 +644,28 @@ def register(router: Router) -> None:
     @_owner_only
     async def panel(callback: CallbackQuery, conn: sqlite3.Connection, config):
         await _edit(callback, *_panel_view(conn, config))
+
+    # -- watermark-removal stub (disabled by default) ---------------------------
+    @ar.callback_query(F.data == "adm:watermark")
+    @_owner_only
+    async def watermark_card(callback: CallbackQuery, conn: sqlite3.Connection, config):
+        await _edit(callback, *_watermark_view(conn))
+
+    @ar.callback_query(F.data == "adm:watermark:on")
+    @_owner_only
+    async def watermark_on(callback: CallbackQuery, conn: sqlite3.Connection, config):
+        from . import watermark as _wm
+        _wm.set_enabled(conn, True, by_id=callback.from_user.id)
+        await callback.answer("فعال شد.")
+        await _edit(callback, *_watermark_view(conn))
+
+    @ar.callback_query(F.data == "adm:watermark:off")
+    @_owner_only
+    async def watermark_off(callback: CallbackQuery, conn: sqlite3.Connection, config):
+        from . import watermark as _wm
+        _wm.set_enabled(conn, False, by_id=callback.from_user.id)
+        await callback.answer("غیرفعال شد.")
+        await _edit(callback, *_watermark_view(conn))
 
     # -- features (buttons) ------------------------------------------------------
     @ar.callback_query(F.data == "adm:feats")
@@ -1143,11 +1206,8 @@ def register(router: Router) -> None:
     async def clear_yes(callback: CallbackQuery, conn: sqlite3.Connection,
                         config, state: FSMContext):
         user_id = callback.from_user.id
-        for row in list_outbox(conn, user_id):
-            try:
-                await callback.bot.delete_message(row["chat_id"], row["message_id"])
-            except Exception:
-                pass
+        rows = list_outbox(conn, user_id)
+        deleted, failed = await delete_tracked_messages(callback.bot, rows)
         clear_chat_data(conn, user_id)
         await state.clear()
         await callback.answer()
@@ -1155,7 +1215,22 @@ def register(router: Router) -> None:
             await callback.message.delete()
         except Exception:
             pass
-        await callback.message.answer(CLEAR_DONE)
+        # Honest result: never a fake success message.
+        if not rows:
+            text = "پیامی برای پاک‌سازی پیدا نشد."
+        elif failed:
+            text = (f"✅ {deleted} پیام پاک شد؛ {failed} پیام به دلیل محدودیت "
+                    "تلگرام پاک نشد (پیام‌های قدیمی‌تر از ۴۸ ساعت قابل حذف نیستند).")
+        else:
+            text = CLEAR_DONE
+        # Re-assert the persistent main menu after clearing (lazy import:
+        # handlers imports this module at load time).
+        try:
+            from ..bot.handlers import _main_reply_kb
+            kb = _main_reply_kb(conn)
+        except Exception:
+            kb = None
+        await callback.message.answer(text, reply_markup=kb)
 
     # -- delete-all-my-data (every user) --------------------------------------------
     @ar.callback_query(F.data == "adm:wipe")

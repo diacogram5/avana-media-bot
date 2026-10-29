@@ -44,7 +44,10 @@ from aiogram.types import (
 
 from .. import db as dbmod
 from ..bot.audio_send import send_song_audio
-from ..bot.media_send import answer_no_preview, send_music, send_video
+from ..bot.media_send import (
+    answer_no_preview, has_audio_stream, probe_audio, send_music, send_video,
+    transcode_mp3,
+)
 from ..config import Config
 from ..features import admin as adminfeat
 from ..features import bank as bankfeat
@@ -99,6 +102,19 @@ def _track(conn, message: Message, sent) -> None:
         pass
 
 
+def _track_incoming(conn, message: Message) -> None:
+    """Record an incoming user message so «پاک‌سازی گفتگو» can delete the
+    user's own messages too (bots may delete incoming messages in private
+    chats). Without this, clear-chat visibly "does nothing" because the
+    user's messages all remain."""
+    try:
+        if message.from_user and getattr(message, "message_id", None):
+            adminfeat.track(conn, message.from_user.id, message.chat.id,
+                            message.message_id)
+    except Exception:
+        pass
+
+
 async def _answer(message: Message, conn, text: str, **kwargs):
     """message.answer + outbox tracking."""
     sent = await message.answer(text, **kwargs)
@@ -131,7 +147,6 @@ def _blocked(conn, user_id: int) -> bool:
     return bool(user and user.get("blocked"))
 
 
-@router.message(Command("start"))
 def _with_signature(conn, config: Config, text: str) -> str:
     """Append the bot-ID signature line: the ONE fixed, deliberate place
     the bot ID appears on outbound content (welcome/help). Never under
@@ -146,8 +161,17 @@ def _with_signature(conn, config: Config, text: str) -> str:
     return f"{text}\n\n🤖 {bot_id}"
 
 
-async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config):
+@router.message(Command("start"))
+async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config,
+                    state: FSMContext | None = None):
     _register(message, conn)
+    # Reset the conversation to its initial state without touching any
+    # saved user data (favorites, playlists, history, settings).
+    if state is not None:
+        try:
+            await state.clear()
+        except Exception:
+            pass
     # Persistent bottom menu (web parity): the 10 main feature buttons stay
     # at the bottom of the chat, each wired to its real function. Inline
     # keyboards remain only for supplementary card operations.
@@ -598,6 +622,7 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
                                 caption="🎬 ویدیوی همان لینک برای دانلود")
         if sent is not None:
             _track(conn, message, sent)
+            await _attach_identify_button(message, conn, sent)
             return sent
         await _answer(message, conn, text)
         return None
@@ -657,6 +682,7 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         caption="🎬 ویدیوی همان لینک برای دانلود")
     if sent is not None:
         _track(conn, message, sent)
+        await _attach_identify_button(message, conn, sent)
     return sent
 
 
@@ -715,6 +741,137 @@ def _bank_button(token: str | None):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔎 جست‌وجو در بانک هوش برتر",
                              callback_data=f"bank:search:{token}")]])
+
+
+# --- one-click «🎵 شناسایی موسیقی» under received videos -------------------------
+# Server-side registry: token -> {"user_id", "file_id", "kind"}. The button
+# never carries a path — only an opaque token — and the callback re-checks
+# ownership, so concurrent users/videos can never be mixed up. Tokens live
+# in memory only: after a restart a tap gets the distinct "expired" message.
+_VIDEO_IDENTIFY: dict[str, dict] = {}
+_VIDEO_IDENTIFY_RUNNING: set[str] = set()
+
+
+def _video_identify_kb(user_id: int, file_id: str, kind: str) -> InlineKeyboardMarkup:
+    """Build the one-click music-identification button for a video.
+
+    ``kind`` is "link" (video fetched from a sent link) or "file" (video
+    the user sent directly). The registry entry is keyed by an opaque
+    token; the Telegram file_id is resolved server-side on click."""
+    token = secrets.token_hex(8)
+    _VIDEO_IDENTIFY[token] = {"user_id": user_id, "file_id": file_id,
+                              "kind": kind}
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎵 شناسایی موسیقی",
+                             callback_data=f"vid:id:{token}")]])
+
+
+async def _attach_identify_button(message: Message, conn, sent) -> None:
+    """Attach the one-click identification button under a bot-sent video
+    message (best effort; the video must have a downloadable file_id)."""
+    try:
+        video = getattr(sent, "video", None)
+        file_id = getattr(video, "file_id", None) if video else None
+        if not file_id or not message.from_user:
+            return
+        kb = _video_identify_kb(message.from_user.id, file_id, "link")
+        await sent.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _answer_identify_clip_fallback(message, conn, config, data: bytes,
+                                         file_id: str) -> None:
+    """Not-identified flow for the one-click video button: the clip's own
+    audio is extracted to a real MP3 and sent, then the honest message
+    with the bank button. Never a guessed song."""
+    mp3 = None
+    try:
+        src_br, _dur = probe_audio(data, "mp4")
+        target = 320 if (src_br or 0) >= 300 else max(96, src_br or 128)
+        conv = transcode_mp3(data, "mp4", target)
+        if conv[0]:
+            mp3 = conv[0]
+    except Exception:
+        mp3 = None
+    if mp3:
+        sent = await send_music(
+            message, mp3, "صدای استخراج‌شده از ویدیو", "",
+            caption=("نام و نسخه اصلی آهنگ شناسایی نشد؛ اما صدای موجود در "
+                     "ویدیو به‌صورت فایل صوتی برای شما آماده شد."))
+        if sent is not None:
+            _track(conn, message, sent)
+    _tok = await _arm_bank_sample(conn, config, "video_button", file_id,
+                                  data, "", "")
+    await _answer(message, conn,
+                  "نام و نسخه اصلی آهنگ شناسایی نشد؛ اما صدای موجود در ویدیو به‌صورت فایل صوتی برای شما آماده شد.",
+                  reply_markup=_bank_button(_tok))
+
+
+@router.callback_query(F.data.startswith("vid:id:"))
+async def video_identify(callback, conn: sqlite3.Connection, config: Config):
+    """One-click «🎵 شناسایی موسیقی» under a received video.
+
+    Extracts THAT video's audio (the Telegram file_id comes from the
+    server-side registry — the button carries only an opaque token) and
+    runs it through the identification engine. The user never re-sends
+    the link or the file. Ownership is re-checked on every tap so two
+    users' videos can never be mixed up; an idempotency set stops
+    accidental double runs.
+    """
+    token = callback.data.split("vid:id:", 1)[1]
+    entry = _VIDEO_IDENTIFY.get(token)
+    if not entry:
+        await callback.answer(
+            "این درخواست منقضی شده است؛ ویدیو را دوباره بفرستید.",
+            show_alert=True)
+        return
+    if entry.get("user_id") != callback.from_user.id:
+        await callback.answer("این دکمه برای شما نیست.", show_alert=True)
+        return
+    if token in _VIDEO_IDENTIFY_RUNNING:
+        await callback.answer("در حال شناسایی…")
+        return
+    _VIDEO_IDENTIFY_RUNNING.add(token)
+    await callback.answer("🎧 در حال شناسایی آهنگ از روی صدای ویدیو…")
+    try:
+        try:
+            tg_file = await callback.bot.get_file(entry["file_id"])
+            buf = io.BytesIO()
+            await callback.bot.download_file(tg_file.file_path, buf)
+            data = buf.getvalue()
+        except Exception:
+            await callback.message.answer(
+                "⚠️ دریافت فایل ویدیو ممکن نشد؛ دوباره تلاش کنید.")
+            return
+        if not data or len(data) > config.max_file_mb * 1024 * 1024:
+            await callback.message.answer(
+                "⚠️ فایل ویدیو معتبر نیست یا بزرگ‌تر از حد مجاز است.")
+            return
+        # Distinct honest cause when the video provably has no audio track.
+        try:
+            audible = has_audio_stream(data)
+        except Exception:
+            audible = None
+        if audible is False:
+            await callback.message.answer(
+                "🔇 این ویدیو صدای قابل‌شناسایی ندارد.")
+            return
+        result = await _identify_audio(data, "clip.mp4", config)
+        if result.status == "identified":
+            _tok = await _arm_bank_sample(conn, config, "video_button",
+                                          entry["file_id"], data, "", "")
+            await _send_professional_song_card(
+                callback.message, conn, result.title, result.artist,
+                bot_id=dbmod.get_bot_id(conn, config), bank_token=_tok,
+                own_media=("video", entry["file_id"]))
+        elif result.status == "not_found":
+            await _answer_identify_clip_fallback(
+                callback.message, conn, config, data, entry["file_id"])
+        else:
+            await callback.message.answer(t("audio_error", "fa"))
+    finally:
+        _VIDEO_IDENTIFY_RUNNING.discard(token)
 
 
 async def _identify_audio(data: bytes, filename: str, config: Config) -> AudioIdResult:
@@ -1137,6 +1294,7 @@ async def search_next(callback, conn: sqlite3.Connection, config: Config):
 @router.message(F.text)
 async def text_handler(message: Message, conn: sqlite3.Connection, config: Config, state: FSMContext | None = None):
     _register(message, conn)
+    _track_incoming(conn, message)
     if _blocked(conn, message.from_user.id):
         await message.answer(t("blocked", "fa")); return
     text = (message.text or "").strip()
@@ -1272,6 +1430,7 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
     the same voice is transcribed to text instead, via speech recognition
     (not a speech-synthesis engine), and no text is ever fabricated."""
     _register(message, conn)
+    _track_incoming(conn, message)
     if _blocked(conn, message.from_user.id):
         await message.answer(t("blocked", "fa")); return
     current_state = None
@@ -1367,8 +1526,17 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         _tok = await _arm_bank_sample(conn, config, "file",
                                       __import__("hashlib").sha256(data).hexdigest(),
                                       data, "", caption)
+        _rows: list = []
+        _bb = _bank_button(_tok)
+        if _bb:
+            _rows.extend(_bb.inline_keyboard)
+        if message.video is not None:
+            # One-click retry on this same video: no re-send needed.
+            _rows.extend(_video_identify_kb(
+                message.from_user.id, message.video.file_id,
+                "file").inline_keyboard)
         await _answer(message, conn, t("audio_not_found", "fa"),
-                      reply_markup=_bank_button(_tok))
+                      reply_markup=InlineKeyboardMarkup(inline_keyboard=_rows) if _rows else None)
         # AI/channel-only fallback: the user's own file, labelled honestly
         # (never claimed identified), sent back for download with bot ID.
         try:
@@ -1388,7 +1556,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             await _do_search(message, conn, sanitize_text(caption, 300), config=config)
         return
     if result.status != "identified":
-        await _answer(message, conn, t("audio_error", "fa")); return
+        _err_kb = None
+        if message.video is not None:
+            _err_kb = _video_identify_kb(
+                message.from_user.id, message.video.file_id, "file")
+        await _answer(message, conn, t("audio_error", "fa"),
+                      reply_markup=_err_kb)
+        return
     _tok = await _arm_bank_sample(conn, config, "file",
                                   __import__("hashlib").sha256(data).hexdigest(),
                                   data, "", caption)
