@@ -67,6 +67,21 @@ async def check_instagram_gating(page_url: str) -> str | None:
     except Exception:
         return "network_error"
     if resp.status_code in (400, 404):
+        # Instagram puts the age/region-gate signals INSIDE the 400 body
+        # (measured 2026-10-29 on reel Dd23bq7vkPr: HTTP 400 with
+        # geoblock_required / MIN_AGE_ACCOUNT in the JSON). Check the body
+        # first — a gated post is never "private/deleted".
+        try:
+            _data = resp.json()
+            _blob = json.dumps(_data, ensure_ascii=False) \
+                if isinstance(_data, (dict, list)) else ""
+        except Exception:
+            try:
+                _blob = resp.text or ""
+            except Exception:
+                _blob = ""
+        if any(marker in _blob for marker in _GATING_MARKERS):
+            return "age_gated"
         return "private_or_deleted"
     if resp.status_code != 200:
         return None

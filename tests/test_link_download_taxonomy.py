@@ -217,6 +217,14 @@ async def test_gating_oembed_400_is_private_or_deleted(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gating_oembed_400_with_gate_markers_is_age_gated(monkeypatch):
+    # Real-world shape (reel Dd23bq7vkPr, measured 2026-10-29): Instagram
+    # answers HTTP 400 with the gate signals inside the JSON body.
+    _client_with(monkeypatch, resp=_JsonResp(400, GATED_PAYLOAD))
+    assert await I.check_instagram_gating(IG_URL) == "age_gated"
+
+
+@pytest.mark.asyncio
 async def test_gating_timeout_is_distinct(monkeypatch):
     _client_with(monkeypatch, exc=httpx.TimeoutException("slow"))
     assert await I.check_instagram_gating(IG_URL) == "timeout"
