@@ -277,6 +277,9 @@ class FormatResult:
     note: str = ""
     content_type: str = "unknown"
     file_url: str = ""
+    # Separate audio-stream URL (Instagram DASH serves audio apart from
+    # video); "" when not applicable. Lets the downloader mux both.
+    audio_url: str = ""
     # "" | "unavailable" | "age_gated" | "empty_shell" | "timeout" | "network_error"
     error: str = ""
 
@@ -303,6 +306,9 @@ async def _detect_instagram_formats(url: str) -> FormatResult:
             formats=[{"id": "file", "label": FILE_LABEL}],
             content_type="video",
             file_url=video_url,
+            # Keep the separate DASH audio stream: the video URL alone
+            # is a SILENT file; the downloader muxes both (see run_job).
+            audio_url=audio_url or "",
         )
     if audio_url:
         return FormatResult(
@@ -726,7 +732,19 @@ async def run_job(message: types.Message, conn: sqlite3.Connection,
                     update_job(conn, job_id, progress=pct)
                     await _refresh_status(message, conn, job_id)
 
-            data = await _download_bytes(download_url, limit, _prog)
+            # Instagram DASH: video and audio are separate streams; mux both
+            # so the downloaded file is not silent. Falls back to the plain
+            # download when there is no separate audio URL.
+            _audio_url = job.get("audio_url") or ""
+            if _audio_url and job.get("content_type") == "video":
+                from ..services.instagram import fetch_merged_video
+                data, _ = await fetch_merged_video(
+                    download_url, _audio_url,
+                    max_mb=min(config.max_file_mb, 50))
+                if not data:
+                    raise _TransientError(RETRY_LATER)
+            else:
+                data = await _download_bytes(download_url, limit, _prog)
             update_job(conn, job_id, stage="saving", progress=90)
             await _refresh_status(message, conn, job_id)
             job = get_job(conn, job_id)
@@ -870,7 +888,8 @@ def register(router: Router) -> None:
             await message.answer(t("dl_queue_failed", lang))
             return
         if result.file_url:
-            update_job(conn, job_id, result_url=result.file_url)
+            update_job(conn, job_id, result_url=result.file_url,
+                       audio_url=result.audio_url or "")
         job = get_job(conn, job_id)
         if len(result.formats) > 1:
             await state.clear()

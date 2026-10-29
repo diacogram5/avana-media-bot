@@ -899,18 +899,20 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
             return _INSTAGRAM_GATED
         return None
     t0 = _time.time()
+    max_mb = getattr(config, "max_file_mb", 50) if config is not None else 50
     try:
-        headers = {"User-Agent": "Mozilla/5.0",
-                   "Referer": "https://www.instagram.com/"}
-        async with httpx.AsyncClient(timeout=40) as client:
-            resp = await client.get(video_url, headers=headers)
-            resp.raise_for_status()
-            data = resp.content
+        from ..services.instagram import fetch_merged_video
+        # Instagram DASH serves video and audio as SEPARATE streams:
+        # downloading only the video URL yields a SILENT file. Fetch
+        # both and mux to one MP4 (falls back to video-only when the
+        # audio stream is missing — the healthy path is preserved).
+        data, _has_audio = await fetch_merged_video(
+            video_url, audio_url, max_mb=max_mb)
     except Exception:
         return None
     log_event(log, "identify_stage", stage="video_download",
-              ms=int((_time.time() - t0) * 1000), bytes=len(data or b""))
-    max_mb = getattr(config, "max_file_mb", 50) if config is not None else 50
+              ms=int((_time.time() - t0) * 1000), bytes=len(data or b""),
+              has_audio=_has_audio)
     if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
         return None
     sent = await send_video(
@@ -919,8 +921,8 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     if sent is not None:
         _track(conn, message, sent)
         # Pass the reel's separate audio-stream URL so the one-click
-        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio —
-        # the sent video file is the video-only DASH stream (no audio).
+        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
+        # directly (cheaper than re-extracting from the merged video).
         await _attach_identify_button(message, conn, sent, audio_url=audio_url)
     return sent
 

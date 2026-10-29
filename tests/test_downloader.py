@@ -177,6 +177,7 @@ def test_migration_creates_download_jobs(db):
         "id", "user_id", "url", "source", "content_type", "status",
         "stage", "progress", "formats_json", "chosen_format",
         "result_file_id", "result_url", "error", "created_at", "updated_at",
+        "audio_url",
     ]
     idx = [r[0] for r in db.execute(
         "SELECT name FROM sqlite_master WHERE type='index' "
