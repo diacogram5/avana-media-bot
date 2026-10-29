@@ -1250,8 +1250,10 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                                           audio_url or "", "")
             await _send_professional_song_card(
                 callback.message, conn, result.title, result.artist,
-                bot_id=dbmod.get_bot_id(conn, config), bank_token=_tok,
-                own_media=("video", entry["file_id"]))
+                bot_id=dbmod.get_bot_id(conn, config),
+                bank_token=_tok,
+                own_media=("video", entry["file_id"]),
+                config=config)
         elif result.status == "not_found":
             await _answer_identify_clip_fallback(
                 callback.message, conn, config, data, entry["file_id"])
@@ -1785,7 +1787,8 @@ async def _run_link_channel_stage(message, conn, config, page_text: str) -> bool
 
 async def _send_professional_song_card(message, conn, title: str, artist: str, bot_id: str = "",
                                        bank_token: str | None = None,
-                                       own_media: tuple[str, str] | None = None):
+                                       own_media: tuple[str, str] | None = None,
+                                       config=None):
     """One clean card for an identified song.
 
     Delivery order (full-version-first):
@@ -1878,10 +1881,29 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         except Exception:
             pass
     # 3) Honest "full version not found" + more-search options. A short
-    # preview is never presented as the song.
+    # preview is never presented as the song. If Spotify is configured,
+    # attach the official Spotify link as an honest alternative.
     more_kb_rows = list(kb.inline_keyboard)
     more_kb_rows.append([InlineKeyboardButton(
         text=t("similar_songs", ulang), callback_data=_cb_query(query))])
+    spotify_url = ""
+    if config is not None and getattr(config, "spotify_client_id", ""):
+        try:
+            from ..search.spotify import search_tracks as _sp_search
+            _sp = await _sp_search(
+                f"{artist} {title}".strip(),
+                config.spotify_client_id, config.spotify_client_secret or "",
+                limit=1)
+            if _sp and _sp[0].get("spotify_url"):
+                # title sanity: must match, never a wrong song's link
+                from ..search.youtube_full import _title_ok as _sp_ok
+                if _sp_ok(_sp[0]["title"], "", artist, title):
+                    spotify_url = _sp[0]["spotify_url"]
+        except Exception:
+            spotify_url = ""
+    if spotify_url:
+        more_kb_rows.append([InlineKeyboardButton(
+            text="🎧 Spotify", url=spotify_url)])
     if bank_token:
         more_kb_rows.append([InlineKeyboardButton(
             text=t("m_bank_search_btn", ulang),
@@ -2175,7 +2197,8 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             if cached_obj.get("title"):
                 await _send_professional_song_card(
                     message, conn, cached_obj["title"], cached_obj.get("artist", ""),
-                    bot_id=dbmod.get_bot_id(conn, config))
+                    bot_id=dbmod.get_bot_id(conn, config),
+                config=config)
                 return
         # ONE progress status for the (long) identification stage: the
         # video is already delivered above, so without this the chat would
@@ -2393,8 +2416,10 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
                                   data, "", caption)
     await _send_professional_song_card(
         message, conn, result.title, result.artist,
-        bot_id=dbmod.get_bot_id(conn, config), bank_token=_tok,
-        own_media=(media_kind, media.file_id))
+        bot_id=dbmod.get_bot_id(conn, config),
+        bank_token=_tok,
+        own_media=(media_kind, media.file_id),
+        config=config)
 
 
 
@@ -2503,7 +2528,8 @@ async def suggest_get(callback, conn: sqlite3.Connection, config: Config):
     try:
         await _send_professional_song_card(
             callback.message, conn, res["title"], res.get("artist", ""),
-            bot_id=dbmod.get_bot_id(conn, config))
+            bot_id=dbmod.get_bot_id(conn, config),
+            config=config)
     except Exception:
         await callback.message.answer(
             t("m_suggest_send_fail", ulang))

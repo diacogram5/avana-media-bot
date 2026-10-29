@@ -302,6 +302,36 @@ async def find_full_song_file(artist: str, title: str,
     if yt:
         _cache_put(key, yt["data"], yt["ext"], yt["duration_sec"], yt["source"])
         return yt
+    # Fallback 2: Jamendo (CC/indie catalog, real downloads). Needs key.
+    try:
+        import os as _os
+        from .jamendo import search_tracks as _jam_search
+        _jid = _os.environ.get("JAMENDO_CLIENT_ID", "")
+        if _jid:
+            _jtracks = await _jam_search(f"{artist} {title}".strip(), _jid, limit=3)
+            for _jt in _jtracks:
+                if not _jt.get("download_url"):
+                    continue
+                from .youtube_full import _title_ok as _jt_ok
+                if not _jt_ok(_jt["title"], "", artist, title):
+                    continue
+                import httpx as _httpx
+                async with _httpx.AsyncClient(timeout=30) as _jc:
+                    _jr = await _jc.get(_jt["download_url"])
+                    if _jr.status_code == 200 and _looks_like_audio(_jr.content):
+                        _jd = _jr.content
+                        _jdur = _fingerprint_duration(_jd)
+                        if _jdur >= FULL_SONG_MIN_SECONDS:
+                            log_event(log, "fullsong", stage="found",
+                                      source="jamendo", duration_s=round(_jdur, 1),
+                                      bytes=len(_jd))
+                            _cache_put(key, _jd, "mp3", _jdur, "jamendo")
+                            return {"data": _jd, "ext": "mp3",
+                                    "duration_sec": _jdur, "source": "jamendo"}
+            log_event(log, "fullsong", stage="jamendo_not_found")
+    except Exception as exc:
+        log_event(log, "fullsong", stage="jamendo_error",
+                  error=f"{type(exc).__name__}: {str(exc)[:60]}")
     log_event(log, "fullsong", stage="not_found",
               ms=int((time.time() - t0) * 1000), candidates=len(candidates))
     return None

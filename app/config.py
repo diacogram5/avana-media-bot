@@ -50,6 +50,13 @@ class Config:
     # Primary speech engine (both directions): OpenAI (Whisper + TTS).
     openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     audd_token: str = field(default_factory=lambda: os.environ.get("AUDD_API_TOKEN", ""))
+    # Jamendo (free client_id at developer.jamendo.com): CC-music catalog
+    # with real download URLs.
+    jamendo_client_id: str = field(default_factory=lambda: os.environ.get("JAMENDO_CLIENT_ID", ""))
+    # Spotify Web API (free at developer.spotify.com): metadata, official
+    # links, 30s previews. No full downloads (by design).
+    spotify_client_id: str = field(default_factory=lambda: os.environ.get("SPOTIFY_CLIENT_ID", ""))
+    spotify_client_secret: str = field(default_factory=lambda: os.environ.get("SPOTIFY_CLIENT_SECRET", ""))
     azure_speech_key: str = field(default_factory=lambda: os.environ.get("AZURE_SPEECH_KEY", ""))
     azure_speech_region: str = field(default_factory=lambda: os.environ.get("AZURE_SPEECH_REGION", ""))
     web_admin_enabled: bool = field(default_factory=lambda: os.environ.get("WEB_ADMIN_ENABLED", "1") == "1")
@@ -89,6 +96,8 @@ class Config:
             "db_path": self.db_path,
             "language": self.language,
             "audd_configured": bool(self.audd_token),
+            "jamendo_configured": bool(self.jamendo_client_id),
+            "spotify_configured": bool(self.spotify_client_id and self.spotify_client_secret),
             "openai_speech_configured": bool(self.openai_api_key),
             "azure_tts_configured": bool(self.azure_speech_key and self.azure_speech_region),
             "web_admin_enabled": self.web_admin_enabled,
