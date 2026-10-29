@@ -5,3 +5,4 @@ httpx>=0.27
 shazamio==0.9.0
 pytest>=8.0
 pytest-asyncio>=0.23
+yt-dlp>=2024.8.6

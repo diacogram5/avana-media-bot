@@ -292,6 +292,17 @@ async def find_full_song_file(artist: str, title: str,
         log_event(log, "fullsong", stage="error",
                   error=f"{type(exc).__name__}: {str(exc)[:80]}")
         return None
+    # Fallback: YouTube (slower, universal coverage). Proven 2026-10-29.
+    try:
+        from .youtube_full import find_youtube_audio
+        yt = await find_youtube_audio(artist, title)
+    except Exception as exc:
+        log_event(log, "fullsong", stage="youtube_error",
+                  error=f"{type(exc).__name__}: {str(exc)[:60]}")
+        yt = None
+    if yt:
+        _cache_put(key, yt["data"], yt["ext"], yt["duration_sec"], yt["source"])
+        return yt
     log_event(log, "fullsong", stage="not_found",
               ms=int((time.time() - t0) * 1000), candidates=len(candidates))
     return None
