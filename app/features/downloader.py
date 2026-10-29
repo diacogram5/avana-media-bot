@@ -686,7 +686,8 @@ def register(router: Router) -> None:
         await callback.answer()
         await state.set_state(DlStates.await_url)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:main")]])
+            InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu:main"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="flow:cancel")]])
         await callback.message.answer(
             f"{TITLE}\n\n{EXPLAINER}\n\n{PROMPT_SEND_LINK}", reply_markup=kb)
 

@@ -184,6 +184,20 @@ def _main_reply_kb(conn) -> ReplyKeyboardMarkup:
 
     Reflects renames/toggles/reorders automatically: whatever the admin
     panel shows as visible+enabled is what the user gets at the bottom.
+
+    Keyboard policy (Telegram standards):
+    - The reply keyboard is the navigation layer: it STAYS visible during
+      navigation and one-shot hints. It is never removed mid-conversation
+      (removing it would strand the user with no way back).
+    - Contextual keyboards are INLINE only (quality pickers, pagination,
+      confirmations, per-song buttons) — they never replace the bottom menu.
+    - Every multi-step flow offers in-bot «❌ لغو» / «🏠 منوی اصلی»; the
+      phone's hardware back button sends nothing to the bot and is never
+      relied upon.
+    - After an operation completes or is cancelled, the UI returns to the
+      one predictable standard state: this main-menu keyboard + a short
+      status line. The keyboard is re-sent only when the state changes —
+      never re-sent identically as filler.
     """
     titles = [f["title"] for f in capabilities_menu(conn)]
     rows = []
@@ -276,14 +290,16 @@ async def _run_menu_title(message: Message, conn: sqlite3.Connection,
             await message.answer(t(reason, "fa")); return
         if state is not None:
             await state.set_state("suggest")
-        await message.answer(t("suggest_prompt", "fa"))
+        await message.answer(t("suggest_prompt", "fa"),
+                             reply_markup=_cancel_kb())
     elif key == "downloader":
         allowed, reason = can_use_feature(conn, uid, "downloader")
         if not allowed:
             await message.answer(t(reason, "fa")); return
         if state is not None:
             await state.set_state(dlfeat.DlStates.await_url)
-        await message.answer(f"{dlfeat.TITLE}\n\n{dlfeat.EXPLAINER}\n\n{dlfeat.PROMPT_SEND_LINK}")
+        await message.answer(f"{dlfeat.TITLE}\n\n{dlfeat.EXPLAINER}\n\n{dlfeat.PROMPT_SEND_LINK}",
+                             reply_markup=_cancel_kb())
     elif key == "professional":
         allowed, reason = can_use_feature(conn, uid, "professional")
         if not allowed:
@@ -296,7 +312,8 @@ async def _run_menu_title(message: Message, conn: sqlite3.Connection,
             await message.answer(t(reason, "fa")); return
         if state is not None:
             await state.set_state("lyr:await_query")
-        await message.answer("📝 نام آهنگ و خواننده را بنویسید، مثلاً: مهدی احمدوند - دوست دارم")
+        await message.answer("📝 نام آهنگ و خواننده را بنویسید، مثلاً: مهدی احمدوند - دوست دارم",
+                             reply_markup=_cancel_kb())
     elif key == "clear_chat":
         text, kb = adminfeat.clear_view()
         await message.answer(text, reply_markup=kb)
@@ -317,8 +334,18 @@ async def _run_menu_title(message: Message, conn: sqlite3.Connection,
         await message.answer(
             "🔗 لینک اینستاگرام، تیک‌تاک، آپارات یا یوتیوب را بفرستید تا ویدیوی همان لینک و آهنگ آن بررسی شود.")
     elif key == "audio_id":
+        allowed, reason = can_use_feature(conn, uid, "audio_id")
+        if not allowed:
+            await message.answer(t(reason, "fa")); return
+        # Explicit pending-file state: the button now arms a real wait for
+        # a file instead of sending a dead hint. The state is honoured by
+        # media_handler (file -> identification) and text_handler (a text
+        # mid-wait gets a clear "still waiting" notice, never a silent die).
+        if state is not None:
+            await state.set_state("audio_id:await_file")
         await message.answer(
-            "🎵 فایل صوتی، ویدیو یا ویس را بفرستید تا آهنگ آن شناسایی شود.")
+            "🎵 فایل صوتی، ویدیو یا ویس را بفرستید تا آهنگ آن شناسایی شود.",
+            reply_markup=_cancel_kb())
     else:
         feat = dbmod.get_feature(conn, key)
         if feat and feat.get("enabled"):
@@ -366,6 +393,31 @@ async def menu_main(callback, conn: sqlite3.Connection, config: Config,
             pass
     await callback.message.answer(
         _with_signature(conn, config, welcome_text(conn)),
+        reply_markup=_main_reply_kb(conn))
+
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    """In-bot «لغو»: every multi-step flow offers it, so the user never
+    needs the phone's hardware back button (which sends nothing to the
+    bot) and can never be trapped in a dead-end step."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="flow:cancel")]])
+
+
+@router.callback_query(F.data == "flow:cancel")
+async def flow_cancel(callback, conn: sqlite3.Connection, config: Config,
+                      state: FSMContext | None = None):
+    """Cancel any in-progress flow: clear the conversation state and land
+    back on the one predictable standard state — the persistent main-menu
+    keyboard plus a short status line."""
+    await callback.answer()
+    if state is not None:
+        try:
+            await state.clear()
+        except Exception:
+            pass
+    await callback.message.answer(
+        "لغو شد؛ به منوی اصلی برگشتید.",
         reply_markup=_main_reply_kb(conn))
 
 
@@ -453,7 +505,8 @@ async def cmd_voice_to_text(message: Message, conn: sqlite3.Connection,
     if not allowed:
         await _answer(message, conn, t(reason, "fa")); return
     await state.set_state("voice_to_text")
-    await _answer(message, conn, t("voice_to_text_prompt", "fa"))
+    await _answer(message, conn, t("voice_to_text_prompt", "fa"),
+                  reply_markup=_cancel_kb())
 
 
 @router.callback_query(F.data == "voice_to_text:start")
@@ -464,7 +517,8 @@ async def voice_to_text_button(callback, conn: sqlite3.Connection,
         await callback.answer(t(reason, "fa"), show_alert=True); return
     await state.set_state("voice_to_text")
     await callback.answer()
-    await callback.message.answer(t("voice_to_text_prompt", "fa"))
+    await callback.message.answer(t("voice_to_text_prompt", "fa"),
+                                  reply_markup=_cancel_kb())
 
 
 
@@ -472,14 +526,16 @@ async def voice_to_text_button(callback, conn: sqlite3.Connection,
 async def cmd_suggest(message: Message, conn: sqlite3.Connection, config: Config, state: FSMContext):
     _register(message, conn)
     await state.set_state("suggest")
-    await _answer(message, conn, t("suggest_prompt", "fa"))
+    await _answer(message, conn, t("suggest_prompt", "fa"),
+                  reply_markup=_cancel_kb())
 
 
 @router.callback_query(F.data == "suggest:start")
 async def suggest_button(callback, conn: sqlite3.Connection, config: Config, state: FSMContext):
     await state.set_state("suggest")
     await callback.answer()
-    await _answer(callback.message, conn, t("suggest_prompt", "fa"))
+    await _answer(callback.message, conn, t("suggest_prompt", "fa"),
+                  reply_markup=_cancel_kb())
 
 
 @router.message(Command("playlists"))
@@ -532,7 +588,8 @@ async def cmd_favorites(message: Message, conn: sqlite3.Connection, config: Conf
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, conn: sqlite3.Connection, state: FSMContext):
     await state.clear()
-    await _answer(message, conn, t("cancelled", "fa"))
+    await _answer(message, conn, t("cancelled", "fa"),
+                  reply_markup=_main_reply_kb(conn))
 
 
 @router.message(Command("admin"))
@@ -752,17 +809,21 @@ _VIDEO_IDENTIFY: dict[str, dict] = {}
 _VIDEO_IDENTIFY_RUNNING: set[str] = set()
 
 
-def _video_identify_kb(user_id: int, file_id: str, kind: str) -> InlineKeyboardMarkup:
-    """Build the one-click music-identification button for a video.
+def _video_identify_kb(user_id: int, file_id: str, kind: str,
+                       label: str = "🎵 شناسایی موسیقی") -> InlineKeyboardMarkup:
+    """Build the one-click music-identification button for a video — or,
+    with kind="audio" and a «🔄 تلاش مجدد» label, the retry button for an
+    audio/voice file whose identification failed.
 
-    ``kind`` is "link" (video fetched from a sent link) or "file" (video
-    the user sent directly). The registry entry is keyed by an opaque
-    token; the Telegram file_id is resolved server-side on click."""
+    ``kind`` is "link" (video fetched from a sent link), "file" (video
+    the user sent directly), or "audio" (audio/voice the user sent). The
+    registry entry is keyed by an opaque token; the Telegram file_id is
+    resolved server-side on click."""
     token = secrets.token_hex(8)
     _VIDEO_IDENTIFY[token] = {"user_id": user_id, "file_id": file_id,
                               "kind": kind}
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎵 شناسایی موسیقی",
+        InlineKeyboardButton(text=label,
                              callback_data=f"vid:id:{token}")]])
 
 
@@ -822,8 +883,10 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     token = callback.data.split("vid:id:", 1)[1]
     entry = _VIDEO_IDENTIFY.get(token)
     if not entry:
+        # The registry is in-memory: after a restart the token is gone.
+        # Honest expiry — never a silent no-op.
         await callback.answer(
-            "این درخواست منقضی شده است؛ ویدیو را دوباره بفرستید.",
+            "این درخواست منقضی شده است؛ لطفاً فایل را دوباره بفرستید.",
             show_alert=True)
         return
     if entry.get("user_id") != callback.from_user.id:
@@ -857,7 +920,9 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             await callback.message.answer(
                 "🔇 این ویدیو صدای قابل‌شناسایی ندارد.")
             return
-        result = await _identify_audio(data, "clip.mp4", config)
+        result = await _identify_audio(
+            data, "clip.mp3" if entry.get("kind") == "audio" else "clip.mp4",
+            config)
         if result.status == "identified":
             _tok = await _arm_bank_sample(conn, config, "video_button",
                                           entry["file_id"], data, "", "")
@@ -1325,6 +1390,22 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             pass
         await _run_lyrics_search(message, conn, text, config)
         return
+    if current_state == "audio_id:await_file":
+        # Waiting for a file: plain text is neither consumed as a search
+        # nor kills the wait silently. The wait continues with a clear
+        # notice; menu-button taps and /cancel still escape via the guards
+        # above. A link is its own independent input type: if the text
+        # carries one, the file-wait is superseded and the link flow below
+        # takes over.
+        if _extract_link(text):
+            try:
+                await state.clear()
+            except Exception:
+                pass
+        else:
+            await message.answer(
+                "⏳ هنوز منتظر فایل صوتی، ویدیو یا ویس هستم؛ برای لغو «❌ لغو» را بزنید.")
+            return
     link_url = _extract_link(text)
     if link_url:
         # Intent from a link is deterministic (no button, no brain call
@@ -1438,6 +1519,17 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         current_state = await state.get_state()
     except Exception:
         current_state = None
+    if current_state == "audio_id:await_file":
+        # The «شناسایی موسیقی از فایل» button armed this wait: the file the
+        # user just sent IS the identification request. Clear the wait and
+        # fall through to the standard identification flow below (the same
+        # engine, result card, full-version-first delivery, and honest
+        # fallback states as the automatic path — no parallel logic).
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        current_state = None
     if current_state == "voice_to_text":
         try:
             await state.clear()
@@ -1535,6 +1627,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             _rows.extend(_video_identify_kb(
                 message.from_user.id, message.video.file_id,
                 "file").inline_keyboard)
+        elif message.audio is not None or message.voice is not None:
+            # Same-file retry for audio/voice: the registry resolves the
+            # Telegram file_id server-side, so the user never re-sends.
+            _media = message.audio or message.voice
+            _rows.extend(_video_identify_kb(
+                message.from_user.id, _media.file_id, "audio",
+                label="🔄 تلاش مجدد").inline_keyboard)
         await _answer(message, conn, t("audio_not_found", "fa"),
                       reply_markup=InlineKeyboardMarkup(inline_keyboard=_rows) if _rows else None)
         # AI/channel-only fallback: the user's own file, labelled honestly
@@ -1560,6 +1659,11 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         if message.video is not None:
             _err_kb = _video_identify_kb(
                 message.from_user.id, message.video.file_id, "file")
+        elif message.audio is not None or message.voice is not None:
+            _media = message.audio or message.voice
+            _err_kb = _video_identify_kb(
+                message.from_user.id, _media.file_id, "audio",
+                label="🔄 تلاش مجدد")
         await _answer(message, conn, t("audio_error", "fa"),
                       reply_markup=_err_kb)
         return
@@ -1638,15 +1742,27 @@ _SUGGEST_MORE: dict[str, list] = {}
 
 @router.callback_query(F.data.startswith("sg:get:"))
 async def suggest_get(callback, conn: sqlite3.Connection, config: Config):
-    """One suggestion's own button: deliver that exact song (full-version-first)."""
+    """One suggestion's own button: deliver that exact song (full-version-first).
+
+    The user must end with a real audio file or a precise reason — never a
+    bare song name and never a silent death if the delivery raises.
+    """
     key = callback.data.split("sg:get:", 1)[1]
     res = profeat.get_result(key)
     if not res:
-        await callback.answer(brief_error("generic"), show_alert=True); return
+        # In-memory result keys die on restart: honest expiry, not a no-op.
+        await callback.answer(
+            "این پیشنهاد منقضی شده است؛ لطفاً دوباره درخواست بدهید.",
+            show_alert=True)
+        return
     await callback.answer()
-    await _send_professional_song_card(
-        callback.message, conn, res["title"], res.get("artist", ""),
-        bot_id=dbmod.get_bot_id(conn, config))
+    try:
+        await _send_professional_song_card(
+            callback.message, conn, res["title"], res.get("artist", ""),
+            bot_id=dbmod.get_bot_id(conn, config))
+    except Exception:
+        await callback.message.answer(
+            "⚠️ ارسال فایل این آهنگ ممکن نشد؛ دوباره تلاش کنید.")
 
 
 @router.callback_query(F.data.startswith("sg:more:"))
@@ -1977,11 +2093,17 @@ def _install_ad_hook(bot, conn, config: Config) -> None:
     bot.send_message = send_message_with_ads  # type: ignore[method-assign]
 
 
-def _bot_commands() -> list[BotCommand]:
-    """Minimal professional command menu (the user-facing Menu button)."""
+def _user_commands() -> list[BotCommand]:
+    """Command menu for regular users: no admin entry points visible."""
     return [
         BotCommand(command="start", description="شروع"),
         BotCommand(command="help", description="راهنما"),
+    ]
+
+
+def _owner_commands() -> list[BotCommand]:
+    """Command menu for the owner: the user menu plus the admin panel."""
+    return _user_commands() + [
         BotCommand(command="admin", description="پنل مدیریت"),
     ]
 
@@ -2000,9 +2122,17 @@ async def run_bot(config: Config) -> None:
         web = start_web_panel(config.db_path, config)
     from aiogram import Bot
     bot = Bot(token=config.bot_token)
-    # Minimal professional command menu (the user-facing Menu button).
+    # Command menu (the user-facing Menu button): regular users see only
+    # start/help — /admin is never advertised to them. The owner gets the
+    # same menu plus /admin, scoped to their chat only. Server-side denial
+    # in cmd_admin stays as the second layer (hiding alone is not enough).
     try:
-        await bot.set_my_commands(_bot_commands())
+        await bot.set_my_commands(_user_commands())
+        if config.owner_id is not None:
+            from aiogram.types import BotCommandScopeChat
+            await bot.set_my_commands(
+                _owner_commands(),
+                scope=BotCommandScopeChat(chat_id=config.owner_id))
     except Exception as exc:
         log.warning("set_my_commands failed: %s", exc)
     _install_ad_hook(bot, conn, config)

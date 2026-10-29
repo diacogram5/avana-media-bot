@@ -259,8 +259,12 @@ def test_persistent_menu_has_ten_buttons(db):
 
 
 def test_bot_commands_minimal():
-    cmds = H._bot_commands()
-    assert [(c.command, c.description) for c in cmds] == [
+    # Regular users never see /admin in their Menu button; the owner gets
+    # the same menu plus /admin, scoped to their chat only.
+    user_cmds = [(c.command, c.description) for c in H._user_commands()]
+    assert user_cmds == [("start", "شروع"), ("help", "راهنما")]
+    owner_cmds = [(c.command, c.description) for c in H._owner_commands()]
+    assert owner_cmds == [
         ("start", "شروع"), ("help", "راهنما"), ("admin", "پنل مدیریت")]
 
 
