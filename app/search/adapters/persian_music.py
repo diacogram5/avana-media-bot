@@ -22,6 +22,7 @@ log = get_logger("persian_music")
 # Format: ("artist_lower", "title_lower") -> mp3_url
 KNOWN_MP3S = {
     ("hichkas", "yani chi nemishe"): "https://vip1.msbmusic.ir/1403/01/24/Hichkas%20-%20Yani%20Chi%20Nemishe.mp3",
+    ("big shaggy", "bang o hashish"): "https://beysmu.musitraf.ir/Music/B/Big.Shaggy/Bang.O.Hashish/Big.Shaggy.Bang.O.Hashish.320.mp3",
 }
 
 # WordPress-based Persian music sites with direct MP3 links
