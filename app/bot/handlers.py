@@ -1847,9 +1847,14 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                 reply_markup=kb)
             if sent is not None:
                 _track(conn, message, sent)
+                log_event(log, "fullsong", stage="sent",
+                          title=title[:40], bytes=len(full["data"]))
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            # NEVER silent: log the real error so delivery failures are visible
+            log_event(log, "fullsong", stage="send_failed",
+                      title=title[:40],
+                      error=f"{type(exc).__name__}: {str(exc)[:200]}")
     # 1b) BANK: indexed channel audio (forwarded files) by title/artist.
     # The bank is a real source in the chain, not a separate button.
     if not full:
