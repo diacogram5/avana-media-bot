@@ -20,6 +20,7 @@ visible in the logs.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from urllib.parse import quote
 
@@ -189,29 +190,36 @@ async def fetch_merged_video(video_url: str, audio_url: str | None = None,
     headers = {"User-Agent": "Mozilla/5.0",
                "Referer": "https://www.instagram.com/"}
     t0 = _time.time()
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(video_url, headers=headers)
-            resp.raise_for_status()
-            video_data = resp.content
-    except Exception as exc:
-        log_event(log, "instagram_merge", stage="video_download",
-                  ms=int((_time.time() - t0) * 1000), error=str(exc)[:80])
-        return b"", False
-    if not video_data or len(video_data) > max_mb * 1024 * 1024:
-        return b"", False
 
-    audio_data = b""
-    if audio_url:
+    async def _dl(url: str) -> bytes:
+        """Download one stream. Returns b"" on any failure."""
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(audio_url, headers=headers)
+                resp = await client.get(url, headers=headers)
                 resp.raise_for_status()
-                audio_data = resp.content
+                data = resp.content
+                if data and len(data) <= max_mb * 1024 * 1024:
+                    return data
         except Exception:
-            audio_data = b""
+            pass
+        return b""
+
+    # Download video and audio IN PARALLEL (they're independent streams).
+    # Sequential download was the 35s bottleneck.
+    if audio_url:
+        video_data, audio_data = await asyncio.gather(
+            _dl(video_url), _dl(audio_url))
+    else:
+        video_data = await _dl(video_url)
+        audio_data = b""
+
+    if not video_data:
+        log_event(log, "instagram_merge", stage="video_download",
+                  ms=int((_time.time() - t0) * 1000), error="empty_or_failed")
+        return b"", False
+
     if not audio_data:
-        # No audio stream: previous (silent-video) behavior, unchanged.
+        # No audio stream: return video only (silent-video behavior).
         return video_data, False
 
     def _mux() -> bytes:
