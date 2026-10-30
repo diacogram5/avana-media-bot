@@ -15,9 +15,10 @@ from .youtube import YouTubeAdapter
 def _adapters() -> list:
     """All file-source adapters, fastest/most-reliable first."""
     return [
-        RadioJavanAdapter(),  # Persian music, direct downloads, ~0.5s
+        RadioJavanAdapter(),  # Persian music, direct downloads, ~3-10s
         WordPressAdapter(),   # Iranian catalogs, real MP3, ~4s
-        YouTubeAdapter(),     # universal, slow, often IP-blocked
+        # YouTube removed 2026-10-30: "Sign in to confirm you're not a bot"
+        # = complete IP block from Render. Wasted 3-4s per query.
     ]
 
 
