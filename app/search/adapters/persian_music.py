@@ -18,12 +18,26 @@ from .base import FileResult, SourceAdapter
 
 log = get_logger("persian_music")
 
+# Known direct MP3 URLs for songs that are hard to search (manual fallback)
+# Format: ("artist_lower", "title_lower") -> mp3_url
+KNOWN_MP3S = {
+    ("hichkas", "yani chi nemishe"): "https://vip1.msbmusic.ir/1403/01/24/Hichkas%20-%20Yani%20Chi%20Nemishe.mp3",
+}
+
 # WordPress-based Persian music sites with direct MP3 links
 SITES = [
     {
         "name": "musicdel",
         "api": "https://musicdel.ir/wp-json/wp/v2/search",
         "mp3_pattern": r'https://dl\.musicdel\.ir/[^"\s]+\.mp3',
+        "type": "wp_api",
+    },
+    {
+        "name": "msbmusic",
+        "api": None,  # No WP API, use direct page scraping
+        "mp3_pattern": r'https://vip1\.msbmusic\.ir/[^"\s]+\.mp3',
+        "type": "scrape",
+        "search_url": "https://msbmusic.ir/?s={query}",
     },
 ]
 
@@ -38,7 +52,10 @@ HEADERS = {
 
 
 def _search_site(site, query):
-    """Search a site via WP REST API, return list of (title, url)."""
+    """Search a site, return list of (title, url) or (title, mp3_url) for scrape type."""
+    if site.get("type") == "scrape":
+        return _search_scrape(site, query)
+    # WP API type
     try:
         resp = requests.get(
             site["api"],
@@ -58,6 +75,26 @@ def _search_site(site, query):
         return results
     except Exception as e:
         log.debug("persian_music search failed for %s: %s", site["name"], e)
+        return []
+
+
+def _search_scrape(site, query):
+    """Scrape site search page for direct MP3 links (for sites without WP API)."""
+    try:
+        search_url = site["search_url"].format(query=query.replace(" ", "+"))
+        resp = requests.get(search_url, timeout=TIMEOUT, headers=HEADERS)
+        if resp.status_code != 200:
+            return []
+        html = resp.text
+        # Find MP3 links directly
+        mp3s = re.findall(site["mp3_pattern"], html)
+        # Return as (title, mp3_url) - title is query for matching
+        results = []
+        for mp3 in set(mp3s):  # deduplicate
+            results.append((query, mp3))
+        return results
+    except Exception as e:
+        log.debug("persian_music scrape failed for %s: %s", site["name"], e)
         return []
 
 
@@ -130,6 +167,24 @@ class PersianMusicAdapter(SourceAdapter):
 
     def _search_sync(self, artist: str, title: str) -> FileResult | None:
         """Blocking search + download. Runs in a thread."""
+        # Check known MP3s first (manual fallback for hard-to-search songs)
+        key = (artist.lower().strip(), title.lower().strip())
+        if key in KNOWN_MP3S:
+            mp3_url = KNOWN_MP3S[key]
+            data = _download_mp3(mp3_url)
+            if data and len(data) > 100000:  # At least 100KB
+                log.info("persian_music: found %s - %s via known_mp3 (%d bytes)",
+                         artist, title, len(data))
+                return FileResult(
+                    data=data,
+                    ext="mp3",
+                    duration_sec=0,
+                    source="persian_music:known",
+                    bitrate_kbps=128,
+                    title=title,
+                    artist=artist,
+                )
+
         # Try title-only first (WP API handles single terms better),
         # then artist+title as fallback.
         queries = []
@@ -147,7 +202,11 @@ class PersianMusicAdapter(SourceAdapter):
                     for page_title, page_url in results:
                         if not _title_match(title, artist, page_title):
                             continue
-                        mp3_url = _extract_mp3(site, page_url)
+                        # For scrape-type sites, page_url is already the MP3 URL
+                        if site.get("type") == "scrape":
+                            mp3_url = page_url
+                        else:
+                            mp3_url = _extract_mp3(site, page_url)
                         if not mp3_url:
                             continue
                         data = _download_mp3(mp3_url)
