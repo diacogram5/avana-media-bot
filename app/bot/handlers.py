@@ -1484,6 +1484,20 @@ def _link_needs_file_card(outcome, cause: str = "", lang: str = "fa") -> str:
     return card
 
 
+async def _bg_identify_link(outcome, config, conn, resolved):
+    """Background identify for link flow (competitor's model).
+
+    Runs _identify_link_audio without messaging the user. The result
+    is cached by the identify pipeline (url:audio_url key), so when the
+    user taps «🎵 شناسایی موسیقی», the button handler gets a cache hit
+    and responds instantly. Fire-and-forget: all exceptions swallowed.
+    """
+    try:
+        await _identify_link_audio(outcome, config, conn, resolved=resolved)
+    except Exception:
+        pass
+
+
 async def _identify_link_audio(outcome, config: Config, conn=None,
                              resolved: tuple | None = None):
     """Identify a sent link's audio.
@@ -2234,26 +2248,15 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             # There is no audio any anonymous fetch can reach, so no
             # identification, bank sample, or channel stage runs.
             return
-        # NOTE 2026-10-30: Auto-identify DISABLED. The other bot's UX is
-        # better: send video fast, user taps «🎵 شناسایی موسیقی» on demand.
-        # Auto-identify was slow (25s) and redundant with the button.
-        # Cached identification first: same link must not re-burn
-        # Shazam/AudD lookups (token/API cost).
-        import json as _json
-        cached = dbmod.get_cached_search(conn, f"link:{outcome.official_url}")
-        if cached:
-            try:
-                cached_obj = _json.loads(cached)
-            except ValueError:
-                cached_obj = {}
-            if cached_obj.get("title"):
-                await _send_professional_song_card(
-                    message, conn, cached_obj["title"], cached_obj.get("artist", ""),
-                    bot_id=dbmod.get_bot_id(conn, config),
-                config=config)
-                return
-        # No auto-identify: user taps the «🎵 شناسایی موسیقی» button
-        # attached to the video above when they want the song.
+        # NOTE 2026-10-31: Background identify (competitor's model).
+        # Video is sent immediately above. Now identify in BACKGROUND so
+        # when the user taps «🎵 شناسایی موسیقی», the result is cached
+        # and instant. Fire-and-forget: never blocks, never messages.
+        try:
+            import asyncio as _aio
+            _aio.create_task(_bg_identify_link(outcome, config, conn, _resolved))
+        except Exception:
+            pass
         return
     allowed, reason = can_use_feature(conn, message.from_user.id, "song_search")
     if not allowed:
