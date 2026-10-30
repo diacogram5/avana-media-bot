@@ -32,6 +32,8 @@ import io
 import re
 import secrets
 import sqlite3
+import time as _time
+import uuid
 
 import httpx
 from aiogram import Dispatcher, F, Router
@@ -90,6 +92,14 @@ from .logic import (
 
 log = get_logger(__name__)
 router = Router()
+
+
+def _new_request_id() -> str:
+    """Generate a unique request ID for tracing a user request end-to-end.
+    Format: 8 hex chars (e.g. 'a1b2c3d4'). Used in logs to correlate
+    all stages (receive → identify → search → download → send) of one
+    request. No secrets or tokens are ever included."""
+    return uuid.uuid4().hex[:8]
 rate_limiter = RateLimiter()
 # Lyrics fetched for cards the user opened: key -> (title, artist, lyrics).
 LYRICS_CACHE: dict[str, tuple[str, str, str]] = {}
@@ -241,53 +251,28 @@ async def lang_change(callback, conn: sqlite3.Connection, config: Config):
     await callback.answer()
 
 
-def _main_reply_kb(conn, user_id: int | None = None) -> ReplyKeyboardMarkup:
-    """Permanent bottom menu built from the admin-managed feature list.
+def _main_reply_kb(conn, user_id: int | None = None) -> InlineKeyboardMarkup:
+    """Main menu as INLINE keyboard (ReplyKeyboard removed 2026-10-30).
 
-    Reflects renames/toggles/reorders automatically: whatever the admin
-    panel shows as visible+enabled is what the user gets at the bottom.
-
-    Collapsible per user (persisted in the DB via dbmod.menu_collapsed):
-    - OPEN (default): the current feature buttons EXACTLY as before —
-      same count, order, columns and sizes — plus one small toggle row
-      «🔽 بستن منو» at the bottom.
-    - CLOSED: a single «☰ منو» button that re-opens. The features stay
-      fully working: tapping «☰ منو» restores them, and callbacks,
-      commands and auto-intent (send a link/file) are unaffected.
-    ``user_id=None`` (callers that don't know the user) renders the open
-    state, which is also the default for a fresh user.
-
-    Keyboard policy (Telegram standards):
-    - The reply keyboard is the navigation layer: it STAYS visible during
-      navigation and one-shot hints. It is never removed mid-conversation
-      (removing it would strand the user with no way back).
-    - Contextual keyboards are INLINE only (quality pickers, pagination,
-      confirmations, per-song buttons) — they never replace the bottom menu.
-    - Every multi-step flow offers in-bot «❌ لغو» / «🏠 منوی اصلی»; the
-      phone's hardware back button sends nothing to the bot and is never
-      relied upon.
-    - After an operation completes or is cancelled, the UI returns to the
-      one predictable standard state: this main-menu keyboard + a short
-      status line. The keyboard is re-sent only when the state changes —
-      never re-sent identically as filler.
+    The permanent bottom ReplyKeyboard took screen space and blocked the
+    Android back gesture. This inline version provides the same features
+    via callback buttons under the welcome message. All features preserved;
+    admin-managed via capabilities_menu(); each button maps to its real
+    callback via _menu_callback().
     """
     ulang = _user_lang(conn, user_id)
-    if user_id is not None and dbmod.menu_collapsed(conn, user_id):
-        return ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=toggle_open_text(ulang))]],
-            resize_keyboard=True, is_persistent=True)
-    titles = []
-    for f in capabilities_menu(conn):
-        loc = feature_title_localized(conn, f["key"], ulang)
-        titles.append(loc if loc is not None else f["title"])
     rows = []
-    for i in range(0, len(titles), 2):
-        rows.append([KeyboardButton(text=t) for t in titles[i:i + 2]])
+    for f in capabilities_menu(conn):
+        cb = _menu_callback(f["key"])
+        if not cb:
+            continue
+        loc = feature_title_localized(conn, f["key"], ulang)
+        title = loc if loc is not None else f["title"]
+        rows.append([InlineKeyboardButton(text=title, callback_data=cb)])
     if not rows:
-        rows = [[KeyboardButton(text=t("m_features_word", ulang))]]
-    rows.append([KeyboardButton(text=toggle_close_text(ulang))])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
-                               is_persistent=True)
+        rows = [[InlineKeyboardButton(text=t("m_features_word", ulang),
+                                      callback_data="menu:open")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _run_menu_toggle(message: Message, conn: sqlite3.Connection,

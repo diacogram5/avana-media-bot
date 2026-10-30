@@ -170,11 +170,9 @@ def test_main_menu_all_languages(db):
     for lang, uid in (("fa", 778001), ("en", 778002), ("ar", 778003)):
         dbmod.set_user_language(db, uid, lang)
         kb = h._main_reply_kb(db, uid)
-        texts = [b.text for row in kb.keyboard for b in row]
+        texts = [b.text for row in kb.inline_keyboard for b in row]
         assert len(texts) >= 10, f"{lang}: menu too short"
-        # toggle button present in the right language
-        blob = " ".join(texts)
-        assert t("m_toggle_close", lang) in blob or t("m_toggle_open", lang) in blob, lang
+        # (toggle removed with ReplyKeyboard 2026-10-30)
 
 
 def test_admin_views_all_languages(db):

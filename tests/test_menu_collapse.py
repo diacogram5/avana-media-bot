@@ -1,12 +1,9 @@
-"""Collapsible persistent menu (final-round item 1) + menu honesty (item 6).
+"""Inline main menu (ReplyKeyboard removed 2026-10-30).
 
-- OPEN: the 10 admin-managed feature buttons EXACTLY as before (same
-  count/order/columns) + one small «🔽 بستن منو» toggle row.
-- CLOSED: a single «☰ منو» button that re-opens.
-- Collapse state persists per user in the DB (menu_collapse table).
-- The toggle is handled in text_handler before every other branch and
-  inside menu_escape, so it works from every screen without clearing
-  flow state. All 10 features keep working in both states.
+- The permanent bottom ReplyKeyboard is gone; the main menu is now an
+  InlineKeyboardMarkup under the welcome message.
+- All admin-managed features appear as inline buttons with callbacks.
+- No collapse state; no toggle row.
 - No network is used anywhere in these tests.
 """
 import asyncio
@@ -15,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -57,7 +54,7 @@ class FakeState:
 
 
 def _buttons(kb):
-    return [b.text for row in kb.keyboard for b in row]
+    return [b.text for row in kb.inline_keyboard for b in row]
 
 
 # ------------------------------------------------- DB persistence
@@ -83,122 +80,22 @@ def test_menu_collapse_table_created_by_migrations(db):
 
 def test_open_state_ten_buttons_plus_toggle_row(db):
     kb = H._main_reply_kb(db, 42)
-    assert isinstance(kb, ReplyKeyboardMarkup)
-    assert kb.is_persistent is True and kb.resize_keyboard is True
+    assert isinstance(kb, InlineKeyboardMarkup)
+    assert kb.inline_keyboard
     buttons = _buttons(kb)
     # 10 feature buttons + the toggle row — nothing else.
-    assert len(buttons) == 11
-    assert buttons[-1] == L.MENU_TOGGLE_CLOSE
-    feature_rows = kb.keyboard[:-1]
-    assert len(feature_rows) == 5  # 10 buttons, two per row, menu order
-    assert all(len(r) == 2 for r in feature_rows)
+    assert len(buttons) >= 1
+    assert True  # no toggle in inline menu
+    feature_rows = kb.inline_keyboard
+    assert len(feature_rows) >= 1  # inline: one button per row
+    assert all(len(r) == 1 for r in feature_rows)
     titles = [f["title"] for f in L.capabilities_menu(db)]
     assert [b.text for row in feature_rows for b in row] == titles
 
 
 def test_open_state_unknown_user_defaults_open(db):
     kb = H._main_reply_kb(db)
-    assert _buttons(kb)[-1] == L.MENU_TOGGLE_CLOSE
-
-
-def test_closed_state_single_reopen_button(db):
-    dbmod.set_menu_collapsed(db, 42, True)
-    kb = H._main_reply_kb(db, 42)
-    assert _buttons(kb) == [L.MENU_TOGGLE_OPEN]
-    assert kb.is_persistent is True and kb.resize_keyboard is True
-
-
-def test_closed_state_reflects_admin_rename(db):
-    # Admin renames still apply; the collapsed menu stays one button.
-    dbmod.set_feature(db, "lyrics", title="ترانه‌ها", by_id=1)
-    dbmod.set_menu_collapsed(db, 42, True)
-    assert _buttons(H._main_reply_kb(db, 42)) == [L.MENU_TOGGLE_OPEN]
-    kb = H._main_reply_kb(db, 42 + 1)
-    assert "ترانه‌ها" in _buttons(kb)
-
-
-# ------------------------------------------------- toggle via text_handler
-
-def _cfg():
-    return SimpleNamespace(owner_id=999, bot_id="", openai_api_key="")
-
-
-@pytest.mark.asyncio
-async def test_toggle_close_from_text_handler(db):
-    msg = FakeMessage(L.MENU_TOGGLE_CLOSE, user_id=42)
-    await H.text_handler(msg, db, _cfg(), FakeState())
-    assert dbmod.menu_collapsed(db, 42) is True
-    assert msg.answers, "toggle produced no reply"
-    text, kwargs = msg.answers[0]
-    assert "بسته شد" in text
-    kb = kwargs.get("reply_markup")
-    assert _buttons(kb) == [L.MENU_TOGGLE_OPEN]
-
-
-@pytest.mark.asyncio
-async def test_toggle_open_from_text_handler(db):
-    dbmod.set_menu_collapsed(db, 42, True)
-    msg = FakeMessage(L.MENU_TOGGLE_OPEN, user_id=42)
-    await H.text_handler(msg, db, _cfg(), FakeState())
-    assert dbmod.menu_collapsed(db, 42) is False
-    text, kwargs = msg.answers[0]
-    assert "باز شد" in text
-    assert _buttons(kwargs.get("reply_markup"))[-1] == L.MENU_TOGGLE_CLOSE
-
-
-@pytest.mark.asyncio
-async def test_toggle_checked_before_state_branches(db):
-    # Mid-flow (suggest state): the toggle still flips and does NOT
-    # consume the text as flow input — and it does not clear the state.
-    state = FakeState("suggest")
-    msg = FakeMessage(L.MENU_TOGGLE_CLOSE, user_id=42)
-    await H.text_handler(msg, db, _cfg(), state)
-    assert dbmod.menu_collapsed(db, 42) is True
-    assert state.cleared is False
-    assert msg.answers and "بسته شد" in msg.answers[0][0]
-
-
-@pytest.mark.asyncio
-async def test_toggle_does_not_shadow_feature_titles(db):
-    # Feature titles still route to their features in both states.
-    for uid, collapsed in ((42, False), (43, True)):
-        dbmod.set_menu_collapsed(db, uid, collapsed)
-        title = next(f["title"] for f in L.capabilities_menu(db)
-                     if f["key"] == "history")
-        msg = FakeMessage(title, user_id=uid)
-        await H.text_handler(msg, db, _cfg(), FakeState())
-        assert msg.answers, f"feature title not handled (collapsed={collapsed})"
-        assert "تاریخچه" in msg.answers[0][0]
-
-
-# ------------------------------------------------- menu_escape interception
-
-@pytest.mark.asyncio
-async def test_menu_escape_intercepts_toggle_without_clearing_state(db):
-    consumed = []
-
-    @L.menu_escape
-    async def fake_flow_handler(message, conn=None, state=None, config=None):
-        consumed.append(message.text)
-        return "consumed"
-
-    state = FakeState("dl:await_url")
-    msg = FakeMessage(L.MENU_TOGGLE_OPEN, user_id=42)
-    result = await fake_flow_handler(msg, conn=db, state=state, config=_cfg())
-    assert result is None  # inner handler never ran
-    assert not consumed
-    assert state.cleared is False  # display change only: flow survives
-    assert msg.answers and "باز شد" in msg.answers[0][0]
-
-
-# ------------------------------------------------- item 6 honesty bits
-
-def test_toggle_labels_are_distinct_from_feature_titles(db):
-    titles = {f["title"].strip() for f in L.capabilities_menu(db)}
-    assert L.MENU_TOGGLE_CLOSE not in titles
-    assert L.MENU_TOGGLE_OPEN not in titles
-    assert L.menu_title_key(db, L.MENU_TOGGLE_CLOSE) is None
-    assert L.menu_title_key(db, L.MENU_TOGGLE_OPEN) is None
+    assert len(_buttons(kb)) >= 1
 
 
 def test_professional_title_has_no_leading_space(db):

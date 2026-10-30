@@ -14,7 +14,7 @@ No network is used.
 import asyncio
 
 import pytest
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardMarkup
 
 from app import db as dbmod
 from app.bot import handlers
@@ -99,8 +99,8 @@ def test_flow_cancel_clears_state_and_restores_main_menu(db):
     text, kwargs = cb.message.answers[0]
     assert "منوی اصلی" in text
     kb = kwargs.get("reply_markup")
-    assert isinstance(kb, ReplyKeyboardMarkup)
-    assert kb.resize_keyboard and kb.is_persistent
+    assert isinstance(kb, InlineKeyboardMarkup)
+    assert kb.inline_keyboard, "menu must have inline buttons"
 
 
 # --- item 2: «شناسایی موسیقی از فایل» ----------------------------------------

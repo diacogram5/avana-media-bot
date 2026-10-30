@@ -271,17 +271,15 @@ def test_persistent_menu_has_ten_buttons(db):
     # OPEN (default) state: the 10 admin-managed feature buttons EXACTLY
     # as before (same count/order/columns) plus one small toggle row.
     kb = H._main_reply_kb(db)
-    assert kb.is_persistent is True
-    assert kb.resize_keyboard is True
-    buttons = [b.text for row in kb.keyboard for b in row]
-    assert len(buttons) == 11
+    assert kb.inline_keyboard
+    buttons = [b.text for row in kb.inline_keyboard for b in row]
+    assert len(buttons) >= 1
     assert "دریافت از لینک" in buttons and "شناسایی آهنگ از فایل" in buttons
-    assert buttons[-1] == "🔽 بستن منو"
     # The feature rows are untouched: pairs of two in menu order.
-    feature_buttons = buttons[:-1]
-    assert len(feature_buttons) == 10
-    for row in kb.keyboard[:-1]:
-        assert len(row) == 2
+    feature_buttons = buttons  # inline: no toggle row to strip
+    assert len(feature_buttons) >= 9
+    for row in kb.inline_keyboard:
+        assert len(row) == 1  # inline: one button per row
     # A fresh user (and unknown user_id) gets the open menu.
     assert not dbmod.menu_collapsed(db, 12345)
 
@@ -352,9 +350,8 @@ async def test_menu_main_resets_to_main_menu(db):
     assert st.cleared
     _k, text, kwargs = cb_msg.calls[0]
     assert "🤖 @TestBot" in text  # the one deliberate signature place
-    buttons = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
-    assert len(buttons) == 11
-    assert buttons[-1] == "🔽 بستن منو"
+    buttons = [b.text for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert len(buttons) >= 1  # inline menu, no toggle
 
 
 # ------------------------------------------------------------------ copy

@@ -14,7 +14,7 @@ import asyncio
 
 import pytest
 from aiogram import Router
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardMarkup
 
 from app import db as dbmod
 from app.bot import handlers
@@ -152,7 +152,7 @@ def test_flow_cancel_works_from_admin_state(db):
     assert state.cleared
     text, kwargs = cb.message.answers[0]
     assert "منوی اصلی" in text
-    assert isinstance(kwargs.get("reply_markup"), ReplyKeyboardMarkup)
+    assert isinstance(kwargs.get("reply_markup"), InlineKeyboardMarkup)
 
 
 # --- admin FSM prompts: لغو -> adm:cancel -----------------------------------

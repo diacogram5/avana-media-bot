@@ -121,20 +121,35 @@ async def _call(src: Source, *args, **kwargs) -> Any:
 
 
 async def fetch_all(kind: str, *args, **kwargs) -> tuple[dict[str, Any], list[str]]:
-    """Run every enabled source of `kind` in priority order.
+    """Run every enabled source of `kind` IN PARALLEL via asyncio.gather.
 
-    Returns (results_by_name, failed_names). A source raising (or timing
-    out) is logged, recorded in failed_names, and the next source runs —
-    a failing source never kills the search.
+    Returns (results_by_name, failed_names). Each source runs in its own
+    task with a per-source timeout; a source raising (or timing out) is
+    logged, recorded in failed_names, and does NOT affect other sources —
+    a failing source never kills the search. Results preserve source
+    identity by name; priority order is available via sources(kind).
     """
-    results: dict[str, Any] = {}
-    failed: list[str] = []
-    for src in sources(kind):
+    srcs = sources(kind)
+    if not srcs:
+        return {}, []
+
+    async def _one(src):
         try:
-            results[src.name] = await _call(src, *args, **kwargs)
+            res = await _call(src, *args, **kwargs)
+            return (src.name, res, None)
         except Exception as exc:  # noqa: BLE001 — isolation is the point
             log.warning("source %r (%s) failed: %s", src.name, src.kind, exc)
-            failed.append(src.name)
+            return (src.name, None, src.name)
+
+    # Parallel execution with per-source timeout handled inside _call
+    outcomes = await asyncio.gather(*[_one(s) for s in srcs])
+    results: dict[str, Any] = {}
+    failed: list[str] = []
+    for name, res, fail_name in outcomes:
+        if fail_name:
+            failed.append(fail_name)
+        else:
+            results[name] = res
     return results, failed
 
 

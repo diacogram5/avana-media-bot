@@ -36,27 +36,48 @@ class RadioJavanAdapter(SourceAdapter):
             if not r.songs:
                 return None
 
-        # Pick best match using token overlap (not just substring).
-        # This prevents sending the wrong song when titles are similar.
-        from ...bot.logic import token_overlap_ratio
-        wanted = title.strip().lower()
+        # Pick best match using multi-factor scoring.
+        # Title alone is NOT enough — short/common titles cause false positives.
+        from ...bot.logic import token_overlap_ratio, _distinctive_tokens
+        wanted_title = title.strip().lower()
+        wanted_artist = artist.strip().lower()
         best = None
         best_score = 0.0
         for s in r.songs[:5]:
             st = (s.title or "").lower()
-            # Title must contain all wanted tokens (strict)
-            score = token_overlap_ratio(wanted, st)
-            # Artist bonus: prefer same artist
             sa = (s.artist or "").lower()
-            if artist.strip().lower() in sa or sa in artist.strip().lower():
-                score += 0.1
+
+            # 1. Title match (0-1)
+            title_score = token_overlap_ratio(wanted_title, st)
+            if title_score < 0.7:
+                continue  # title must substantially match
+
+            # 2. Artist match (0-1) — REQUIRED, not just a bonus.
+            # Prevents "Sunday" by wrong artist from scoring high.
+            artist_score = token_overlap_ratio(wanted_artist, sa) if wanted_artist else 0.5
+            if wanted_artist and artist_score < 0.5:
+                continue  # wrong artist = reject
+
+            # 3. Version check: remix/cover/live must match the request.
+            # If user wants original but file is a remix (or vice versa), penalize heavily.
+            from ...bot.logic import identified_version_tokens
+            want_ver = set(identified_version_tokens(title))
+            got_ver = set(identified_version_tokens(s.title or ""))
+            version_ok = (want_ver == got_ver)
+            version_penalty = 0.0 if version_ok else 0.4
+
+            # Combined: title 50%, artist 40%, version penalty
+            score = (title_score * 0.5 + artist_score * 0.4) - version_penalty
+
             if score > best_score:
                 best_score = score
                 best = s
+
         # Require high confidence; otherwise don't send a wrong song
-        if best is None or best_score < 0.8:
+        if best is None or best_score < 0.7:
             log_event(log, "radiojavan", stage="low_confidence",
-                      wanted=title[:40], score=round(best_score, 2))
+                      wanted=f"{artist} - {title}"[:50],
+                      score=round(best_score, 2))
             return None
 
         full = c.get_song_by_id(str(best.id))
@@ -85,12 +106,15 @@ class RadioJavanAdapter(SourceAdapter):
             return None
 
         log_event(log, "radiojavan", stage="hit",
-                  title=best.title[:40], duration_s=round(duration, 1),
-                  bytes=len(data))
+                  title=best.title[:40], artist=(best.artist or "")[:40],
+                  duration_s=round(duration, 1), bytes=len(data))
+        # CRITICAL: Use the REAL file info from RadioJavan, NOT the user's
+        # request. The user might have typed a slightly wrong title; the
+        # file's actual metadata is authoritative.
         return FileResult(
             data=data, ext="m4a", duration_sec=duration,
             source="radiojavan", bitrate_kbps=256,
-            title=title, artist=artist)
+            title=best.title or title, artist=best.artist or artist)
 
     async def search(self, artist: str, title: str) -> FileResult | None:
         try:

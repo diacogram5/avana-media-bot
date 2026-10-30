@@ -101,15 +101,49 @@ async def _run_one(adapter: SourceAdapter, artist: str, title: str,
         return None
 
 
+async def _score_result(res: FileResult, artist: str, title: str) -> float:
+    """Score a file by how well it matches the requested song.
+    Accuracy outranks speed: a slower exact match beats a fast near-miss."""
+    from ...bot.logic import token_overlap_ratio, identified_version_tokens
+    if not res:
+        return 0.0
+    # Use the file's REAL metadata (not the request) for scoring
+    ft = (res.title or "").lower()
+    fa = (res.artist or "").lower()
+    wt = title.strip().lower()
+    wa = artist.strip().lower()
+
+    title_score = token_overlap_ratio(wt, ft)
+    artist_score = token_overlap_ratio(wa, fa) if wa else 0.5
+
+    # Version must match (remix vs original etc.)
+    want_ver = set(identified_version_tokens(title))
+    got_ver = set(identified_version_tokens(res.title or ""))
+    version_ok = (want_ver == got_ver)
+
+    score = title_score * 0.5 + artist_score * 0.4
+    if not version_ok:
+        score -= 0.3
+    # Prefer higher real bitrate as tiebreaker (honest quality)
+    score += min(res.bitrate_kbps / 1000, 0.1)
+    return score
+
+
 async def search_parallel(adapters: list[SourceAdapter],
                           artist: str, title: str,
-                          first_win: bool = True) -> FileResult | None:
-    """Run adapters in parallel. If first_win, return the first valid file
-    without waiting for the rest. Otherwise wait for all and pick best."""
+                          first_win: bool = False) -> FileResult | None:
+    """Run adapters in parallel and pick the BEST match, not the fastest.
+
+    Accuracy outranks speed: all adapters run concurrently, then results
+    are scored by real title/artist/version matching. The highest-scoring
+    valid file wins. first_win=True is kept for backward compat but
+    defaults to False — a fast wrong file is worse than a slow right one.
+    """
     if not adapters:
         return None
     if first_win:
-        # Return as soon as any adapter delivers a valid file.
+        # Legacy: return as soon as any adapter delivers.
+        # WARNING: fastest ≠ most accurate. Prefer first_win=False.
         pending = {asyncio.create_task(_run_one(a, artist, title))
                    for a in adapters}
         try:
@@ -127,12 +161,35 @@ async def search_parallel(adapters: list[SourceAdapter],
             for p in pending:
                 p.cancel()
     else:
+        # Accuracy-first: wait for all, score each, pick best match.
         results = await asyncio.gather(
             *[_run_one(a, artist, title) for a in adapters],
             return_exceptions=True)
         valid = [r for r in results if isinstance(r, FileResult)]
         if not valid:
             return None
-        # Highest real bitrate wins (honest quality, no upscaling).
-        valid.sort(key=lambda r: r.bitrate_kbps, reverse=True)
-        return valid[0]
+        scored = [(_score_result_sync(r, artist, title), r) for r in valid]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best = scored[0]
+        log_event(log, "adapter", stage="best_pick",
+                  adapter=best.source, score=round(best_score, 2),
+                  candidates=len(valid))
+        return best
+
+
+def _score_result_sync(res: FileResult, artist: str, title: str) -> float:
+    """Sync wrapper for scoring (called after gather completes)."""
+    from ...bot.logic import token_overlap_ratio, identified_version_tokens
+    ft = (res.title or "").lower()
+    fa = (res.artist or "").lower()
+    wt = title.strip().lower()
+    wa = artist.strip().lower()
+    title_score = token_overlap_ratio(wt, ft)
+    artist_score = token_overlap_ratio(wa, fa) if wa else 0.5
+    want_ver = set(identified_version_tokens(title))
+    got_ver = set(identified_version_tokens(res.title or ""))
+    score = title_score * 0.5 + artist_score * 0.4
+    if want_ver != got_ver:
+        score -= 0.3
+    score += min(res.bitrate_kbps / 1000, 0.1)
+    return score

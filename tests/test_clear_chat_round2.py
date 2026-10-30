@@ -19,7 +19,7 @@ import asyncio
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 from app import db as dbmod
 from app.bot import handlers
@@ -227,7 +227,7 @@ def test_clear_state_zero_leakage_then_new_flow(db):
         # Landed back on the persistent main menu.
         assert cb.message.answers
         _text, kwargs = cb.message.answers[0]
-        assert isinstance(kwargs.get("reply_markup"), ReplyKeyboardMarkup)
+        assert isinstance(kwargs.get("reply_markup"), InlineKeyboardMarkup)
 
         # 4) Start a NEW flow: nothing from the old one may surface.
         state2 = _FakeState()

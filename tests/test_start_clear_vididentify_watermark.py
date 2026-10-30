@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 from app import db as dbmod
 from app.bot import handlers
@@ -117,8 +117,8 @@ def test_cmd_start_sends_welcome_and_menu_and_clears_state(db):
     text, kwargs = msg.answers[0]
     assert text.startswith(WELCOME_EXACT), text[:60]
     kb = kwargs.get("reply_markup")
-    assert isinstance(kb, ReplyKeyboardMarkup)
-    assert kb.resize_keyboard and kb.is_persistent
+    assert isinstance(kb, InlineKeyboardMarkup)
+    assert kb.inline_keyboard, "menu must have inline buttons"
 
 
 def test_track_incoming_records_user_message(db):
