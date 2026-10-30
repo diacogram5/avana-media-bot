@@ -73,8 +73,9 @@ class RadioJavanAdapter(SourceAdapter):
                 best_score = score
                 best = s
 
-        # Require high confidence; otherwise don't send a wrong song
-        if best is None or best_score < 0.7:
+        # Require high confidence; otherwise don't send a wrong song.
+        # Threshold 0.6 (was 0.7): 0.7 was rejecting valid matches.
+        if best is None or best_score < 0.6:
             log_event(log, "radiojavan", stage="low_confidence",
                       wanted=f"{artist} - {title}"[:50],
                       score=round(best_score, 2))

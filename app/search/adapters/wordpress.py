@@ -24,7 +24,7 @@ _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 class WordPressAdapter(SourceAdapter):
     name = "wordpress"
-    timeout_s = 10  # was 25 — misses took 17s, too slow
+    timeout_s = 5  # was 10 — WordPress is backup, don't wait long
 
     async def search(self, artist: str, title: str) -> FileResult | None:
         queries = [q for q in (f"{artist} {title}".strip(), title.strip())
