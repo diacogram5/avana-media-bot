@@ -220,8 +220,11 @@ async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config,
     # Clear any OLD persistent ReplyKeyboard (pre-2026-10-30). The old
     # menu was sent with is_persistent=True and stays visible until
     # explicitly removed — sending InlineKeyboard alone does NOT clear it.
+    # We send the removal with the welcome text itself (not an empty msg,
+    # which Telegram rejects), then the inline menu follows.
     try:
-        await message.answer("‍", reply_markup=ReplyKeyboardRemove())
+        await message.answer(t("m_menu_updated", ulang),
+                             reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
     await _answer(message, conn, _with_signature(conn, config, welcome_text(conn, ulang)),

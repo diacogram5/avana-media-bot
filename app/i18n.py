@@ -38,6 +38,7 @@ from __future__ import annotations
 FA = {
 
     # --- m ---
+    'm_menu_updated': 'منو به‌روزرسانی شد.',
     'm_identify_head_notfound': 'نام و نسخه اصلی آهنگ شناسایی نشد',
     'm_req_expired': 'این درخواست منقضی شده است؛ لطفاً فایل را دوباره بفرستید.',
     'm_not_yours': 'این دکمه برای شما نیست.',
@@ -679,6 +680,7 @@ FA = {
 
 EN = {
     # --- m ---
+    'm_menu_updated': 'Menu updated.',
     'm_identify_head_notfound': 'Song name and original version not identified',
     'm_req_expired': 'This request has expired; please resend the file.',
     'm_not_yours': 'This button is not for you.',
@@ -1308,6 +1310,7 @@ EN = {
 
 AR = {
     # --- m ---
+    'm_menu_updated': 'تم تحديث القائمة.',
     'm_identify_head_notfound': 'لم يتم تحديد اسم الأغنية ونسختها الأصلية',
     'm_req_expired': 'انتهت صلاحية هذا الطلب؛ أعد إرسال الملف من فضلك.',
     'm_not_yours': 'هذا الزر ليس لك.',
