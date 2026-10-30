@@ -41,10 +41,9 @@ def get_result(key: str) -> dict | None:
 
 def build_song_card_buttons(key: str, is_fav: bool,
                             lang: str = "fa") -> list[list[InlineKeyboardButton]]:
-    """Minimal song-card buttons: download, favorite heart, lyrics + playlist."""
+    """Minimal song-card buttons: favorite heart, then lyrics + add-to-playlist."""
     heart = "❤️" if is_fav else "🤍"
     return [
-        [InlineKeyboardButton(text=t("dl_full_btn", lang), callback_data=f"dl:full:{key}")],
         [InlineKeyboardButton(text=heart, callback_data=f"fav:toggle:{key}")],
         [
             InlineKeyboardButton(text=t("pro_lyrics_btn", lang), callback_data=f"ly:{key}"),

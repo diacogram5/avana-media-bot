@@ -1837,15 +1837,6 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         own_media=own_media)
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    # NOTE 2026-10-31: NO AUTO-DOWNLOAD (user request).
-    # Show the identified song card with «⬇️ دانلود نسخه کامل» button.
-    # The full version downloads ONLY when the user taps the button
-    # (dl:full: callback). This makes identify instant instead of 25s.
-    await _answer(message, conn,
-                  t("h_song_identified", ulang).format(title=title, artist=artist),
-                  reply_markup=kb)
-    return
-    # --- OLD AUTO-DOWNLOAD CODE BELOW (disabled) ---
     # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
     # (Argument order is (artist, title); a swapped call silently searched
     # the wrong query and never found anything.)
