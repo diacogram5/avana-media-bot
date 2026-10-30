@@ -25,10 +25,12 @@ from ..i18n import t
 RESULTS: dict[str, dict] = {}
 
 
-def remember_result(title: str, artist: str = "", url: str = "", preview_url: str = "") -> str:
+def remember_result(title: str, artist: str = "", url: str = "", preview_url: str = "",
+                    own_media: tuple[str, str] | None = None) -> str:
     """Store a song-card result; return a short key (12 hex chars) for callbacks."""
     key = secrets.token_hex(6)
-    RESULTS[key] = {"title": title, "artist": artist, "url": url, "preview_url": preview_url}
+    RESULTS[key] = {"title": title, "artist": artist, "url": url,
+                    "preview_url": preview_url, "own_media": own_media}
     return key
 
 

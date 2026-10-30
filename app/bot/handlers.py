@@ -1833,7 +1833,8 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     key = profeat.remember_result(
         title, artist,
         (getattr(match, "url", "") or "") if match else "",
-        (getattr(match, "preview_url", "") or "") if match else "")
+        (getattr(match, "preview_url", "") or "") if match else "",
+        own_media=own_media)
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
     # NOTE 2026-10-31: NO AUTO-DOWNLOAD (user request).
@@ -2732,7 +2733,9 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
     """Download full version on demand (user taps «⬇️ دانلود نسخه کامل»).
 
     No auto-download: the user explicitly requests the file. Uses the
-    in-memory fullsong cache for instant repeat delivery.
+    in-memory fullsong cache for instant repeat delivery. If no full
+    version is found, falls back to the extracted audio from the user's
+    own video (own_media) — the song itself, not just "not found".
     """
     ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
     key = callback.data[8:]
@@ -2748,25 +2751,79 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
         full = await find_full_song_file_v2(artist, title)
     except Exception:
         full = None
-    if not full or not full.get("data"):
-        await callback.message.answer(t("m_identified_no_full", ulang).format(
-            title=title, artist=artist))
-        return
-    try:
-        sent = await callback.message.answer_audio(
-            BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
-            title=title, performer=artist,
-            duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
-            caption=t("h_song_full_caption", ulang).format(
-                label=t("m_full_duration_long", ulang), title=title, artist=artist))
-        if sent is not None:
-            try:
-                adminfeat.track(conn, callback.from_user.id,
-                                callback.message.chat.id, sent.message_id)
-            except Exception:
-                pass
-    except Exception as exc:
-        await callback.message.answer(t("m_download_failed", ulang))
+    if full and full.get("data"):
+        try:
+            sent = await callback.message.answer_audio(
+                BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
+                title=title, performer=artist,
+                duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
+                caption=t("h_song_full_caption", ulang).format(
+                    label=t("m_full_duration_long", ulang), title=title, artist=artist))
+            if sent is not None:
+                try:
+                    adminfeat.track(conn, callback.from_user.id,
+                                    callback.message.chat.id, sent.message_id)
+                except Exception:
+                    pass
+            return
+        except Exception:
+            pass
+    # Fallback: send the extracted audio from the user's own video
+    # (the song itself, labelled as extracted — not a fake "full version").
+    own_media = result.get("own_media")
+    if own_media:
+        media_type, file_id = own_media
+        try:
+            import io as _io
+            import subprocess as _sp
+            import tempfile as _tf
+            import os as _os
+            bot = callback.bot
+            tg_file = await bot.get_file(file_id)
+            # Download the video file into memory
+            buf = _io.BytesIO()
+            await bot.download_file(tg_file.file_path, buf)
+            video_bytes = buf.getvalue()
+            if video_bytes:
+                # Extract audio with ffmpeg (available on Render)
+                with _tf.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+                    vf.write(video_bytes)
+                    vpath = vf.name
+                apath = vpath + ".m4a"
+                try:
+                    _sp.run(["ffmpeg", "-y", "-i", vpath, "-vn",
+                             "-c:a", "aac", "-b:a", "128k", apath],
+                            capture_output=True, timeout=30)
+                    if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
+                        with open(apath, "rb") as af:
+                            audio_bytes = af.read()
+                        sent = await callback.message.answer_audio(
+                            BufferedInputFile(audio_bytes,
+                                              filename=f"{title}.m4a"),
+                            title=title, performer=artist,
+                            caption=t("m_extracted_audio_caption", ulang).format(
+                                title=title, artist=artist))
+                        if sent is not None:
+                            try:
+                                adminfeat.track(conn, callback.from_user.id,
+                                                callback.message.chat.id,
+                                                sent.message_id)
+                            except Exception:
+                                pass
+                        return
+                finally:
+                    try:
+                        _os.unlink(vpath)
+                    except Exception:
+                        pass
+                    try:
+                        _os.unlink(apath)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    await callback.message.answer(t("m_identified_no_full", ulang).format(
+        title=title, artist=artist))
 
 
 _COPY_TEXT_LIMIT = 240  # Bot API CopyTextButton.text allows 1-256 chars
