@@ -28,7 +28,7 @@ async def find_full_song_file_v2(artist: str, title: str) -> dict | None:
     Same contract as find_full_song_file, but via parallel adapters.
     """
     res: FileResult | None = await search_parallel(
-        _adapters(), artist, title, first_win=False)
+        _adapters(), artist, title, first_win=True)
     if not res:
         return None
     return {"data": res.data, "ext": res.ext,
