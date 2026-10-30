@@ -14,8 +14,10 @@ from .youtube import YouTubeAdapter
 
 def _adapters() -> list:
     """All file-source adapters, fastest/most-reliable first."""
+    from .persian_music import PersianMusicAdapter
     return [
         RadioJavanAdapter(),  # Persian music, direct downloads, ~3-10s
+        PersianMusicAdapter(),  # musicdel.ir etc., larger catalog, ~5-15s
         # WordPress REMOVED 2026-10-30: 5s timeout on every miss, zero hits
         # in production logs. Dead weight — just slows down the "not found"
         # path. RadioJavan alone is faster and more reliable.
