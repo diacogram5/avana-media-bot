@@ -41,7 +41,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     BufferedInputFile, BotCommand, CopyTextButton, InlineKeyboardButton,
-    InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup,
+    InlineKeyboardMarkup, Message,
 )
 
 from .. import db as dbmod
