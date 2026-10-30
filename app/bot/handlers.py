@@ -814,9 +814,7 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
                                 caption=t("m_link_video_dl", ulang))
         if sent is not None:
             _track(conn, message, sent)
-            # NOTE: «🎵 شناسایی موسیقی» button removed 2026-10-30 —
-            # auto-identify already runs on clip send; the manual button
-            # was redundant clutter.
+            await _attach_identify_button(message, conn, sent)
             return sent
         await _answer(message, conn, text)
         return None
@@ -918,9 +916,10 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         caption=t("m_link_video_dl", ulang))
     if sent is not None:
         _track(conn, message, sent)
-        # NOTE: «🎵 شناسایی موسیقی» button removed 2026-10-30 —
-        # auto-identify already runs on clip send; the manual button
-        # was redundant clutter.
+        # Pass the reel's separate audio-stream URL so the one-click
+        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
+        # directly (cheaper than re-extracting from the merged video).
+        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
     return sent
 
 
@@ -2235,6 +2234,9 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             # There is no audio any anonymous fetch can reach, so no
             # identification, bank sample, or channel stage runs.
             return
+        # NOTE 2026-10-30: Auto-identify DISABLED. The other bot's UX is
+        # better: send video fast, user taps «🎵 شناسایی موسیقی» on demand.
+        # Auto-identify was slow (25s) and redundant with the button.
         # Cached identification first: same link must not re-burn
         # Shazam/AudD lookups (token/API cost).
         import json as _json
@@ -2250,21 +2252,8 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                     bot_id=dbmod.get_bot_id(conn, config),
                 config=config)
                 return
-        # ONE progress status for the (long) identification stage: the
-        # video is already delivered above, so without this the chat would
-        # sit silent. Dismissed (best effort) before the result card lands
-        # — never a duplicate "please wait".
-        link_status = await message.answer(t("link_identifying", ulang))
-        try:
-            _link_res = await _identify_link_audio(outcome, config, conn,
-                                                   resolved=_resolved)
-        finally:
-            try:
-                await link_status.delete()
-            except Exception:
-                pass
-        await _answer_link_identify_result(message, conn, config, outcome,
-                                           _link_res, video_msg)
+        # No auto-identify: user taps the «🎵 شناسایی موسیقی» button
+        # attached to the video above when they want the song.
         return
     allowed, reason = can_use_feature(conn, message.from_user.id, "song_search")
     if not allowed:
