@@ -307,6 +307,8 @@ _FA_CHAR_MAP = {
     "م": "m", "ن": "n", "و": "o", "ه": "h", "ی": "i", "ي": "i", "ك": "k",
     "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4", "۵": "5",
     "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+    # Half-space (ZWNJ) treated as space for tokenization
+    "‌": " ",
 }
 
 _PACKAGING_STOPWORDS = frozenset({

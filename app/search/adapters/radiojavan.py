@@ -36,18 +36,28 @@ class RadioJavanAdapter(SourceAdapter):
             if not r.songs:
                 return None
 
-        # Pick best match: title must contain the wanted title
+        # Pick best match using token overlap (not just substring).
+        # This prevents sending the wrong song when titles are similar.
+        from ...bot.logic import token_overlap_ratio
         wanted = title.strip().lower()
         best = None
+        best_score = 0.0
         for s in r.songs[:5]:
             st = (s.title or "").lower()
-            if wanted in st or st in wanted:
+            # Title must contain all wanted tokens (strict)
+            score = token_overlap_ratio(wanted, st)
+            # Artist bonus: prefer same artist
+            sa = (s.artist or "").lower()
+            if artist.strip().lower() in sa or sa in artist.strip().lower():
+                score += 0.1
+            if score > best_score:
+                best_score = score
                 best = s
-                break
-        if best is None:
-            best = r.songs[0]
-            log_event(log, "radiojavan", stage="fuzzy_match",
-                      wanted=title[:40], found=best.title[:40])
+        # Require high confidence; otherwise don't send a wrong song
+        if best is None or best_score < 0.8:
+            log_event(log, "radiojavan", stage="low_confidence",
+                      wanted=title[:40], score=round(best_score, 2))
+            return None
 
         full = c.get_song_by_id(str(best.id))
         dl = str(full.hq_link) if full.hq_link else ""
