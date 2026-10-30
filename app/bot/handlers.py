@@ -814,7 +814,9 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
                                 caption=t("m_link_video_dl", ulang))
         if sent is not None:
             _track(conn, message, sent)
-            await _attach_identify_button(message, conn, sent)
+            # NOTE: «🎵 شناسایی موسیقی» button removed 2026-10-30 —
+            # auto-identify already runs on clip send; the manual button
+            # was redundant clutter.
             return sent
         await _answer(message, conn, text)
         return None
@@ -916,10 +918,9 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         caption=t("m_link_video_dl", ulang))
     if sent is not None:
         _track(conn, message, sent)
-        # Pass the reel's separate audio-stream URL so the one-click
-        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
-        # directly (cheaper than re-extracting from the merged video).
-        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
+        # NOTE: «🎵 شناسایی موسیقی» button removed 2026-10-30 —
+        # auto-identify already runs on clip send; the manual button
+        # was redundant clutter.
     return sent
 
 
