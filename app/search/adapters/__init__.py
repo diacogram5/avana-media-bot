@@ -16,7 +16,9 @@ def _adapters() -> list:
     """All file-source adapters, fastest/most-reliable first."""
     return [
         RadioJavanAdapter(),  # Persian music, direct downloads, ~3-10s
-        WordPressAdapter(),   # Iranian catalogs, real MP3, ~4s
+        # WordPress REMOVED 2026-10-30: 5s timeout on every miss, zero hits
+        # in production logs. Dead weight — just slows down the "not found"
+        # path. RadioJavan alone is faster and more reliable.
         # YouTube removed 2026-10-30: "Sign in to confirm you're not a bot"
         # = complete IP block from Render. Wasted 3-4s per query.
     ]
