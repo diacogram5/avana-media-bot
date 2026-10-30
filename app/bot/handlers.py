@@ -1836,6 +1836,15 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         (getattr(match, "preview_url", "") or "") if match else "")
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
+    # NOTE 2026-10-31: NO AUTO-DOWNLOAD (user request).
+    # Show the identified song card with «⬇️ دانلود نسخه کامل» button.
+    # The full version downloads ONLY when the user taps the button
+    # (dl:full: callback). This makes identify instant instead of 25s.
+    await _answer(message, conn,
+                  t("h_song_identified", ulang).format(title=title, artist=artist),
+                  reply_markup=kb)
+    return
+    # --- OLD AUTO-DOWNLOAD CODE BELOW (disabled) ---
     # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
     # (Argument order is (artist, title); a swapped call silently searched
     # the wrong query and never found anything.)
@@ -2716,6 +2725,48 @@ async def lyrics_callback(callback, conn: sqlite3.Connection, config: Config):
         adminfeat.track(conn, callback.from_user.id, callback.message.chat.id, sent.message_id)
     except Exception:
         pass
+
+
+@router.callback_query(F.data.startswith("dl:full:"))
+async def download_full_callback(callback, conn: sqlite3.Connection, config: Config):
+    """Download full version on demand (user taps «⬇️ دانلود نسخه کامل»).
+
+    No auto-download: the user explicitly requests the file. Uses the
+    in-memory fullsong cache for instant repeat delivery.
+    """
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    key = callback.data[8:]
+    result = profeat.get_result(key)
+    if result is None:
+        await callback.answer(t("m_req_expired", ulang), show_alert=True)
+        return
+    await callback.answer(t("m_downloading", ulang))
+    title = result["title"]
+    artist = result.get("artist", "")
+    try:
+        from ..search.adapters import find_full_song_file_v2
+        full = await find_full_song_file_v2(artist, title)
+    except Exception:
+        full = None
+    if not full or not full.get("data"):
+        await callback.message.answer(t("m_identified_no_full", ulang).format(
+            title=title, artist=artist))
+        return
+    try:
+        sent = await callback.message.answer_audio(
+            BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
+            title=title, performer=artist,
+            duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
+            caption=t("h_song_full_caption", ulang).format(
+                label=t("m_full_duration_long", ulang), title=title, artist=artist))
+        if sent is not None:
+            try:
+                adminfeat.track(conn, callback.from_user.id,
+                                callback.message.chat.id, sent.message_id)
+            except Exception:
+                pass
+    except Exception as exc:
+        await callback.message.answer(t("m_download_failed", ulang))
 
 
 _COPY_TEXT_LIMIT = 240  # Bot API CopyTextButton.text allows 1-256 chars
