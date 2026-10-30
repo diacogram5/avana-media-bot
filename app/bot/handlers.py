@@ -41,7 +41,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     BufferedInputFile, BotCommand, CopyTextButton, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message,
+    InlineKeyboardMarkup, Message, ReplyKeyboardRemove,
 )
 
 from .. import db as dbmod
@@ -217,9 +217,13 @@ async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config,
                       reply_markup=_lang_picker_kb())
         return
     ulang = _user_lang(conn, uid)
-    # Persistent bottom menu (web parity): the 10 main feature buttons stay
-    # at the bottom of the chat, each wired to its real function. Inline
-    # keyboards remain only for supplementary card operations.
+    # Clear any OLD persistent ReplyKeyboard (pre-2026-10-30). The old
+    # menu was sent with is_persistent=True and stays visible until
+    # explicitly removed — sending InlineKeyboard alone does NOT clear it.
+    try:
+        await message.answer("‍", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
     await _answer(message, conn, _with_signature(conn, config, welcome_text(conn, ulang)),
                   reply_markup=_main_reply_kb(conn, uid))
 

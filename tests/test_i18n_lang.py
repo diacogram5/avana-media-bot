@@ -98,7 +98,7 @@ def test_first_start_shows_picker(db):
     msg = _FakeMessage(777001)
     _run(h.cmd_start(msg, db, _FakeConfig()))
     assert msg.answers, "first /start must answer something"
-    text, kwargs = msg.answers[0]
+    text, kwargs = msg.answers[-1]
     kb = kwargs.get("reply_markup")
     assert kb is not None
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
@@ -115,7 +115,7 @@ def test_second_start_skips_picker(db):
     msg = _FakeMessage(uid)
     _run(h.cmd_start(msg, db, _FakeConfig()))
     assert msg.answers
-    text, kwargs = msg.answers[0]
+    text, kwargs = msg.answers[-1]
     kb = kwargs.get("reply_markup")
     # reply keyboard (main menu), not the inline picker
     assert "lang:set:fa" not in str(kwargs)

@@ -114,7 +114,8 @@ def test_cmd_start_sends_welcome_and_menu_and_clears_state(db):
     asyncio.run(handlers.cmd_start(msg, db, cfg, state))
     assert state.cleared, "conversation state must reset on /start"
     assert msg.answers, "no answer sent"
-    text, kwargs = msg.answers[0]
+    # answers[0] is ReplyKeyboardRemove cleanup; welcome is answers[-1]
+    text, kwargs = msg.answers[-1]
     assert text.startswith(WELCOME_EXACT), text[:60]
     kb = kwargs.get("reply_markup")
     assert isinstance(kb, InlineKeyboardMarkup)
