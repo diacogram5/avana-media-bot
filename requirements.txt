@@ -7,3 +7,5 @@ pytest>=8.0
 pytest-asyncio>=0.23
 yt-dlp>=2024.8.6
 radiojavanapi>=0.7.0
+# Fast fuzzy string matching for Persian bank text search (FTS5 + re-rank)
+rapidfuzz>=3.0
