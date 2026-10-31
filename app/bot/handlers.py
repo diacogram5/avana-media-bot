@@ -2809,27 +2809,23 @@ async def _run_suggest_body(message, conn, text: str, config):
                                           callback_data="sg:retry"))
     kb_rows.append(extra_row)
 
-    # Try to send graphical card (fallback to text on error)
+    # Send the "آهنگ درخواستی شما" banner above the results (user requirement 2026-11-01)
+    # Banner is only for the song-request (suggest) feature.
     try:
-        from .song_card import generate_top_songs_card
-        from aiogram.types import BufferedInputFile
-        card_songs = []
-        for r in picks:
-            card_songs.append({
-                "title": r.title or "",
-                "artist": r.artist or "",
-                "duration": getattr(r, "duration", None),
-            })
-        card_title = t("h_suggest_head", ulang).format(n=len(picks), mood=mood)
-        # Use a short title for the card
-        img_bytes = generate_top_songs_card(card_songs, title="🎵 " + mood[:30])
-        photo = BufferedInputFile(img_bytes, filename="songs.png")
-        await message.answer_photo(
-            photo,
-            caption=card_title + "\n\n@AvanoMediaBot",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        from aiogram.types import FSInputFile
+        from pathlib import Path
+        _banner = Path(__file__).parent.parent / "assets" / "suggest_banner.png"
+        if _banner.exists():
+            await message.answer_photo(
+                FSInputFile(str(_banner)),
+                caption=t("h_suggest_head", ulang).format(n=len(picks), mood=mood) + "\n\n@AvanoMediaBot",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        else:
+            # Fallback to text list if banner missing
+            await _answer(message, conn, "\n".join(lines),
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     except Exception:
-        # Fallback to text list
+        # Fallback to text list on any error
         await _answer(message, conn, "\n".join(lines),
                       reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
