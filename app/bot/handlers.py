@@ -2309,9 +2309,14 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                 log_event(log, "link", stage="url_cache_hit", url=link_url[:60])
                 try:
                     if _ftype == "video":
-                        await message.answer_video(_fid)
+                        _sent = await message.answer_video(_fid)
                     else:
-                        await message.answer_audio(_fid)
+                        _sent = await message.answer_audio(_fid)
+                    # Attach the identify button (audio_url=None → falls back to Telegram file)
+                    try:
+                        await _attach_identify_button(message, conn, _sent)
+                    except Exception:
+                        pass
                     return
                 except Exception:
                     # Cached file_id invalid (e.g., deleted) — fall through to normal flow
