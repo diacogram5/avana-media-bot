@@ -263,26 +263,50 @@ async def lang_change(callback, conn: sqlite3.Connection, config: Config):
 
 
 def _main_reply_kb(conn, user_id: int | None = None) -> InlineKeyboardMarkup:
-    """Main menu as INLINE keyboard (ReplyKeyboard removed 2026-10-30).
+    """Main menu as INLINE keyboard - matches the reference design exactly.
 
-    The permanent bottom ReplyKeyboard took screen space and blocked the
-    Android back gesture. This inline version provides the same features
-    via callback buttons under the welcome message. All features preserved;
-    admin-managed via capabilities_menu(); each button maps to its real
-    callback via _menu_callback().
+    Layout (2 columns):
+    Row 1: [دانلود اینستاگرام] [جستجوی آهنگ]
+    Row 2: [متن آهنگ] [شناسایی موسیقی]
+    Row 3: [تاریخچه جستجو] [درخواست آهنگ]
+    Row 4: [راهنما و پشتیبانی] (full width)
     """
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     ulang = _user_lang(conn, user_id)
-    rows = []
-    for f in capabilities_menu(conn):
-        cb = _menu_callback(f["key"])
-        if not cb:
-            continue
-        loc = feature_title_localized(conn, f["key"], ulang)
-        title = loc if loc is not None else f["title"]
-        rows.append([InlineKeyboardButton(text=title, callback_data=cb)])
-    if not rows:
-        rows = [[InlineKeyboardButton(text=t("m_features_word", ulang),
-                                      callback_data="menu:open")]]
+
+    # Exact button layout from the reference design
+    # Using the existing callback mappings
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="📷 " + t("m_downloader_instagram", ulang),
+                callback_data="dl:open"),
+            InlineKeyboardButton(
+                text="🔍 " + t("m_song_search", ulang),
+                callback_data="menu:search"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📄 " + t("m_lyrics", ulang),
+                callback_data="menu:lyrics"),
+            InlineKeyboardButton(
+                text="🎵 " + t("m_identify_music", ulang),
+                callback_data="menu:file"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🕐 " + t("m_history", ulang),
+                callback_data="menu:history"),
+            InlineKeyboardButton(
+                text="🎵 " + t("m_song_request", ulang),
+                callback_data="suggest:start"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="❓ " + t("m_help_support", ulang),
+                callback_data="menu:help"),
+        ],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
