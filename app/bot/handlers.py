@@ -2809,19 +2809,21 @@ async def _run_suggest_body(message, conn, text: str, config):
                                           callback_data="sg:retry"))
     kb_rows.append(extra_row)
 
-    # Send the "آهنگ درخواستی شما" banner above the results (user requirement 2026-11-01)
-    # Banner is only for the song-request (suggest) feature.
+    # Send the "آهنگ درخواستی شما" sticker above the results (user requirement 2026-11-01)
+    # Sticker is only for the song-request (suggest) feature.
     try:
         from aiogram.types import FSInputFile
         from pathlib import Path
-        _banner = Path(__file__).parent.parent / "assets" / "suggest_banner.png"
-        if _banner.exists():
-            await message.answer_photo(
-                FSInputFile(str(_banner)),
-                caption=t("h_suggest_head", ulang).format(n=len(picks), mood=mood) + "\n\n@AvanoMediaBot",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        _sticker = Path(__file__).parent.parent / "assets" / "suggest_banner.webp"
+        if _sticker.exists():
+            # Send as sticker (no caption, fixed 512x512)
+            await message.answer_sticker(FSInputFile(str(_sticker)))
+            # Then send the results with buttons
+            await _answer(message, conn,
+                          t("h_suggest_head", ulang).format(n=len(picks), mood=mood) + "\n\n@AvanoMediaBot",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
         else:
-            # Fallback to text list if banner missing
+            # Fallback to text list if sticker missing
             await _answer(message, conn, "\n".join(lines),
                           reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     except Exception:
