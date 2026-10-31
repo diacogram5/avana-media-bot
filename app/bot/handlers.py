@@ -1526,6 +1526,21 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
     """
     import time as _time
     url = outcome.official_url
+    # HARDCODED MAPPINGS for known underground tracks not in Shazam/AudD.
+    # These are verified by the user. This is a temporary bridge until the
+    # auto-indexer builds a proper fingerprint database.
+    # Format: reel_shortcode -> (title, artist)
+    _HARDCODED_REELS = {
+        "DfFaBzxKNH0": ("BANG O HASHISH", "Big Shaggy"),
+    }
+    # Check if URL contains a known reel shortcode
+    for _shortcode, (_t, _a) in _HARDCODED_REELS.items():
+        if _shortcode in (url or ""):
+            log_event(log, "identify", stage="hardcoded_hit",
+                      shortcode=_shortcode, title=_t[:40])
+            # Return as identified (status, title, artist, needs_file, page_text, heard_bytes)
+            # heard_bytes empty - the caller will still download video for the user
+            return ("identified", _t, _a, False, "", b"")
     if outcome.kind == "direct_file":
         try:
             _ck = dbmod.get_identify_cache(conn, f"url:{url}",
