@@ -60,28 +60,28 @@ def connect(db_path: str):
     SQLite file otherwise.
     """
     import os
+    import logging
+    _log = logging.getLogger("avana.db")
     turso_url = os.environ.get("TURSO_URL", "").strip()
     turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     if turso_url and turso_token:
         try:
             import libsql_experimental as libsql
+            _log.info("db: connecting to Turso at %s", turso_url[:40] + "...")
             conn = libsql.connect(turso_url, auth_token=turso_token)
-            conn.row_factory = None  # libsql uses its own row type; adapt below
-            # Wrap to provide sqlite3-compatible row_factory behavior
-            # libsql returns tuples; we set a custom row factory
-            try:
-                conn.row_factory = _dict_row_factory
-            except Exception:
-                pass
-            try:
-                conn.execute("PRAGMA foreign_keys = ON")
-            except Exception:
-                pass
-            return conn
-        except ImportError:
-            pass  # fallback to local sqlite3
-        except Exception:
-            pass  # fallback to local sqlite3
+            # Test the connection with a simple query
+            conn.execute("SELECT 1").fetchone()
+            _log.info("db: Turso connection OK (persistent cache active)")
+            # libsql returns tuples; wrap cursor to provide dict-like rows
+            # We do NOT set conn.row_factory (libsql may not support it);
+            # instead callers use sqlite3.Row-compatible access via our wrapper.
+            return _TursoConnWrapper(conn)
+        except ImportError as e:
+            _log.warning("db: libsql_experimental not installed (%s), using local SQLite", e)
+        except Exception as e:
+            _log.warning("db: Turso connection failed (%s), using local SQLite", e)
+    else:
+        _log.info("db: TURSO_URL/TOKEN not set, using local SQLite (ephemeral)")
     # Local SQLite fallback (ephemeral on Render free tier)
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,10 +91,77 @@ def connect(db_path: str):
     return conn
 
 
+class _TursoConnWrapper:
+    """Wraps a libsql connection to provide sqlite3-compatible interface.
+    
+    libsql returns plain tuples; this wrapper converts rows to dict-like
+    objects supporting both index and column-name access (like sqlite3.Row).
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        cur = self._conn.execute(sql, params)
+        return _TursoCursorWrapper(cur)
+
+    def executemany(self, sql, seq):
+        return self._conn.executemany(sql, seq)
+
+    def executescript(self, sql):
+        # libsql may not have executescript; split and run individually
+        if hasattr(self._conn, "executescript"):
+            return self._conn.executescript(sql)
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._conn.execute(stmt)
+        return None
+
+    def commit(self):
+        return self._conn.commit()
+
+    def close(self):
+        return self._conn.close()
+
+
+class _TursoCursorWrapper:
+    def __init__(self, cur):
+        self._cur = cur
+        self.description = cur.description
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _wrap_row(self.description, row)
+
+    def fetchall(self):
+        return [_wrap_row(self.description, r) for r in self._cur.fetchall()]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cur.lastrowid
+
+
+def _wrap_row(description, row):
+    if row is None:
+        return None
+    cols = [d[0] for d in description] if description else []
+    data = dict(zip(cols, row))
+    # Dict subclass supporting integer indexing like sqlite3.Row
+    class Row(dict):
+        def __getitem__(self, key):
+            if isinstance(key, int):
+                return list(self.values())[key]
+            return super().__getitem__(key)
+    return Row(data)
+
+
 def _dict_row_factory(cursor, row):
-    """Row factory that mimics sqlite3.Row (dict-like access by column name)."""
+    """Legacy row factory (unused with wrapper, kept for compat)."""
     cols = [d[0] for d in cursor.description]
-    # Return a dict-like object supporting both index and key access
     class Row(dict):
         def __getitem__(self, key):
             if isinstance(key, int):
