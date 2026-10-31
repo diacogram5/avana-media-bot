@@ -40,6 +40,12 @@ SITES = [
         "type": "scrape",
         "search_url": "https://msbmusic.ir/?s={query}",
     },
+    {
+        "name": "beys_music",
+        "api": "https://beys-music.ir/wp-json/wp/v2/search",
+        "mp3_pattern": r'https://beysmu\.musitraf\.ir/[^"\s]+\.mp3',
+        "type": "wp_api",
+    },
 ]
 
 # Timeout for site requests (short - don't block the chain)
