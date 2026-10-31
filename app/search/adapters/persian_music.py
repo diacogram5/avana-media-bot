@@ -46,6 +46,18 @@ SITES = [
         "mp3_pattern": r'https://beysmu\.musitraf\.ir/[^"\s]+\.mp3',
         "type": "wp_api",
     },
+    {
+        "name": "mifa_music",
+        "api": "https://mifa-music.ir/wp-json/wp/v2/search",
+        "mp3_pattern": r'https://dl\.mifa-music\.ir/[^"\s]+\.mp3',
+        "type": "wp_api",
+    },
+    {
+        "name": "download1music",
+        "api": "https://download1music.ir/wp-json/wp/v2/search",
+        "mp3_pattern": r'https://dl\d*\.download1music\.ir/[^"\s]+\.mp3',
+        "type": "wp_api",
+    },
 ]
 
 # Timeout for site requests (short - don't block the chain)
