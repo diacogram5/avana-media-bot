@@ -9,5 +9,3 @@ yt-dlp>=2024.8.6
 radiojavanapi>=0.7.0
 # Fast fuzzy string matching for Persian bank text search (FTS5 + re-rank)
 rapidfuzz>=3.0
-# Turso (libsql) client for persistent cloud SQLite — survives Render restarts
-libsql-experimental>=0.0.50
