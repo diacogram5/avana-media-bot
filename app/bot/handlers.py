@@ -3087,20 +3087,27 @@ async def run_bot(config: Config) -> None:
     _install_ad_hook(bot, conn, config)
     dp = build_dispatcher(conn, config)
     log_event(log, "bot_start", **config.safe_summary())
-    # Daily auto-indexer TEMPORARILY DISABLED (2026-10-31): causing crash loop.
-    # Will re-enable after testing the schema fix.
-    # async def _daily_indexer():
-    #     import asyncio as _aio
-    #     await _aio.sleep(300)
-    #     while True:
-    #         try:
-    #             from ..jobs.daily_indexer import run_indexer
-    #             await run_indexer(config.db_path)
-    #         except Exception as exc:
-    #             log.warning("daily_indexer failed: %s", exc)
-    #         await _aio.sleep(24 * 3600)
-    # import asyncio as _asyncio_outer
-    # _indexer_task = _asyncio_outer.create_task(_daily_indexer())
+    # Daily auto-indexer: crawls Persian music sites for new songs.
+    # Runs in background, never blocks the bot. All exceptions caught.
+    async def _daily_indexer():
+        import asyncio as _aio
+        await _aio.sleep(300)  # 5 min after startup
+        while True:
+            try:
+                from ..jobs.daily_indexer import run_indexer
+                await run_indexer(config.db_path)
+            except Exception as exc:
+                # Never crash the bot - just log and continue
+                try:
+                    log.warning("daily_indexer failed: %s", exc)
+                except:
+                    pass
+            await _aio.sleep(24 * 3600)  # Every 24h
+    try:
+        import asyncio as _asyncio_outer
+        _indexer_task = _asyncio_outer.create_task(_daily_indexer())
+    except Exception:
+        pass  # If task creation fails, bot still runs
     try:
         await dp.start_polling(bot)
     finally:
