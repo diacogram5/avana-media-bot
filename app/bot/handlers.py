@@ -2349,6 +2349,15 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         try:
             from .file_cache import get_cached_url_file_id
             _url_cached = get_cached_url_file_id(conn, link_url)
+            # Try persistent Turso cache if local miss (survives Render restarts)
+            if not _url_cached:
+                try:
+                    from .turso_cache import get_url_file_id as _turso_get
+                    _url_cached = _turso_get(link_url)
+                    if _url_cached:
+                        log_event(log, "link", stage="turso_cache_hit", url=link_url[:60])
+                except Exception:
+                    pass
             if _url_cached:
                 _fid, _ftype = _url_cached
                 log_event(log, "link", stage="url_cache_hit", url=link_url[:60])
@@ -2448,6 +2457,13 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                 if _vid:
                     store_url_file_id(conn, link_url, _vid, _vtype)
                     log_event(log, "link", stage="url_cache_stored", url=link_url[:60])
+                    # Also store in persistent Turso cache (survives restarts)
+                    try:
+                        from .turso_cache import store_url_file_id as _turso_store
+                        if _turso_store(link_url, _vid, _vtype):
+                            log_event(log, "link", stage="turso_cache_stored", url=link_url[:60])
+                    except Exception:
+                        pass
         except Exception:
             pass
         # NOTE 2026-10-31: Background identify (competitor's model).
