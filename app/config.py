@@ -50,6 +50,10 @@ class Config:
     # Primary speech engine (both directions): OpenAI (Whisper + TTS).
     openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     audd_token: str = field(default_factory=lambda: os.environ.get("AUDD_API_TOKEN", ""))
+    # ACRCloud (free at acrcloud.com): 150M tracks, MENA coverage, sped-up tolerant
+    acrcloud_host: str = field(default_factory=lambda: os.environ.get("ACRCLOUD_HOST", ""))
+    acrcloud_key: str = field(default_factory=lambda: os.environ.get("ACRCLOUD_ACCESS_KEY", ""))
+    acrcloud_secret: str = field(default_factory=lambda: os.environ.get("ACRCLOUD_ACCESS_SECRET", ""))
     # Jamendo (free client_id at developer.jamendo.com): CC-music catalog
     # with real download URLs.
     jamendo_client_id: str = field(default_factory=lambda: os.environ.get("JAMENDO_CLIENT_ID", ""))
@@ -96,6 +100,7 @@ class Config:
             "db_path": self.db_path,
             "language": self.language,
             "audd_configured": bool(self.audd_token),
+            "acrcloud_configured": bool(self.acrcloud_host and self.acrcloud_key and self.acrcloud_secret),
             "jamendo_configured": bool(self.jamendo_client_id),
             "spotify_configured": bool(self.spotify_client_id and self.spotify_client_secret),
             "openai_speech_configured": bool(self.openai_api_key),

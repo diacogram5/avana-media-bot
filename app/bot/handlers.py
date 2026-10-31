@@ -71,7 +71,7 @@ from ..search.lyrics import (
 from ..search.channel import search_channels
 from ..search.suggest import is_mood_request, suggest_songs
 from ..security import RateLimiter, resolve_short_link, sanitize_text
-from ..services.audio_id import AudioIdResult, identify_bytes, identify_url
+from ..services.audio_id import AudioIdResult, identify_acrcloud, identify_bytes, identify_url
 from ..services.brain import brain_clean_query
 from ..search.audio_match import fingerprint as audio_fingerprint, find_match as find_audio_match
 from ..services.link_media import extract_media_url, extract_page_text
@@ -1440,6 +1440,27 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       ms=int((_time.time() - t0) * 1000), status="identified",
                       title=audd.title, artist=audd.artist)
             return audd
+    # ACRCloud as third fallback (150M tracks, MENA coverage, sped-up tolerant)
+    if config.acrcloud_host and config.acrcloud_key and config.acrcloud_secret:
+        t0 = _time.time()
+        try:
+            acr = await identify_acrcloud(
+                data, config.acrcloud_host,
+                config.acrcloud_key, config.acrcloud_secret)
+            log_event(log, "identify_stage", stage="lookup_response",
+                      window="acrcloud", ms=int((_time.time() - t0) * 1000),
+                      status=acr.status if acr else "none")
+        except Exception as exc:
+            log_event(log, "identify_stage", stage="lookup_error",
+                      window="acrcloud",
+                      error=f"{type(exc).__name__}: {str(exc)[:120]}")
+            acr = None
+        if acr is not None and acr.status == "identified":
+            _cache_store("identified", acr.title, acr.artist)
+            log_event(log, "identify_stage", stage="result_sent",
+                      ms=int((_time.time() - t0) * 1000), status="identified",
+                      title=acr.title, artist=acr.artist)
+            return acr
     if shazam is not None and shazam.status == "not_found":
         _cache_store("not_found")
         log_event(log, "identify_stage", stage="result_sent",
