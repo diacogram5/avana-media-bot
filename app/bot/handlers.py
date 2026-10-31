@@ -2758,6 +2758,28 @@ async def _run_suggest_body(message, conn, text: str, config):
         if k[0] and k not in seen:
             seen.add(k)
             uniq.append(r)
+
+    # Filter: only songs with full version available (user requirement 2026-11-01)
+    # Check each against the full-song sources
+    try:
+        from app.search.fullsong import find_full_song_file
+        full_only = []
+        for r in uniq:
+            try:
+                # Quick check: try to find full song file
+                result = await find_full_song_file(
+                    r.artist or "", r.title or "", timeout=8.0)
+                if result and result.get("url"):
+                    full_only.append(r)
+            except Exception:
+                pass
+        # Use full-version songs if we found any, otherwise fall back to all
+        # (better to show something than nothing, but prefer full versions)
+        if full_only:
+            uniq = full_only
+    except Exception:
+        pass
+
     picks, rest = uniq[:5], uniq[5:]
     more_tok = secrets.token_hex(6) if rest else ""
     if more_tok:
