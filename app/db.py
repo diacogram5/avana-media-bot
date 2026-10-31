@@ -52,13 +52,55 @@ DEFAULT_SETTINGS = {
 }
 
 
-def connect(db_path: str) -> sqlite3.Connection:
+def connect(db_path: str):
+    """Connect to the database.
+    
+    Uses Turso (libsql) when TURSO_URL + TURSO_AUTH_TOKEN env vars are set
+    (persistent cache that survives Render restarts). Falls back to local
+    SQLite file otherwise.
+    """
+    import os
+    turso_url = os.environ.get("TURSO_URL", "").strip()
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if turso_url and turso_token:
+        try:
+            import libsql_experimental as libsql
+            conn = libsql.connect(turso_url, auth_token=turso_token)
+            conn.row_factory = None  # libsql uses its own row type; adapt below
+            # Wrap to provide sqlite3-compatible row_factory behavior
+            # libsql returns tuples; we set a custom row factory
+            try:
+                conn.row_factory = _dict_row_factory
+            except Exception:
+                pass
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+            except Exception:
+                pass
+            return conn
+        except ImportError:
+            pass  # fallback to local sqlite3
+        except Exception:
+            pass  # fallback to local sqlite3
+    # Local SQLite fallback (ephemeral on Render free tier)
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _dict_row_factory(cursor, row):
+    """Row factory that mimics sqlite3.Row (dict-like access by column name)."""
+    cols = [d[0] for d in cursor.description]
+    # Return a dict-like object supporting both index and key access
+    class Row(dict):
+        def __getitem__(self, key):
+            if isinstance(key, int):
+                return list(self.values())[key]
+            return super().__getitem__(key)
+    return Row(zip(cols, row))
 
 
 def applied_versions(conn: sqlite3.Connection) -> set[str]:
