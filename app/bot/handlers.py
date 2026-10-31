@@ -1840,6 +1840,50 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
     # (Argument order is (artist, title); a swapped call silently searched
     # the wrong query and never found anything.)
+    #
+    # Requirement #3: Check Telegram file_id cache first. If this song was
+    # previously sent by the bot, reuse the file_id instead of re-downloading.
+    # This is instant and saves bandwidth.
+    import time as _time
+    _t_start = _time.time()
+    _cache_hit = False
+    try:
+        from .file_cache import get_cached_file_id, store_file_id
+        _cached_fid = get_cached_file_id(conn, artist, title)
+        if _cached_fid:
+            _cache_hit = True
+            try:
+                sent = await message.answer_audio(
+                    _cached_fid,
+                    caption=t("h_song_full_caption", ulang).format(
+                        label=t("m_full_duration_long", ulang),
+                        title=title, artist=artist),
+                    title=title, performer=artist,
+                    reply_markup=kb)
+                if sent is not None:
+                    _track(conn, message, sent)
+                    _t_ms = int((_time.time() - _t_start) * 1000)
+                    log_event(log, "fullsong", stage="sent_cached",
+                              title=title[:40], ms=_t_ms)
+                    # Speed measurement (Requirement #7)
+                    try:
+                        conn.execute(
+                            "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
+                            ("send", _t_ms, int(_time.time())))
+                        conn.commit()
+                    except:
+                        pass
+                    return
+            except Exception:
+                # Cached file_id invalid, fall through to normal flow
+                # and invalidate the cache entry
+                try:
+                    from .file_cache import invalidate_file
+                    invalidate_file(conn, artist, title)
+                except:
+                    pass
+    except Exception:
+        pass
     from ..search.adapters import find_full_song_file_v2
     full = None
     try:
@@ -1860,6 +1904,27 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                 _track(conn, message, sent)
                 log_event(log, "fullsong", stage="sent",
                           title=title[:40], bytes=len(full["data"]))
+                # Requirement #3: Store the Telegram file_id for future reuse.
+                # This avoids re-downloading and re-uploading the same file.
+                try:
+                    _fid = None
+                    if sent.audio:
+                        _fid = sent.audio.file_id
+                    if _fid:
+                        store_file_id(conn, artist, title, _fid, "audio",
+                                      len(full["data"]), full["duration_sec"],
+                                      full.get("source", ""))
+                    # Speed measurement (Requirement #7): cache miss
+                    _t_ms = int((_time.time() - _t_start) * 1000)
+                    try:
+                        conn.execute(
+                            "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 0, ?, ?)",
+                            ("send", _t_ms, int(_time.time())))
+                        conn.commit()
+                    except:
+                        pass
+                except:
+                    pass
                 return
         except Exception as exc:
             # NEVER silent: log the real error so delivery failures are visible
