@@ -3102,7 +3102,8 @@ async def run_bot(config: Config) -> None:
             except Exception as exc:
                 log.warning("daily_indexer failed: %s", exc)
             await _aio.sleep(24 * 3600)
-    _indexer_task = asyncio.create_task(_daily_indexer())
+    import asyncio as _asyncio_outer
+    _indexer_task = _asyncio_outer.create_task(_daily_indexer())
     try:
         await dp.start_polling(bot)
     finally:
