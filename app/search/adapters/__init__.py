@@ -44,12 +44,34 @@ async def find_full_song_file_v2(artist: str, title: str) -> dict | None:
 
     Same contract as find_full_song_file, but via parallel adapters.
     Checks in-memory cache first for instant repeat delivery.
+    SPEED: 1.8s timeout — first valid result wins, rest cancelled.
     """
+    import asyncio as _aio
+    import time as _time
     key = _fullsong_cache_key(artist, title)
     if key in _FULLSONG_CACHE:
         return _FULLSONG_CACHE[key]
-    res: FileResult | None = await search_parallel(
-        _adapters(), artist, title, first_win=True)
+    _t0 = _time.perf_counter()
+    try:
+        # SPEED: Wrap in timeout — 1.8s max for the whole parallel search.
+        # Uses first_win=True: fastest valid result wins.
+        res: FileResult | None = await _aio.wait_for(
+            search_parallel(_adapters(), artist, title, first_win=True),
+            timeout=1.8
+        )
+    except _aio.TimeoutError:
+        res = None
+    except Exception:
+        res = None
+    _ms = int((_time.perf_counter() - _t0) * 1000)
+    # Log timing
+    try:
+        from .base import log as _alog
+        from ..logging_config import log_event as _le
+        _le(_alog, "fullsong", stage="search_done", ms=_ms,
+            artist=artist[:30], title=title[:30], found=bool(res))
+    except Exception:
+        pass
     if not res:
         return None
     out = {"data": res.data, "ext": res.ext,

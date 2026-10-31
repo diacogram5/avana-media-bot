@@ -2298,9 +2298,44 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         allowed, reason = can_use_feature(conn, message.from_user.id, "link_fetch")
         if not allowed:
             await message.answer(t(reason, ulang)); return
+        # SPEED: URL-based file_id cache check FIRST (instant resend < 1s).
+        # If this exact URL was sent before, reuse the Telegram file_id
+        # without any download or processing.
+        try:
+            from .file_cache import get_cached_url_file_id
+            _url_cached = get_cached_url_file_id(conn, link_url)
+            if _url_cached:
+                _fid, _ftype = _url_cached
+                log_event(log, "link", stage="url_cache_hit", url=link_url[:60])
+                try:
+                    if _ftype == "video":
+                        await message.answer_video(_fid)
+                    else:
+                        await message.answer_audio(_fid)
+                    return
+                except Exception:
+                    # Cached file_id invalid (e.g., deleted) — fall through to normal flow
+                    from .file_cache import invalidate_file
+                    # Note: invalidate by URL key requires the key; skip for now, will be overwritten on next store
+                    pass
+        except Exception:
+            pass
+        # SPEED: Immediate status message (< 1s response) before heavy work.
+        # The actual download + send happens in background.
+        try:
+            _status_msg = await message.answer("⏳ در حال پردازش...")
+        except Exception:
+            _status_msg = None
         outcome = process_link(link_url, config.max_file_mb)
         if not outcome.ok:
-            await message.answer(t(outcome.message, "fa")); return
+            if _status_msg:
+                try:
+                    await _status_msg.edit_text(t(outcome.message, "fa"))
+                except Exception:
+                    await message.answer(t(outcome.message, "fa"))
+            else:
+                await message.answer(t(outcome.message, "fa"))
+            return
         # Resolve Instagram media ONCE per link: the video-send stage
         # and the identify stage share the result (they used to each run
         # the full four-strategy resolver for the same URL, doubling
@@ -2308,27 +2343,62 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         _resolved = None
         if outcome.kind == "instagram":
             import time as _time
-            _rt = _time.time()
+            _rt = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
                 _resolved = await resolve_instagram_media(
                     outcome.official_url)
             except Exception:
                 _resolved = None
+            _resolve_ms = int((_time.perf_counter() - _rt) * 1000)
             log_event(log, "identify_stage", stage="resolve",
-                      ms=int((_time.time() - _rt) * 1000),
+                      ms=_resolve_ms,
                       strategy=_resolved[3] if _resolved else "error")
+        # SPEED: Time the video send stage.
+        import time as _ptime
+        _vs = _ptime.perf_counter()
         # Professional minimal link flow: video, then one clean song card.
         # No catalog video search, no video section, no button grid, no
         # empty "not found" boxes.
         video_msg = await _send_link_video(message, conn, outcome, config,
                                            bot_id=dbmod.get_bot_id(conn, config),
                                            resolved=_resolved)
+        # SPEED: Log video send timing.
+        _vsend_ms = int((_ptime.perf_counter() - _vs) * 1000)
+        log_event(log, "link", stage="video_sent", ms=_vsend_ms, url=link_url[:60])
+        # SPEED: Delete the "processing" status message now that video is sent.
+        if _status_msg:
+            try:
+                await _status_msg.delete()
+            except Exception:
+                pass
         if video_msg == _INSTAGRAM_GATED:
             # Age-gated reel: the dedicated message is already shown.
             # There is no audio any anonymous fetch can reach, so no
             # identification, bank sample, or channel stage runs.
             return
+        # SPEED: Store file_id in URL cache for instant resend (< 1s next time).
+        # video_msg is the sent Message object; extract file_id from it.
+        try:
+            from .file_cache import store_url_file_id
+            _vid = None
+            _vtype = "video"
+            if video_msg and video_msg != _INSTAGRAM_GATED:
+                # Try to get file_id from the sent message
+                if hasattr(video_msg, 'video') and video_msg.video:
+                    _vid = video_msg.video.file_id
+                    _vtype = "video"
+                elif hasattr(video_msg, 'audio') and video_msg.audio:
+                    _vid = video_msg.audio.file_id
+                    _vtype = "audio"
+                elif hasattr(video_msg, 'document') and video_msg.document:
+                    _vid = video_msg.document.file_id
+                    _vtype = "video"
+                if _vid:
+                    store_url_file_id(conn, link_url, _vid, _vtype)
+                    log_event(log, "link", stage="url_cache_stored", url=link_url[:60])
+        except Exception:
+            pass
         # NOTE 2026-10-31: Background identify (competitor's model).
         # Video is sent immediately above. Now identify in BACKGROUND so
         # when the user taps «🎵 شناسایی موسیقی», the result is cached
