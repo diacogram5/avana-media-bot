@@ -153,7 +153,7 @@ async def run_indexer(db_path: str):
             try:
                 conn.execute(
                     """INSERT INTO audio_bank 
-                       (title, artist, file_url, fingerprint, source, created_at)
+                       (title, artist, file_url, chroma, source, created_at)
                        VALUES (?, ?, ?, ?, ?, datetime('now'))""",
                     (title, "", result["mp3_url"], result["fingerprint"], site["name"])
                 )
