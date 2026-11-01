@@ -3063,6 +3063,7 @@ async def _remix_run_job(message: Message, conn: sqlite3.Connection,
                          config: Config, state: FSMContext,
                          file1: str, file2: str, tmpdir: str) -> None:
     """Background remix job: status updates + final MP3 delivery."""
+    import os
     import shutil
     from aiogram.types import FSInputFile
 
