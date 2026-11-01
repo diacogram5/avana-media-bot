@@ -786,7 +786,10 @@ def _trending_page_kb(items: list[dict], page: int, total_pages: int,
 @router.callback_query(F.data == "trending:open")
 async def trending_open(callback, conn: sqlite3.Connection, config: Config):
     ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
-    await callback.answer("⏳ در حال دریافت...")
+    await callback.answer(
+        "🎧 آوانو، تجربه‌ای نو برای تو!\n"
+        "✨ در حال پیدا کردن داغ‌ترین ترندهای موسیقی برای تو...",
+        show_alert=False)
     try:
         from .trending import get_trending
         items, fetched_at, _ = await get_trending()
@@ -865,7 +868,10 @@ async def trending_search(callback, conn: sqlite3.Connection, config: Config):
 @router.callback_query(F.data == "kabo:open")
 async def kabo_open(callback, conn: sqlite3.Connection, config: Config):
     ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
-    await callback.answer("⏳ در حال دریافت...")
+    await callback.answer(
+        "🎧 آوانو، تجربه‌ای نو برای تو!\n"
+        "✨ در حال پیدا کردن داغ‌ترین ترندهای موسیقی برای تو...",
+        show_alert=False)
     try:
         from .trending_kabo import get_hot_trends
         items, fetched_at, _ = await get_hot_trends()
