@@ -2809,26 +2809,10 @@ async def _run_suggest_body(message, conn, text: str, config):
                                           callback_data="sg:retry"))
     kb_rows.append(extra_row)
 
-    # Send the "آهنگ درخواستی شما" banner as a SEPARATE floating photo above (user requirement 2026-11-01)
-    # Photo in white bubble at top (like reference), then results with buttons below.
-    try:
-        from aiogram.types import FSInputFile
-        from pathlib import Path
-        _banner = Path(__file__).parent.parent / "assets" / "suggest_banner_nobg.png"
-        if _banner.exists():
-            # 1. Banner photo (in white bubble, floating at top)
-            await message.answer_photo(FSInputFile(str(_banner)))
-            # 2. Results with buttons
-            await _answer(message, conn, "\n".join(lines),
-                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        else:
-            # Fallback to text list if banner missing
-            await _answer(message, conn, "\n".join(lines),
-                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    except Exception:
-        # Fallback to text list on any error
-        await _answer(message, conn, "\n".join(lines),
-                      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    # Banner removed per user request 2026-11-01 (Telegram Bot API does not
+    # support floating UI banners; user chose to remove instead of message-based).
+    await _answer(message, conn, "\n".join(lines),
+                  reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 _SUGGEST_MORE: dict[str, list] = {}
