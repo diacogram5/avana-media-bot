@@ -2809,20 +2809,20 @@ async def _run_suggest_body(message, conn, text: str, config):
                                           callback_data="sg:retry"))
     kb_rows.append(extra_row)
 
-    # Send the "آهنگ درخواستی شما" banner as a SEPARATE floating sticker above (user requirement 2026-11-01)
-    # Sticker = no white bubble, truly floating. Then results with buttons below.
+    # Send the "آهنگ درخواستی شما" banner as a SEPARATE floating photo above (user requirement 2026-11-01)
+    # Photo in white bubble at top (like reference), then results with buttons below.
     try:
         from aiogram.types import FSInputFile
         from pathlib import Path
-        _sticker = Path(__file__).parent.parent / "assets" / "suggest_banner.webp"
-        if _sticker.exists():
-            # 1. Banner sticker (floating, no bubble)
-            await message.answer_sticker(FSInputFile(str(_sticker)))
+        _banner = Path(__file__).parent.parent / "assets" / "suggest_banner_nobg.png"
+        if _banner.exists():
+            # 1. Banner photo (in white bubble, floating at top)
+            await message.answer_photo(FSInputFile(str(_banner)))
             # 2. Results with buttons
             await _answer(message, conn, "\n".join(lines),
                           reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
         else:
-            # Fallback to text list if sticker missing
+            # Fallback to text list if banner missing
             await _answer(message, conn, "\n".join(lines),
                           reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     except Exception:
