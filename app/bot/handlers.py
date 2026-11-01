@@ -334,6 +334,11 @@ def _main_reply_kb(conn, user_id: int | None = None,
         ],
         [
             InlineKeyboardButton(
+                text="🔥 " + t("m_trending_hot", ulang),
+                callback_data="kabo:open"),
+        ],
+        [
+            InlineKeyboardButton(
                 text="❓ " + t("m_help_support", ulang),
                 callback_data="menu:help"),
         ],
@@ -849,6 +854,96 @@ async def trending_search(callback, conn: sqlite3.Connection, config: Config):
     try:
         await _do_search(callback.message, conn, query, config=config)
     except Exception as e:
+        await callback.message.answer(
+            "❌ خطا در جست‌وجو. لطفاً بعداً تلاش کنید.")
+
+
+# ---------------------------------------------------------------------------
+# Kabo hot trends (growth-ranked, 5 public items)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "kabo:open")
+async def kabo_open(callback, conn: sqlite3.Connection, config: Config):
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    await callback.answer("⏳ در حال دریافت...")
+    try:
+        from .trending_kabo import get_hot_trends
+        items, fetched_at, _ = await get_hot_trends()
+    except Exception:
+        items, fetched_at = [], 0
+    if not items:
+        await callback.message.answer(
+            "❌ در حال حاضر ترندهای داغ در دسترس نیست. لطفاً بعداً تلاش کنید.")
+        return
+
+    from datetime import datetime
+    if fetched_at:
+        dt = datetime.fromtimestamp(fetched_at).strftime("%Y-%m-%d")
+    else:
+        dt = "—"
+
+    lines = []
+    for it in items:
+        title = it["title"]
+        artist = it.get("artist", "")
+        header = f"{it['rank']}. <b>{title}</b>"
+        if artist:
+            header += f" — {artist}"
+        details = []
+        if it.get("new_24h"):
+            details.append(f"📈 +{it['new_24h']} ریلز در ۲۴ ساعت")
+        if it.get("growth_pct"):
+            details.append(f"🚀 رشد {it['growth_pct']}")
+        if it.get("audio_url"):
+            details.append(f'<a href="{it["audio_url"]}">🎵 باز کردن در اینستاگرام</a>')
+        lines.append(header + ("\n" + " | ".join(details) if details else ""))
+
+    text = (
+        f"🔥 <b>{t('m_trending_hot', ulang)}</b>\n"
+        f"📅 به‌روزرسانی: {dt}\n"
+        f"📊 مرتب‌سازی بر اساس رشد واقعی\n\n"
+        + "\n\n".join(lines)
+    )
+
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    kb_rows: list[list] = []
+    btn_row: list = []
+    for it in items:
+        btn_row.append(InlineKeyboardButton(
+            text=f"🔍 {it['rank']}",
+            callback_data=f"kabo:search:{it['rank']}"))
+    kb_rows.append(btn_row)
+    kb_rows.append([InlineKeyboardButton(text="🏠 منوی اصلی",
+                                        callback_data="menu:main")])
+    await callback.message.answer(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML", disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("kabo:search:"))
+async def kabo_search(callback, conn: sqlite3.Connection, config: Config):
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    try:
+        rank = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("❌", show_alert=True)
+        return
+    await callback.answer("🔍 در حال جست‌وجو...")
+    try:
+        from .trending_kabo import load_hot_trends
+        items, _ = load_hot_trends()
+        item = next((x for x in items if x["rank"] == rank), None)
+    except Exception:
+        item = None
+    if not item:
+        await callback.message.answer("❌ آهنگ پیدا نشد.")
+        return
+    query = item["title"]
+    if item.get("artist"):
+        query += " " + item["artist"]
+    try:
+        await _do_search(callback.message, conn, query, config=config)
+    except Exception:
         await callback.message.answer(
             "❌ خطا در جست‌وجو. لطفاً بعداً تلاش کنید.")
 
@@ -4303,6 +4398,18 @@ async def run_bot(config: Config) -> None:
         _asyncio_outer.create_task(_trending_refresh())
     except Exception as e:
         log.warning("trending startup refresh not scheduled: %s", e)
+    # Kabo hot trends: same pattern, separate module/lock.
+    try:
+        from .trending_kabo import get_hot_trends as _kabo_get
+
+        async def _kabo_startup():
+            try:
+                await _kabo_get()
+            except Exception as e:
+                log.warning("kabo startup refresh failed: %s", e)
+        _asyncio_outer.create_task(_kabo_startup())
+    except Exception as e:
+        log.warning("kabo startup refresh not scheduled: %s", e)
 
     # Track last received update for the health endpoint
     _health["last_update"] = 0
