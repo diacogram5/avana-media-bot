@@ -4051,9 +4051,45 @@ async def run_bot(config: Config) -> None:
         _indexer_task = _asyncio_outer.create_task(_daily_indexer())
     except Exception:
         pass  # If task creation fails, bot still runs
+
+    # --- Polling watchdog (root fix for "zombie" instances) ---
+    # After a deploy, the new instance must actually start polling Telegram.
+    # If polling silently fails to start, the process would sit alive but
+    # never respond (the "frozen bot" symptom). This watchdog verifies that
+    # polling really began; if not, it exits non-zero so Render restarts
+    # the service instead of leaving a zombie.
+    _polling_started = _asyncio_outer.Event()
+
+    async def _on_polling_startup(*_a, **_k):
+        _polling_started.set()
+        log_event(log, "polling_started", bot_id=getattr(bot, "id", "?"))
+
+    try:
+        dp.startup.register(_on_polling_startup)
+    except Exception:
+        pass
+
+    async def _polling_watchdog():
+        try:
+            await _asyncio_outer.wait_for(_polling_started.wait(),
+                                          timeout=90)
+            log_event(log, "polling_watchdog_ok")
+        except _asyncio_outer.TimeoutError:
+            log_event(log, "polling_watchdog_fail",
+                      error="polling did not start within 90s, exiting")
+            # Force a non-zero exit so Render restarts the service.
+            import os as _os
+            _os._exit(42)
+
+    _watchdog_task = _asyncio_outer.create_task(_polling_watchdog())
+
     try:
         await dp.start_polling(bot)
     finally:
+        try:
+            _watchdog_task.cancel()
+        except Exception:
+            pass
         await bot.session.close()
         if web:
             web.shutdown()
