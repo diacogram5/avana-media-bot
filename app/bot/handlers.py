@@ -2645,7 +2645,7 @@ async def remix_confirm(callback, conn: sqlite3.Connection, config: Config,
         return
 
     from ..search.fullsong import find_full_song_file
-    from .remix import MAX_DURATION_SEC, is_locked
+    from .remix import is_locked
 
     if is_locked():
         await callback.message.answer(
@@ -2661,15 +2661,15 @@ async def remix_confirm(callback, conn: sqlite3.Connection, config: Config,
             if not found or not found.get("data"):
                 raise RuntimeError(
                     f"فایل «{r['title']}» قابل دانلود نیست.")
-            dur = found.get("duration_sec", 0) or 0
-            if dur > MAX_DURATION_SEC:
-                raise RuntimeError(
-                    f"«{r['title']}» طولانی‌تر از {MAX_DURATION_SEC} ثانیه "
-                    f"است ({dur:.0f} ثانیه).")
+            # No duration rejection: long songs are auto-trimmed by the
+            # remix engine (select_best_section).
             ext = found.get("ext", ".mp3") or ".mp3"
             p = os.path.join(tmpdir, f"search{i+1}{ext}")
             with open(p, "wb") as f:
                 f.write(found["data"])
+            # Validate the written file before the job starts.
+            from .remix import _ensure_readable
+            _ensure_readable(p)
             paths.append(p)
     except Exception as e:
         import shutil
@@ -2934,7 +2934,8 @@ async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
     if not (config.owner_id is not None and uid == config.owner_id):
         return False
     try:
-        from .remix import MAX_DURATION_SEC, is_enabled, probe_duration
+        from .remix import (MAX_INPUT_FILE_MB, is_enabled, probe_duration,
+                            _ensure_readable)
     except Exception:
         return False
     if not is_enabled():
@@ -2957,8 +2958,9 @@ async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
         await message.answer("❌ فرمت پشتیبانی نمی‌شود. MP3 / WAV / OGG بفرستید.")
         return True
     size_mb = (file_obj.file_size or 0) / 1024 / 1024
-    if size_mb > 15:
-        await message.answer("❌ فایل خیلی بزرگ است (حداکثر ۱۵ مگابایت).")
+    if size_mb > MAX_INPUT_FILE_MB:
+        await message.answer(
+            f"❌ فایل خیلی بزرگ است (حداکثر {MAX_INPUT_FILE_MB} مگابایت).")
         return True
 
     # Download to a per-user temp dir
@@ -2984,19 +2986,20 @@ async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
         await message.answer(f"❌ خطا در دریافت فایل: {e}")
         return True
 
-    # Duration check
+    # Validate the downloaded file exists and is readable BEFORE probing.
+    # (Fixes "ffprobe failed: No such file or directory".)
+    try:
+        _ensure_readable(dest)
+    except Exception as e:
+        await message.answer(f"❌ فایل دانلود نشد: {e}")
+        return True
+
+    # Duration probe (informational now — long songs are auto-trimmed,
+    # no 60s rejection anymore).
     try:
         dur = probe_duration(dest)
     except Exception as e:
         await message.answer(f"❌ فایل صوتی خوانده نشد: {e}")
-        try:
-            os.remove(dest)
-        except Exception:
-            pass
-        return True
-    if dur > MAX_DURATION_SEC:
-        await message.answer(
-            f"❌ مدت فایل {dur:.0f} ثانیه است. حداکثر {MAX_DURATION_SEC} ثانیه مجاز است.")
         try:
             os.remove(dest)
         except Exception:
@@ -3013,8 +3016,12 @@ async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
             await state.set_state("remix:await_file2")
         except Exception:
             pass
+        note = (f"✅ فایل اول دریافت شد ({dur:.0f} ثانیه)."
+                if dur <= 60 else
+                f"✅ فایل اول دریافت شد ({dur:.0f} ثانیه).\n"
+                "✂️ بخش مناسب آن به‌صورت خودکار انتخاب می‌شود.")
         await message.answer(
-            f"✅ فایل اول دریافت شد ({dur:.0f} ثانیه).\n\n"
+            f"{note}\n\n"
             "🎵 حالا <b>فایل صوتی دوم</b> را ارسال کنید.",
             parse_mode="HTML", reply_markup=cancel_kb)
         return True
@@ -3037,8 +3044,12 @@ async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
         await state.set_state("remix:processing")
     except Exception:
         pass
+    note2 = (f"✅ فایل دوم دریافت شد ({dur:.0f} ثانیه)."
+             if dur <= 60 else
+             f"✅ فایل دوم دریافت شد ({dur:.0f} ثانیه).\n"
+             "✂️ بخش مناسب آن به‌صورت خودکار انتخاب می‌شود.")
     await message.answer(
-        f"✅ فایل دوم دریافت شد ({dur:.0f} ثانیه).\n\n"
+        f"{note2}\n\n"
         "🎛️ ساخت ریمیکس شروع شد...",
         parse_mode="HTML")
     # Fire-and-forget background task; the bot stays responsive.
@@ -3079,6 +3090,17 @@ async def _remix_run_job(message: Message, conn: sqlite3.Connection,
         try:
             if stage == "validate":
                 txt = "📥 <b>دریافت فایل‌ها</b> ✅\n🔍 در حال تحلیل موسیقی..."
+            elif stage == "extract1":
+                d = (detail or {}).get("duration", 0)
+                txt = ("📥 دریافت فایل‌ها ✅\n"
+                       f"✂️ آهنگ اول طولانی است ({d:.0f} ثانیه)؛\n"
+                       "در حال انتخاب بهترین بخش...")
+            elif stage == "extract2":
+                d = (detail or {}).get("duration", 0)
+                txt = ("📥 دریافت فایل‌ها ✅\n"
+                       "✂️ انتخاب بخش آهنگ اول ✅\n"
+                       f"✂️ آهنگ دوم طولانی است ({d:.0f} ثانیه)؛\n"
+                       "در حال انتخاب بهترین بخش...")
             elif stage == "analyze1":
                 txt = ("📥 دریافت فایل‌ها ✅\n"
                        "🔍 تحلیل آهنگ اول... (تشخیص ریتم و کلید)")
@@ -3124,12 +3146,27 @@ async def _remix_run_job(message: Message, conn: sqlite3.Connection,
 
     # Deliver the real MP3
     try:
+        sec_note = ""
+        s1 = result.get("section1")
+        s2 = result.get("section2")
+        if s1 or s2:
+            parts = []
+            if s1:
+                parts.append(
+                    f"آهنگ ۱: بخش {s1['start']:.0f}–{s1['start']+s1['len']:.0f} "
+                    f"از {s1['orig_dur']:.0f} ثانیه")
+            if s2:
+                parts.append(
+                    f"آهنگ ۲: بخش {s2['start']:.0f}–{s2['start']+s2['len']:.0f} "
+                    f"از {s2['orig_dur']:.0f} ثانیه")
+            sec_note = "✂️ " + " | ".join(parts) + "\n"
         caption = (
             "🎛️ <b>ریمیکس هوشمند آماده شد!</b> 🧪\n\n"
             f"🎵 آهنگ ۱: {result.get('bpm1', 0):.0f} BPM "
             f"({result['info1'].get('key', '?')} {result['info1'].get('scale', '')})\n"
             f"🎵 آهنگ ۲: {result.get('bpm2', 0):.0f} BPM "
             f"({result['info2'].get('key', '?')} {result['info2'].get('scale', '')})\n"
+            + sec_note +
             f"⏱️ زمان پردازش: {total:.0f} ثانیه\n"
             f"💾 حجم: {result.get('size_mb', 0)} مگابایت\n\n"
             "@AvanoMediaBot"
