@@ -270,13 +270,25 @@ def _main_reply_kb(conn, user_id: int | None = None,
 
     Layout (2 columns):
     Row 1: [دانلود اینستاگرام] [جستجوی آهنگ]
-    Row 2: [متن آهنگ] [شناسایی موسیقی]
+    Row 2: [متن آهنگ] [شناسایی موسیقی]  (admin beta: [🎛️ ساخت ریمیکس هوشمند] replaces it)
     Row 3: [تاریخچه جستجو] [درخواست آهنگ]
     Row 4: [راهنما و پشتیبانی] (full width)
-    Beta row (admin only): [🎛️ ساخت ریمیکس هوشمند] (full width)
+
+    Per user spec: the remix button REPLACES the «شناسایی موسیقی» button
+    in the main menu (admin only, beta). The identify feature itself is
+    NOT deleted — only its main-menu slot is reused, restorable later.
     """
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     ulang = _user_lang(conn, user_id)
+
+    # Admin beta: remix replaces the identify slot. Import guarded once.
+    _remix_active = False
+    if is_admin:
+        try:
+            from .remix import is_enabled as _remix_enabled
+            _remix_active = bool(_remix_enabled())
+        except Exception:
+            _remix_active = False
 
     # Exact button layout from the reference design
     # Using the existing callback mappings
@@ -294,8 +306,10 @@ def _main_reply_kb(conn, user_id: int | None = None,
                 text="📄 " + t("m_lyrics", ulang),
                 callback_data="menu:lyrics"),
             InlineKeyboardButton(
-                text="🎵 " + t("m_identify_music", ulang),
-                callback_data="menu:file"),
+                text=("🎛️ ساخت ریمیکس هوشمند 🧪" if _remix_active
+                      else "🎵 " + t("m_identify_music", ulang)),
+                callback_data=("remix:start" if _remix_active
+                               else "menu:file")),
         ],
         [
             InlineKeyboardButton(
@@ -311,17 +325,6 @@ def _main_reply_kb(conn, user_id: int | None = None,
                 callback_data="menu:help"),
         ],
     ]
-    # Beta: Smart Remix button - admin only, feature-flaggable
-    try:
-        from .remix import is_enabled as _remix_enabled
-        if is_admin and _remix_enabled():
-            rows.append([
-                InlineKeyboardButton(
-                    text="🎛️ ساخت ریمیکس هوشمند 🧪",
-                    callback_data="remix:start"),
-            ])
-    except Exception:
-        pass
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
