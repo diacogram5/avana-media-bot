@@ -4046,27 +4046,31 @@ async def run_bot(config: Config) -> None:
     _install_ad_hook(bot, conn, config)
     dp = build_dispatcher(conn, config)
     log_event(log, "bot_start", **config.safe_summary())
-    # Daily auto-indexer: crawls Persian music sites for new songs.
-    # Runs in background, never blocks the bot. All exceptions caught.
-    async def _daily_indexer():
-        import asyncio as _aio
-        await _aio.sleep(300)  # 5 min after startup
-        while True:
-            try:
-                from ..jobs.daily_indexer import run_indexer
-                await run_indexer(config.db_path)
-            except Exception as exc:
-                # Never crash the bot - just log and continue
-                try:
-                    log.warning("daily_indexer failed: %s", exc)
-                except:
-                    pass
-            await _aio.sleep(24 * 3600)  # Every 24h
-    try:
-        import asyncio as _asyncio_outer
-        _indexer_task = _asyncio_outer.create_task(_daily_indexer())
-    except Exception:
-        pass  # If task creation fails, bot still runs
+    # Daily auto-indexer: DISABLED (2026-11-01) - it was blocking the event
+    # loop on Render's 0.1 CPU box, causing the bot to stop responding to
+    # Telegram updates. The indexer uses synchronous requests which starve
+    # the polling loop. Re-enable only with a proper non-blocking design
+    # (separate process or thread pool).
+    # async def _daily_indexer():
+    #     import asyncio as _aio
+    #     await _aio.sleep(300)  # 5 min after startup
+    #     while True:
+    #         try:
+    #             from ..jobs.daily_indexer import run_indexer
+    #             await run_indexer(config.db_path)
+    #         except Exception as exc:
+    #             # Never crash the bot - just log and continue
+    #             try:
+    #                 log.warning("daily_indexer failed: %s", exc)
+    #             except:
+    #                 pass
+    #         await _aio.sleep(24 * 3600)  # Every 24h
+    # try:
+    #     import asyncio as _asyncio_outer
+    #     _indexer_task = _asyncio_outer.create_task(_daily_indexer())
+    # except Exception:
+    #     pass  # If task creation fails, bot still runs
+    import asyncio as _asyncio_outer  # noqa: F401 (kept for watchdog below)
 
     # --- Polling watchdog (root fix for "zombie" instances) ---
     # After a deploy, the new instance must actually start polling Telegram.
