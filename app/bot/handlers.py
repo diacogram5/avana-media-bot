@@ -304,6 +304,9 @@ def _main_reply_kb(conn, user_id: int | None = None,
 
     # Exact button layout from the reference design
     # Using the existing callback mappings
+    # NOTE (2026-11-01): trending button occupies the identify slot per user
+    # request. The identify feature itself is NOT deleted -- it remains
+    # available on video/audio cards via the identify button there.
     rows = [
         [
             InlineKeyboardButton(
@@ -318,10 +321,8 @@ def _main_reply_kb(conn, user_id: int | None = None,
                 text="📄 " + t("m_lyrics", ulang),
                 callback_data="menu:lyrics"),
             InlineKeyboardButton(
-                text=("🎛️ ساخت ریمیکس هوشمند 🧪" if _remix_active
-                      else "🎵 " + t("m_identify_music", ulang)),
-                callback_data=("remix:start" if _remix_active
-                               else "menu:file")),
+                text="🔥 " + t("m_trending", ulang),
+                callback_data="trending:open"),
         ],
         [
             InlineKeyboardButton(
@@ -706,6 +707,150 @@ async def menu_lyrics(callback, conn: sqlite3.Connection, config: Config, state:
     # leaves the user in lyr:await_query with no visible way back.
     await callback.message.answer(t("m_lyrics_prompt", ulang),
                                   reply_markup=_cancel_kb(ulang))
+
+
+# ---------------------------------------------------------------------------
+# Trending songs (Snaplytics daily chart)
+# ---------------------------------------------------------------------------
+
+_TRENDING_PER_PAGE = 10
+
+
+def _trending_page_kb(items: list[dict], page: int, total_pages: int,
+                      ulang: str):
+    """Build message text + inline keyboard for a trending page."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from datetime import datetime
+
+    start = page * _TRENDING_PER_PAGE
+    page_items = items[start:start + _TRENDING_PER_PAGE]
+
+    mv_icon = {"up": "↑", "down": "↓", "new": "🆕", "same": "▪️"}
+    lines = []
+    for it in page_items:
+        icon = mv_icon.get(it.get("movement", "same"), "▪️")
+        title = it["title"]
+        artist = it.get("artist", "")
+        if artist:
+            lines.append(f"{it['rank']}. {icon} <b>{title}</b> — {artist}")
+        else:
+            lines.append(f"{it['rank']}. {icon} <b>{title}</b> 🎙️")
+
+    # Last update date
+    _, fetched_at = __import__("app.bot.trending", fromlist=["load_trending"])\
+        .load_trending()
+    if fetched_at:
+        dt = datetime.fromtimestamp(fetched_at).strftime("%Y-%m-%d")
+    else:
+        dt = "—"
+
+    text = (
+        f"🔥 <b>{t('m_trending', ulang)}</b>\n"
+        f"📅 به‌روزرسانی: {dt}\n\n"
+        + "\n".join(lines)
+    )
+
+    # Buttons: page navigation + per-song search
+    kb_rows: list[list] = []
+    # Search buttons (2 per row)
+    btn_row: list = []
+    for it in page_items:
+        btn_row.append(InlineKeyboardButton(
+            text=f"🔍 {it['rank']}",
+            callback_data=f"trending:search:{it['rank']}"))
+        if len(btn_row) == 5:
+            kb_rows.append(btn_row)
+            btn_row = []
+    if btn_row:
+        kb_rows.append(btn_row)
+    # Pagination
+    nav: list = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ قبلی",
+                                       callback_data=f"trending:page:{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="بعدی ▶️",
+                                       callback_data=f"trending:page:{page+1}"))
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton(text="🏠 منوی اصلی",
+                                        callback_data="menu:main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+@router.callback_query(F.data == "trending:open")
+async def trending_open(callback, conn: sqlite3.Connection, config: Config):
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    await callback.answer("⏳ در حال دریافت...")
+    try:
+        from .trending import get_trending
+        items, fetched_at, _ = await get_trending()
+    except Exception:
+        items, fetched_at = [], 0
+    if not items:
+        await callback.message.answer(
+            "❌ در حال حاضر فهرست ترند در دسترس نیست. لطفاً بعداً تلاش کنید.")
+        return
+    total_pages = (len(items) + _TRENDING_PER_PAGE - 1) // _TRENDING_PER_PAGE
+    text, kb = _trending_page_kb(items, 0, total_pages, ulang)
+    await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("trending:page:"))
+async def trending_page(callback, conn: sqlite3.Connection, config: Config):
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    try:
+        page = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        page = 0
+    await callback.answer()
+    try:
+        from .trending import get_trending
+        items, fetched_at, _ = await get_trending()
+    except Exception:
+        items = []
+    if not items:
+        await callback.message.answer("❌ فهرست در دسترس نیست.")
+        return
+    total_pages = (len(items) + _TRENDING_PER_PAGE - 1) // _TRENDING_PER_PAGE
+    page = max(0, min(page, total_pages - 1))
+    text, kb = _trending_page_kb(items, page, total_pages, ulang)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb,
+                                         parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb,
+                                      parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("trending:search:"))
+async def trending_search(callback, conn: sqlite3.Connection, config: Config):
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    try:
+        rank = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        await callback.answer("❌", show_alert=True)
+        return
+    await callback.answer("🔍 در حال جست‌وجو...")
+    try:
+        from .trending import load_trending
+        items, _ = load_trending()
+        item = next((x for x in items if x["rank"] == rank), None)
+    except Exception:
+        item = None
+    if not item:
+        await callback.message.answer("❌ آهنگ پیدا نشد.")
+        return
+    query = item["title"]
+    if item.get("artist"):
+        query += " " + item["artist"]
+    # Use the existing song-search engine directly; no FSM state is set,
+    # so other conversations are unaffected.
+    try:
+        await _do_search(callback.message, conn, query, config=config)
+    except Exception as e:
+        await callback.message.answer(
+            "❌ خطا در جست‌وجو. لطفاً بعداً تلاش کنید.")
 
 
 @router.callback_query(F.data == "menu:history")
@@ -4150,6 +4295,14 @@ async def run_bot(config: Config) -> None:
                 log_event(log, "polling_health_ok")
 
     _heartbeat_task = _asyncio_outer.create_task(_heartbeat())
+
+    # Trending songs: refresh in background if stale (non-blocking).
+    # Uses run_in_executor internally; never blocks the event loop.
+    try:
+        from .trending import refresh_if_needed as _trending_refresh
+        _asyncio_outer.create_task(_trending_refresh())
+    except Exception as e:
+        log.warning("trending startup refresh not scheduled: %s", e)
 
     # Track last received update for the health endpoint
     _health["last_update"] = 0
