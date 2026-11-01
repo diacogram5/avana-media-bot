@@ -283,12 +283,23 @@ def _main_reply_kb(conn, user_id: int | None = None,
 
     # Admin beta: remix replaces the identify slot. Import guarded once.
     _remix_active = False
+    _remix_dbg = f"is_admin={is_admin}"
     if is_admin:
         try:
             from .remix import is_enabled as _remix_enabled
-            _remix_active = bool(_remix_enabled())
-        except Exception:
+            _en = bool(_remix_enabled())
+            _remix_dbg += f" import_ok=True enabled={_en}"
+            _remix_active = _en
+        except Exception as e:
+            _remix_dbg += f" import_ok=False err={type(e).__name__}:{e}"
             _remix_active = False
+    else:
+        _remix_dbg += " skipped(not admin)"
+    try:
+        log_event(log, "remix_menu_check", dbg=_remix_dbg, uid=str(user_id),
+                  active=_remix_active)
+    except Exception:
+        pass
 
     # Exact button layout from the reference design
     # Using the existing callback mappings
