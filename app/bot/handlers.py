@@ -4016,6 +4016,24 @@ def _owner_commands() -> list[BotCommand]:
     ]
 
 
+class _UpdateTracker:
+    """aiogram outer middleware: records timestamp of every update.
+
+    Used by the health monitor to know the bot is receiving Telegram
+    updates. Never raises.
+    """
+    def __init__(self, health: dict):
+        self._health = health
+
+    async def __call__(self, handler, event, data):
+        try:
+            import time as _t
+            self._health["last_update"] = _t.time()
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
 async def run_bot(config: Config) -> None:
     from ..db import init_db
 
@@ -4103,10 +4121,55 @@ async def run_bot(config: Config) -> None:
 
     _watchdog_task = _asyncio_outer.create_task(_polling_watchdog())
 
+    # --- Continuous polling health monitor ---
+    # The startup watchdog only verifies polling BEGAN. This monitor tracks
+    # ongoing health: it records the timestamp of every received Telegram
+    # update. If no update AND no activity is seen for too long while the
+    # process is alive, the event loop is likely blocked (e.g. by a sync
+    # operation) and we exit so Render restarts us.
+    # Note: long quiet periods are NORMAL for a bot (no users = no updates).
+    # So we only trigger when the loop itself appears blocked: we check
+    # that our own heartbeat task is running on schedule. If the heartbeat
+    # is delayed by more than 5 minutes, the loop is blocked.
+    _health = {"last_heartbeat": _time.time(), "blocked_detected": False}
+
+    async def _heartbeat():
+        while True:
+            await _asyncio_outer.sleep(60)
+            now = _time.time()
+            delay = now - _health["last_heartbeat"] - 60
+            _health["last_heartbeat"] = now
+            if delay > 300:  # heartbeat delayed >5min => loop was blocked
+                log_event(log, "event_loop_blocked",
+                          delay_sec=round(delay, 1),
+                          error="event loop blocked for >5min, exiting")
+                import os as _os
+                _os._exit(43)
+            # Log periodic health (every ~10 min) for diagnosability
+            if int(now) % 600 < 60:
+                log_event(log, "polling_health_ok")
+
+    _heartbeat_task = _asyncio_outer.create_task(_heartbeat())
+
+    # Track last received update for the health endpoint
+    _health["last_update"] = 0
+
+    async def _track_updates(*_a, **_k):
+        _health["last_update"] = time.time()
+    try:
+        # aiogram 3.x: register on every update via dispatcher event
+        dp.update.outer_middleware.register(
+            _UpdateTracker(_health))
+    except Exception:
+        pass
+
     # Catch TelegramConflictError (409): aiogram 3.x retries it forever,
     # which causes an infinite mutual-kill ping-pong when two instances
     # poll simultaneously during a deploy. Exit non-zero instead so
     # Render restarts and a single instance wins.
+    # IMPROVED: retry a few times first (the old instance gets SIGTERM
+    # from Render within seconds, so a new instance should survive brief
+    # conflicts instead of exiting immediately).
     try:
         from aiogram.exceptions import TelegramConflictError
     except ImportError:
@@ -4114,18 +4177,33 @@ async def run_bot(config: Config) -> None:
 
     try:
         if TelegramConflictError is not None:
-            try:
-                await dp.start_polling(bot)
-            except TelegramConflictError:
-                log_event(log, "polling_conflict_exit",
-                          error="another instance is polling; exiting")
-                import os as _os
-                _os._exit(3)
+            _conflict_retries = 0
+            while True:
+                try:
+                    await dp.start_polling(bot)
+                    break  # polling ended cleanly
+                except TelegramConflictError:
+                    _conflict_retries += 1
+                    log_event(log, "polling_conflict",
+                              retry=_conflict_retries,
+                              error="another instance is polling")
+                    if _conflict_retries >= 5:
+                        log_event(log, "polling_conflict_exit",
+                                  error="conflict persisted after 5 retries")
+                        import os as _os
+                        _os._exit(3)
+                    # Wait before retry; Render SIGTERMs the old instance
+                    # within seconds, so the new one usually wins.
+                    await _asyncio_outer.sleep(5)
         else:
             await dp.start_polling(bot)
     finally:
         try:
             _watchdog_task.cancel()
+        except Exception:
+            pass
+        try:
+            _heartbeat_task.cancel()
         except Exception:
             pass
         await bot.session.close()
