@@ -39,7 +39,7 @@ import time
 log = logging.getLogger("avana.remix")
 
 # Master switch for the beta feature. Set to False to disable completely.
-REMIX_BETA_ENABLED = True
+REMIX_BETA_ENABLED = False  # DISABLED 2026-11-01: OOM crashes on 512MB Render; stability priority
 
 # Beta limits (v2: full songs accepted, server-safe caps)
 MAX_FILES = 2
