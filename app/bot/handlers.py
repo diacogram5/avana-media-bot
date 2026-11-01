@@ -4084,8 +4084,26 @@ async def run_bot(config: Config) -> None:
 
     _watchdog_task = _asyncio_outer.create_task(_polling_watchdog())
 
+    # Catch TelegramConflictError (409): aiogram 3.x retries it forever,
+    # which causes an infinite mutual-kill ping-pong when two instances
+    # poll simultaneously during a deploy. Exit non-zero instead so
+    # Render restarts and a single instance wins.
     try:
-        await dp.start_polling(bot)
+        from aiogram.exceptions import TelegramConflictError
+    except ImportError:
+        TelegramConflictError = None
+
+    try:
+        if TelegramConflictError is not None:
+            try:
+                await dp.start_polling(bot)
+            except TelegramConflictError:
+                log_event(log, "polling_conflict_exit",
+                          error="another instance is polling; exiting")
+                import os as _os
+                _os._exit(3)
+        else:
+            await dp.start_polling(bot)
     finally:
         try:
             _watchdog_task.cancel()
