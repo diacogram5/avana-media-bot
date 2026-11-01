@@ -232,7 +232,8 @@ async def cmd_start(message: Message, conn: sqlite3.Connection, config: Config,
     except Exception:
         pass
     await _answer(message, conn, _with_signature(conn, config, welcome_text(conn, ulang)),
-                  reply_markup=_main_reply_kb(conn, uid))
+                  reply_markup=_main_reply_kb(conn, uid,
+                      is_admin=(config.owner_id is not None and uid == config.owner_id)))
 
 
 @router.callback_query(F.data.startswith("lang:set:"))
@@ -251,7 +252,8 @@ async def lang_set(callback, conn: sqlite3.Connection, config: Config):
         pass
     await _answer(callback.message, conn,
                   _with_signature(conn, config, welcome_text(conn, code)),
-                  reply_markup=_main_reply_kb(conn, uid))
+                  reply_markup=_main_reply_kb(conn, uid,
+                      is_admin=(config.owner_id is not None and uid == config.owner_id)))
 
 
 @router.callback_query(F.data == "lang:change")
@@ -262,7 +264,8 @@ async def lang_change(callback, conn: sqlite3.Connection, config: Config):
     await callback.answer()
 
 
-def _main_reply_kb(conn, user_id: int | None = None) -> InlineKeyboardMarkup:
+def _main_reply_kb(conn, user_id: int | None = None,
+                   is_admin: bool = False) -> InlineKeyboardMarkup:
     """Main menu as INLINE keyboard - matches the reference design exactly.
 
     Layout (2 columns):
@@ -270,6 +273,7 @@ def _main_reply_kb(conn, user_id: int | None = None) -> InlineKeyboardMarkup:
     Row 2: [متن آهنگ] [شناسایی موسیقی]
     Row 3: [تاریخچه جستجو] [درخواست آهنگ]
     Row 4: [راهنما و پشتیبانی] (full width)
+    Beta row (admin only): [🎛️ ساخت ریمیکس هوشمند] (full width)
     """
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     ulang = _user_lang(conn, user_id)
@@ -307,6 +311,17 @@ def _main_reply_kb(conn, user_id: int | None = None) -> InlineKeyboardMarkup:
                 callback_data="menu:help"),
         ],
     ]
+    # Beta: Smart Remix button - admin only, feature-flaggable
+    try:
+        from .remix import is_enabled as _remix_enabled
+        if is_admin and _remix_enabled():
+            rows.append([
+                InlineKeyboardButton(
+                    text="🎛️ ساخت ریمیکس هوشمند 🧪",
+                    callback_data="remix:start"),
+            ])
+    except Exception:
+        pass
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -324,7 +339,9 @@ async def _run_menu_toggle(message: Message, conn: sqlite3.Connection,
     else:
         status = t("m_menu_opened", ulang)
     await _answer(message, conn, status,
-                  reply_markup=_main_reply_kb(conn, message.from_user.id))
+                  reply_markup=_main_reply_kb(conn, message.from_user.id,
+                      is_admin=bool(config and config.owner_id is not None
+                                    and message.from_user.id == config.owner_id)))
 
 
 def _menu_callback(key: str) -> str | None:
@@ -383,6 +400,106 @@ async def menu_file_hint(callback, conn: sqlite3.Connection, config: Config):
     await callback.answer()
     await callback.message.answer(
         t("m_file_hint", ulang))
+
+
+# ---------------------------------------------------------------------------
+# Smart Remix beta (admin only). All logic lives in app/bot/remix.py;
+# these handlers only wire the Telegram flow.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "remix:start")
+async def remix_start(callback, conn: sqlite3.Connection, config: Config,
+                      state: FSMContext):
+    """Admin-only entry point for the Smart Remix beta."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from .remix import is_enabled, is_locked
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    await callback.answer()
+    uid = callback.from_user.id
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return
+    if not is_enabled():
+        await callback.message.answer("🧪 نسخه آزمایشی ریمیکس فعلاً غیرفعال است.")
+        return
+    if is_locked():
+        await callback.message.answer(
+            "⏳ یک ریمیکس در حال ساخت است. لطفاً بعد از اتمام دوباره تلاش کنید.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 ارسال فایل صوتی",
+                              callback_data="remix:method:file")],
+        [InlineKeyboardButton(text="🔍 جستجو با نام آهنگ/خواننده",
+                              callback_data="remix:method:search")],
+        [InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel")],
+    ])
+    await callback.message.answer(
+        "🎛️ <b>ساخت ریمیکس هوشمند</b> (نسخه آزمایشی)\n\n"
+        "روش سفارش را انتخاب کنید:",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "remix:method:file")
+async def remix_method_file(callback, conn: sqlite3.Connection, config: Config,
+                            state: FSMContext):
+    """Method 1: user uploads 2 audio files."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    await callback.answer()
+    uid = callback.from_user.id
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return
+    await state.set_state("remix:await_file1")
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel"),
+    ]])
+    await callback.message.answer(
+        "📤 <b>روش ارسال فایل</b>\n\n"
+        "🎵 لطفاً <b>فایل صوتی اول</b> را ارسال کنید.\n"
+        "• حداکثر ۶۰ ثانیه\n"
+        "• فرمت: MP3 / WAV / OGG",
+        parse_mode="HTML", reply_markup=cancel_kb)
+
+
+@router.callback_query(F.data == "remix:method:search")
+async def remix_method_search(callback, conn: sqlite3.Connection, config: Config,
+                              state: FSMContext):
+    """Method 2: user types song/artist names, bot searches."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    await callback.answer()
+    uid = callback.from_user.id
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return
+    await state.set_state("remix:await_names")
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel"),
+    ]])
+    await callback.message.answer(
+        "🔍 <b>روش جستجو با نام</b>\n\n"
+        "نام <b>دو آهنگ</b> یا <b>دو خواننده</b> را بنویسید.\n"
+        "هر کدام را در یک خط جدا بنویسید:\n\n"
+        "<i>مثال:</i>\n"
+        "Ebi - Ghorbat\n"
+        "Googoosh - Ageh Bemooni\n\n"
+        "⚠️ فقط آهنگ‌هایی که فایل کامل قابل دانلود داشته باشند "
+        "وارد ریمیکس می‌شوند.",
+        parse_mode="HTML", reply_markup=cancel_kb)
+
+
+@router.callback_query(F.data == "remix:cancel")
+async def remix_cancel(callback, conn: sqlite3.Connection, config: Config,
+                       state: FSMContext):
+    """Cancel the remix flow and clean up temp files."""
+    import shutil
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    await callback.answer()
+    try:
+        data = await state.get_data()
+        tmpdir = data.get("remix_tmpdir")
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        await state.clear()
+    except Exception:
+        pass
+    await callback.message.answer("❌ ساخت ریمیکس لغو شد.")
 
 
 async def _run_menu_title(message: Message, conn: sqlite3.Connection,
@@ -521,7 +638,9 @@ async def menu_main(callback, conn: sqlite3.Connection, config: Config,
             pass
     await callback.message.answer(
         _with_signature(conn, config, welcome_text(conn)),
-        reply_markup=_main_reply_kb(conn, callback.from_user.id))
+        reply_markup=_main_reply_kb(conn, callback.from_user.id,
+            is_admin=(config.owner_id is not None
+                      and callback.from_user.id == config.owner_id)))
 
 
 def _cancel_kb(lang: str = "fa") -> InlineKeyboardMarkup:
@@ -547,7 +666,9 @@ async def flow_cancel(callback, conn: sqlite3.Connection, config: Config,
             pass
     await callback.message.answer(
         t("m_cancel_done", ulang),
-        reply_markup=_main_reply_kb(conn, callback.from_user.id))
+        reply_markup=_main_reply_kb(conn, callback.from_user.id,
+            is_admin=(config.owner_id is not None
+                      and callback.from_user.id == config.owner_id)))
 
 
 @router.callback_query(F.data == "menu:search")
@@ -2277,6 +2398,288 @@ async def search_next(callback, conn: sqlite3.Connection, config: Config):
     await callback.answer()
 
 
+async def _remix_handle_names(message: Message, conn: sqlite3.Connection,
+                              config: Config, state: FSMContext,
+                              text: str) -> None:
+    """Handle song/artist names for remix method 2.
+
+    Parses 2 lines, searches each via the existing search engine,
+    and shows selectable results for user confirmation.
+    """
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    uid = getattr(getattr(message, "from_user", None), "id", None)
+    if not (config.owner_id is not None and uid == config.owner_id):
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        return
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    # Also accept comma-separated on one line
+    if len(lines) == 1 and "," in lines[0]:
+        lines = [p.strip() for p in lines[0].split(",") if p.strip()]
+    if len(lines) < 2:
+        await message.answer(
+            "❌ لطفاً نام <b>دو</b> آهنگ یا خواننده را بنویسید "
+            "(هر کدام در یک خط).",
+            parse_mode="HTML")
+        return
+    # Beta limit: exactly 2
+    lines = lines[:2]
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel"),
+    ]])
+    await message.answer("🔍 در حال جستجوی آهنگ‌ها...", reply_markup=cancel_kb)
+
+    # Search each query with the existing engine (iTunes + Deezer)
+    from ..search import SearchEngine
+    from ..search.itunes import ITunesProvider
+    from ..search.deezer import DeezerProvider
+    from ..search.smart import smart_search
+
+    all_options = []  # list of (query_idx, title, artist)
+    try:
+        engine = SearchEngine([ITunesProvider(entity="song"),
+                               DeezerProvider()])
+        for qi, q in enumerate(lines):
+            try:
+                results, _variant = await smart_search(engine, q, limit=5)
+            except Exception:
+                results = []
+            for r in results[:4]:
+                title = getattr(r, "title", "") or ""
+                artist = getattr(r, "artist", "") or ""
+                if title:
+                    all_options.append((qi, title.strip(), artist.strip()))
+    except Exception as e:
+        await message.answer(f"❌ خطا در جستجو: {e}")
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        return
+
+    if not all_options:
+        await message.answer(
+            "❌ آهنگی پیدا نشد. نام دیگری امتحان کنید.",
+            reply_markup=cancel_kb)
+        return
+
+    # Deduplicate
+    seen = set()
+    uniq = []
+    for qi, title, artist in all_options:
+        key = (title.lower(), artist.lower())
+        if key not in seen:
+            seen.add(key)
+            uniq.append((qi, title, artist))
+    all_options = uniq[:8]
+
+    # Store options in state for the selection callback
+    try:
+        await state.update_data(
+            remix_search_options=[
+                {"qi": qi, "title": t, "artist": a}
+                for qi, t, a in all_options
+            ],
+            remix_queries=lines,
+        )
+        await state.set_state("remix:await_select")
+    except Exception:
+        pass
+
+    # Build selection keyboard: one button per option
+    rows = []
+    for idx, (qi, title, artist) in enumerate(all_options):
+        label = f"{title}" + (f" - {artist}" if artist else "")
+        if len(label) > 40:
+            label = label[:37] + "..."
+        rows.append([InlineKeyboardButton(
+            text=f"🎵 {label}",
+            callback_data=f"remix:pick:{idx}")])
+    rows.append([InlineKeyboardButton(text="❌ لغو",
+                                      callback_data="remix:cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    qlist = "\n".join(f"{i+1}. {q}" for i, q in enumerate(lines))
+    await message.answer(
+        "🎵 <b>نتایج جستجو:</b>\n"
+        f"<i>برای:</i>\n{qlist}\n\n"
+        "دو آهنگ موردنظر را یکی‌یکی انتخاب کنید "
+        "(اول آهنگ اول، بعد آهنگ دوم):",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("remix:pick:"))
+async def remix_pick(callback, conn: sqlite3.Connection, config: Config,
+                     state: FSMContext):
+    """User picks a song from search results. Two picks -> confirm screen."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    await callback.answer()
+    uid = callback.from_user.id
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return
+    try:
+        idx = int(callback.data.split(":")[-1])
+        data = await state.get_data()
+    except Exception:
+        return
+    options = data.get("remix_search_options") or []
+    if idx < 0 or idx >= len(options):
+        return
+    picked = data.get("remix_picked") or []
+    choice = options[idx]
+    # Avoid duplicates
+    if any(p["title"] == choice["title"] and p["artist"] == choice["artist"]
+           for p in picked):
+        await callback.message.answer("⚠️ این آهنگ قبلاً انتخاب شده.")
+        return
+    picked.append(choice)
+    try:
+        await state.update_data(remix_picked=picked)
+    except Exception:
+        pass
+
+    if len(picked) < 2:
+        await callback.message.answer(
+            f"✅ انتخاب شد: <b>{choice['title']}</b>"
+            + (f" - {choice['artist']}" if choice["artist"] else "")
+            + "\n\nحالا <b>آهنگ دوم</b> را انتخاب کنید.",
+            parse_mode="HTML")
+        return
+
+    # Two picked -> show confirmation with download check
+    await callback.message.answer("⏳ در حال بررسی فایل‌های قابل دانلود...")
+    from ..search.fullsong import find_full_song_file
+
+    ready = []
+    missing = []
+    for p in picked:
+        try:
+            found = await find_full_song_file(p["artist"] or "", p["title"])
+        except Exception:
+            found = None
+        if found and found.get("data"):
+            ready.append({**p, "ext": found.get("ext", ".mp3"),
+                          "duration": found.get("duration_sec", 0)})
+        else:
+            missing.append(p)
+
+    if missing:
+        names = ", ".join(
+            f"{m['title']}" + (f" ({m['artist']})" if m["artist"] else "")
+            for m in missing)
+        await callback.message.answer(
+            "⚠️ فایل کامل این آهنگ(ها) پیدا نشد و وارد ریمیکس نمی‌شود:\n"
+            f"<i>{names}</i>\n\n"
+            "لطفاً آهنگ دیگری انتخاب کنید.",
+            parse_mode="HTML")
+        # Reset picks so the user can choose again
+        try:
+            await state.update_data(remix_picked=[])
+            await state.set_state("remix:await_select")
+        except Exception:
+            pass
+        return
+
+    try:
+        await state.update_data(remix_ready=ready)
+        await state.set_state("remix:await_confirm")
+    except Exception:
+        pass
+
+    rows = [[
+        InlineKeyboardButton(text="✅ تأیید و ساخت ریمیکس",
+                             callback_data="remix:confirm"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel"),
+    ]]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    desc = "\n".join(
+        f"{i+1}. <b>{r['title']}</b>"
+        + (f" - {r['artist']}" if r["artist"] else "")
+        + f" ({r['duration']:.0f} ثانیه)"
+        for i, r in enumerate(ready))
+    await callback.message.answer(
+        "🎛️ <b>تأیید نهایی</b>\n\n"
+        f"{desc}\n\n"
+        "آیا این دو آهنگ وارد موتور ریمیکس شوند؟",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "remix:confirm")
+async def remix_confirm(callback, conn: sqlite3.Connection, config: Config,
+                        state: FSMContext):
+    """User confirmed: download the 2 files and run the same remix engine."""
+    import os
+    import tempfile
+
+    await callback.answer()
+    uid = callback.from_user.id
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return
+    try:
+        data = await state.get_data()
+    except Exception:
+        return
+    ready = data.get("remix_ready") or []
+    if len(ready) < 2:
+        await callback.message.answer("❌ اطلاعات آهنگ‌ها ناقص است.")
+        return
+
+    from ..search.fullsong import find_full_song_file
+    from .remix import MAX_DURATION_SEC, is_locked
+
+    if is_locked():
+        await callback.message.answer(
+            "⏳ یک ریمیکس در حال ساخت است. لطفاً بعداً تلاش کنید.")
+        return
+
+    await callback.message.answer("📥 در حال دانلود فایل‌های صوتی...")
+    tmpdir = tempfile.mkdtemp(prefix="remix_tg_")
+    paths = []
+    try:
+        for i, r in enumerate(ready[:2]):
+            found = await find_full_song_file(r["artist"] or "", r["title"])
+            if not found or not found.get("data"):
+                raise RuntimeError(
+                    f"فایل «{r['title']}» قابل دانلود نیست.")
+            dur = found.get("duration_sec", 0) or 0
+            if dur > MAX_DURATION_SEC:
+                raise RuntimeError(
+                    f"«{r['title']}» طولانی‌تر از {MAX_DURATION_SEC} ثانیه "
+                    f"است ({dur:.0f} ثانیه).")
+            ext = found.get("ext", ".mp3") or ".mp3"
+            p = os.path.join(tmpdir, f"search{i+1}{ext}")
+            with open(p, "wb") as f:
+                f.write(found["data"])
+            paths.append(p)
+    except Exception as e:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        await callback.message.answer(f"❌ خطا در دانلود: {e}")
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        return
+
+    try:
+        await state.update_data(remix_tmpdir=tmpdir)
+        await state.set_state("remix:processing")
+    except Exception:
+        pass
+    await callback.message.answer(
+        "🎛️ ساخت ریمیکس شروع شد...",
+        parse_mode="HTML")
+    asyncio.create_task(
+        _remix_run_job(callback.message, conn, config, state,
+                       paths[0], paths[1], tmpdir))
+
+
 @router.message(F.text)
 async def text_handler(message: Message, conn: sqlite3.Connection, config: Config, state: FSMContext | None = None):
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
@@ -2317,6 +2720,9 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         except Exception:
             pass
         await _run_lyrics_search(message, conn, text, config)
+        return
+    if current_state == "remix:await_names":
+        await _remix_handle_names(message, conn, config, state, text)
         return
     if current_state == "audio_id:await_file":
         # Waiting for a file: plain text is neither consumed as a search
@@ -2496,6 +2902,243 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
     await _do_search(message, conn, query, config=config)
 
 
+async def _remix_collect_audio(message: Message, conn: sqlite3.Connection,
+                               config: Config, state: FSMContext,
+                               current_state: str) -> bool:
+    """Collect the 2 audio files for the Smart Remix beta.
+
+    Returns True if the message was consumed by the remix flow.
+    Only the owner can use this; anyone else is ignored (returns False
+    so the normal flow continues untouched).
+    """
+    import os
+    import shutil
+    import tempfile
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    uid = getattr(getattr(message, "from_user", None), "id", None)
+    if not (config.owner_id is not None and uid == config.owner_id):
+        return False
+    try:
+        from .remix import MAX_DURATION_SEC, is_enabled, probe_duration
+    except Exception:
+        return False
+    if not is_enabled():
+        return False
+
+    audio = message.audio
+    doc = message.document
+    file_obj = audio or doc
+    if file_obj is None:
+        await message.answer(
+            "🎵 لطفاً یک فایل صوتی ارسال کنید (MP3 / WAV / OGG).")
+        return True
+
+    # Basic validation: mime / extension
+    name = (getattr(file_obj, "file_name", "") or "").lower()
+    mime = (getattr(doc, "mime_type", "") or "").lower() if doc else "audio/mpeg"
+    ok_ext = name.endswith((".mp3", ".wav", ".ogg", ".m4a", ".flac"))
+    ok_mime = mime.startswith("audio/") or ok_ext
+    if not ok_mime and not ok_ext:
+        await message.answer("❌ فرمت پشتیبانی نمی‌شود. MP3 / WAV / OGG بفرستید.")
+        return True
+    size_mb = (file_obj.file_size or 0) / 1024 / 1024
+    if size_mb > 15:
+        await message.answer("❌ فایل خیلی بزرگ است (حداکثر ۱۵ مگابایت).")
+        return True
+
+    # Download to a per-user temp dir
+    try:
+        data = await state.get_data()
+    except Exception:
+        data = {}
+    tmpdir = data.get("remix_tmpdir")
+    if not tmpdir or not os.path.isdir(tmpdir):
+        tmpdir = tempfile.mkdtemp(prefix="remix_tg_")
+        try:
+            await state.update_data(remix_tmpdir=tmpdir)
+        except Exception:
+            pass
+
+    slot = "file1" if current_state == "remix:await_file1" else "file2"
+    ext = os.path.splitext(name)[1] or ".mp3"
+    dest = os.path.join(tmpdir, f"{slot}{ext}")
+    try:
+        tg_file = await message.bot.get_file(file_obj.file_id)
+        await message.bot.download_file(tg_file.file_path, dest)
+    except Exception as e:
+        await message.answer(f"❌ خطا در دریافت فایل: {e}")
+        return True
+
+    # Duration check
+    try:
+        dur = probe_duration(dest)
+    except Exception as e:
+        await message.answer(f"❌ فایل صوتی خوانده نشد: {e}")
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
+        return True
+    if dur > MAX_DURATION_SEC:
+        await message.answer(
+            f"❌ مدت فایل {dur:.0f} ثانیه است. حداکثر {MAX_DURATION_SEC} ثانیه مجاز است.")
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
+        return True
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="remix:cancel"),
+    ]])
+
+    if current_state == "remix:await_file1":
+        try:
+            await state.update_data(remix_file1=dest)
+            await state.set_state("remix:await_file2")
+        except Exception:
+            pass
+        await message.answer(
+            f"✅ فایل اول دریافت شد ({dur:.0f} ثانیه).\n\n"
+            "🎵 حالا <b>فایل صوتی دوم</b> را ارسال کنید.",
+            parse_mode="HTML", reply_markup=cancel_kb)
+        return True
+
+    # Second file received -> start background remix job
+    try:
+        data = await state.get_data()
+    except Exception:
+        data = {}
+    file1 = data.get("remix_file1")
+    if not file1 or not os.path.exists(file1):
+        await message.answer("❌ فایل اول پیدا نشد. از اول شروع کنید.",
+                             reply_markup=cancel_kb)
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        return True
+    try:
+        await state.set_state("remix:processing")
+    except Exception:
+        pass
+    await message.answer(
+        f"✅ فایل دوم دریافت شد ({dur:.0f} ثانیه).\n\n"
+        "🎛️ ساخت ریمیکس شروع شد...",
+        parse_mode="HTML")
+    # Fire-and-forget background task; the bot stays responsive.
+    asyncio.create_task(
+        _remix_run_job(message, conn, config, state, file1, dest, tmpdir))
+    return True
+
+
+async def _remix_run_job(message: Message, conn: sqlite3.Connection,
+                         config: Config, state: FSMContext,
+                         file1: str, file2: str, tmpdir: str) -> None:
+    """Background remix job: status updates + final MP3 delivery."""
+    import shutil
+    from aiogram.types import FSInputFile
+
+    uid = getattr(getattr(message, "from_user", None), "id", None)
+    ulang = _user_lang(conn, uid)
+    status_msg = None
+
+    async def _say(text: str):
+        nonlocal status_msg
+        try:
+            if status_msg is None:
+                status_msg = await message.answer(text, parse_mode="HTML")
+            else:
+                await status_msg.edit_text(text, parse_mode="HTML")
+        except Exception:
+            try:
+                status_msg = await message.answer(text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    # Bridge sync progress callbacks from remix.py into async status edits.
+    # The executor thread cannot await, so we schedule coroutines.
+    loop = asyncio.get_running_loop()
+
+    def _progress(stage: str, detail):
+        try:
+            if stage == "validate":
+                txt = "📥 <b>دریافت فایل‌ها</b> ✅\n🔍 در حال تحلیل موسیقی..."
+            elif stage == "analyze1":
+                txt = ("📥 دریافت فایل‌ها ✅\n"
+                       "🔍 تحلیل آهنگ اول... (تشخیص ریتم و کلید)")
+            elif stage == "analyze2":
+                i1 = detail or {}
+                txt = ("📥 دریافت فایل‌ها ✅\n"
+                       f"🔍 آهنگ اول: {i1.get('bpm', 0):.0f} BPM ✅\n"
+                       "🔍 تحلیل آهنگ دوم... (تشخیص ریتم و کلید)")
+            elif stage == "mix":
+                i1, i2 = detail or ({}, {})
+                txt = ("📥 دریافت فایل‌ها ✅\n"
+                       f"🔍 تحلیل موسیقی ✅ ({i1.get('bpm', 0):.0f} / "
+                       f"{i2.get('bpm', 0):.0f} BPM)\n"
+                       "🎚️ هماهنگ‌سازی سرعت آهنگ‌ها...")
+            elif stage == "sync":
+                txt = ("📥 دریافت فایل‌ها ✅\n🔍 تحلیل موسیقی ✅\n"
+                       f"🎚️ هماهنگ‌سازی سرعت... (ضریب {detail:.2f})")
+            elif stage == "xfade":
+                txt = ("📥 دریافت فایل‌ها ✅\n🔍 تحلیل موسیقی ✅\n"
+                       "🎚️ هماهنگ‌سازی ✅\n🎛️ ساخت ریمیکس (انتقال نرم)...")
+            else:
+                return
+            asyncio.run_coroutine_threadsafe(_say(txt), loop)
+        except Exception:
+            pass
+
+    out_path = os.path.join(tmpdir, "remix_final.mp3")
+    t0 = asyncio.get_event_loop().time()
+    try:
+        from .remix import run_remix_job
+        result = await run_remix_job(file1, file2, out_path, _progress)
+    except Exception as e:
+        await _say(f"❌ <b>خطا در ساخت ریمیکس:</b>\n{str(e)[:300]}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            await state.clear()
+        except Exception:
+            pass
+        return
+
+    total = result.get("total_sec", 0)
+    await _say("📦 آماده‌سازی خروجی...")
+
+    # Deliver the real MP3
+    try:
+        caption = (
+            "🎛️ <b>ریمیکس هوشمند آماده شد!</b> 🧪\n\n"
+            f"🎵 آهنگ ۱: {result.get('bpm1', 0):.0f} BPM "
+            f"({result['info1'].get('key', '?')} {result['info1'].get('scale', '')})\n"
+            f"🎵 آهنگ ۲: {result.get('bpm2', 0):.0f} BPM "
+            f"({result['info2'].get('key', '?')} {result['info2'].get('scale', '')})\n"
+            f"⏱️ زمان پردازش: {total:.0f} ثانیه\n"
+            f"💾 حجم: {result.get('size_mb', 0)} مگابایت\n\n"
+            "@AvanoMediaBot"
+        )
+        await message.answer_audio(
+            FSInputFile(out_path, filename="avano_remix.mp3"),
+            caption=caption, parse_mode="HTML",
+            title="Avano Smart Remix (Beta)")
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        await _say(f"❌ خطا در ارسال فایل: {e}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            await state.clear()
+        except Exception:
+            pass
+
+
 @router.message(F.video | F.audio | F.voice | F.document)
 async def media_handler(message: Message, conn: sqlite3.Connection, config: Config,
                         state: FSMContext):
@@ -2538,6 +3181,12 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         current_state = await state.get_state()
     except Exception:
         current_state = None
+    # --- Smart Remix beta: intercept audio files for the remix flow ---
+    if current_state in ("remix:await_file1", "remix:await_file2"):
+        handled = await _remix_collect_audio(message, conn, config, state,
+                                             current_state)
+        if handled:
+            return
     if current_state == "audio_id:await_file":
         # The «شناسایی موسیقی از فایل» button armed this wait: the file the
         # user just sent IS the identification request. Clear the wait and

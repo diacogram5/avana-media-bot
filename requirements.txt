@@ -12,3 +12,6 @@ rapidfuzz>=3.0
 # Turso (libsql) client for persistent URL cache - survives Render restarts
 # Optional: if not configured, bot falls back to local SQLite cache
 libsql-experimental>=0.0.50
+# Essentia: fast music analysis (BPM, key) for the Smart Remix beta.
+# Much lighter/faster than librosa on the 512MB Render free tier.
+essentia>=2.1b6
