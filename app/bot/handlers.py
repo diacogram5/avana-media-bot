@@ -3162,13 +3162,28 @@ async def _remix_run_job(message: Message, conn: sqlite3.Connection,
                     f"آهنگ ۲: بخش {s2['start']:.0f}–{s2['start']+s2['len']:.0f} "
                     f"از {s2['orig_dur']:.0f} ثانیه")
             sec_note = "✂️ " + " | ".join(parts) + "\n"
+
+        # Pro engine details
+        pro_note = ""
+        if result.get("beat_aligned"):
+            pro_note += "🥁 هماهنگی ضرب: ✅\n"
+        xfade = result.get("xfade_sec")
+        if xfade:
+            pro_note += f"🔀 انتقال: {xfade:.0f} ثانیه\n"
+        kc = result.get("key_check") or {}
+        if kc.get("trusted") and kc.get("compatible") is False:
+            pro_note += f"⚠️ {kc.get('detail', '')}\n"
+        val = result.get("validation") or {}
+        if val.get("lufs") is not None:
+            pro_note += f"🔊 بلندی: {val['lufs']:.1f} LUFS\n"
+
         caption = (
             "🎛️ <b>ریمیکس هوشمند آماده شد!</b> 🧪\n\n"
             f"🎵 آهنگ ۱: {result.get('bpm1', 0):.0f} BPM "
             f"({result['info1'].get('key', '?')} {result['info1'].get('scale', '')})\n"
             f"🎵 آهنگ ۲: {result.get('bpm2', 0):.0f} BPM "
             f"({result['info2'].get('key', '?')} {result['info2'].get('scale', '')})\n"
-            + sec_note +
+            + sec_note + pro_note +
             f"⏱️ زمان پردازش: {total:.0f} ثانیه\n"
             f"💾 حجم: {result.get('size_mb', 0)} مگابایت\n\n"
             "@AvanoMediaBot"
