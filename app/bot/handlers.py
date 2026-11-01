@@ -2809,17 +2809,18 @@ async def _run_suggest_body(message, conn, text: str, config):
                                           callback_data="sg:retry"))
     kb_rows.append(extra_row)
 
-    # Send the "آهنگ درخواستی شما" banner as part of the results message (user requirement 2026-11-01)
-    # Banner is only for the song-request (suggest) feature.
-    # No caption -> banner flows directly into buttons (integrated look).
+    # Send the "آهنگ درخواستی شما" banner as a SEPARATE floating message above (user requirement 2026-11-01)
+    # Then the results with buttons in a second message.
     try:
         from aiogram.types import FSInputFile
         from pathlib import Path
         _banner = Path(__file__).parent.parent / "assets" / "suggest_banner_nobg.png"
         if _banner.exists():
-            await message.answer_photo(
-                FSInputFile(str(_banner)),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+            # 1. Banner as separate floating message
+            await message.answer_photo(FSInputFile(str(_banner)))
+            # 2. Results with buttons
+            await _answer(message, conn, "\n".join(lines),
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
         else:
             # Fallback to text list if banner missing
             await _answer(message, conn, "\n".join(lines),
