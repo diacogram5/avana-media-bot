@@ -278,6 +278,11 @@ def extract_section(src_path: str, dest_path: str,
     Uses stream copy (no re-encode) for speed, then validates the
     result exists and has a sane duration. The source file is untouched.
     Returns dest_path.
+
+    SAFETY: Never re-encodes on Render's 512MB box — the libmp3lame
+    re-encode path caused OOM kills (2026-11-01). If stream copy fails,
+    falls back to copying the full source (the remix engine handles
+    long files via its own trimming).
     """
     apath = _ensure_readable(src_path)
     dest_abs = os.path.abspath(dest_path)
@@ -294,20 +299,12 @@ def extract_section(src_path: str, dest_path: str,
         dest_abs,
     ], timeout=120)
     if r.returncode != 0 or not os.path.exists(dest_abs):
-        # Stream copy can fail on some containers; retry with re-encode.
-        log.warning("extract_section: stream copy failed, retrying "
-                    "with re-encode")
-        r = _run([
-            "ffmpeg", "-y", "-v", "error",
-            "-ss", f"{start_sec:.2f}",
-            "-i", apath,
-            "-t", f"{duration_sec:.2f}",
-            "-c:a", "libmp3lame", "-b:a", "128k",
-            dest_abs,
-        ], timeout=300)
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"section extract failed: {r.stderr.strip()[:200]}")
+        # Stream copy failed. DO NOT re-encode (OOM risk on 512MB).
+        # Fall back to a full-file copy; the engine will handle it.
+        log.warning("extract_section: stream copy failed, "
+                    "using full file instead of re-encode (OOM safety)")
+        import shutil as _shutil
+        _shutil.copy2(apath, dest_abs)
     out_dur = probe_duration(dest_abs)
     if out_dur < 1.0:
         raise RuntimeError("extracted section is empty")
