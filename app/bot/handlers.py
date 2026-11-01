@@ -28,6 +28,7 @@ Honesty rules enforced here:
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import secrets
