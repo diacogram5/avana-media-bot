@@ -2571,7 +2571,19 @@ async def _do_search(message: Message, conn, query: str, include_video: bool = T
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     if not rate_limiter.allow(f"search:{message.from_user.id}", 10, 60):
         await _answer(message, conn, t("m_rate_wait", ulang)); return
-    await _answer(message, conn, t("searching", ulang))
+    # Temporary "searching" message -- deleted after results are sent.
+    _searching_msg = None
+    try:
+        _searching_msg = await _answer(message, conn, t("searching", ulang))
+    except Exception:
+        pass
+
+    async def _del_searching():
+        if _searching_msg is not None:
+            try:
+                await _searching_msg.delete()
+            except Exception:
+                pass
     providers = [ITunesProvider(entity="song"), DeezerProvider()]
     if include_video:
         providers.append(ITunesProvider(entity="musicVideo"))
@@ -2593,6 +2605,7 @@ async def _do_search(message: Message, conn, query: str, include_video: bool = T
     dbmod.record_search(conn, message.from_user.id, query, ok=bool(results))
     if not results:
         await _no_results_with_channel(message, conn, query, config)
+        await _del_searching()
         return
     text = format_results(results, page=1)
     kb = None
@@ -2600,6 +2613,7 @@ async def _do_search(message: Message, conn, query: str, include_video: bool = T
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=t("m_next_page", ulang), callback_data=_cb_query(query, prefix="search:next:"))]])
     await _answer(message, conn, text, reply_markup=kb)
+    await _del_searching()
     song = next((r for r in results if r.kind == "music"), None)
     if song is not None:
         key = profeat.remember_result(song.title, song.artist, song.url, song.preview_url)
@@ -4178,7 +4192,18 @@ async def _run_lyrics_search(message: Message, conn, text: str, config):
                 artist, title = left.strip(), right.strip()
                 break
     dbmod.record_search(conn, message.from_user.id, query, source="lyrics", ok=True)
-    await _answer(message, conn, t("searching", ulang))
+    _lyr_searching = None
+    try:
+        _lyr_searching = await _answer(message, conn, t("searching", ulang))
+    except Exception:
+        pass
+
+    async def _del_lyr_searching():
+        if _lyr_searching is not None:
+            try:
+                await _lyr_searching.delete()
+            except Exception:
+                pass
     try:
         lyrics, source, responded = await fetch_lyrics_with_source(title, artist)
     except Exception:
@@ -4188,6 +4213,7 @@ async def _run_lyrics_search(message: Message, conn, text: str, config):
             await _answer(message, conn, t("m_lyrics_src_down", ulang))
         else:
             await _answer(message, conn, lyrics_not_found_text(query))
+        await _del_lyr_searching()
         return
     key = profeat.remember_result(title, artist, "", "")
     LYRICS_CACHE[key] = (title, artist, lyrics)
@@ -4195,6 +4221,7 @@ async def _run_lyrics_search(message: Message, conn, text: str, config):
     header = f"📝 متن آهنگ «{title}»" + (f" — {artist}" if artist else "")
     src = f"\nمنبع: {source}" if source else ""
     await _answer(message, conn, f"{header}\n\n{lyrics[:3500]}{src}", reply_markup=kb)
+    await _del_lyr_searching()
 
 
 def build_dispatcher(conn: sqlite3.Connection, config: Config) -> Dispatcher:
