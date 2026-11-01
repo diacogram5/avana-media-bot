@@ -14,4 +14,6 @@ rapidfuzz>=3.0
 libsql-experimental>=0.0.50
 # Essentia: fast music analysis (BPM, key) for the Smart Remix beta.
 # Much lighter/faster than librosa on the 512MB Render free tier.
-essentia>=2.1b6
+# NOTE: only pre-release dev wheels exist on PyPI (no stable 2.1b6),
+# so pin the exact dev version; a >= specifier will NOT resolve.
+essentia==2.1b6.dev1389
