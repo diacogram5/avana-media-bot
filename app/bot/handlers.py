@@ -47,6 +47,14 @@ from aiogram.types import (
 
 from .. import db as dbmod
 from ..bot.audio_send import send_song_audio
+# NEW (2026-11-03): story clips — independent module. Guarded import so a
+# module bug can never break existing handlers or the main menu.
+try:
+    from .story_clips import register_story_handlers as _register_story_handlers
+    from .story_clips import story_button_row as _story_button_row
+    _STORY_CLIPS_OK = True
+except Exception:
+    _STORY_CLIPS_OK = False
 from ..bot.media_send import (
     answer_no_preview, has_audio_stream, probe_audio, send_music, send_video,
     transcode_mp3,
@@ -93,6 +101,14 @@ from .logic import (
 
 log = get_logger(__name__)
 router = Router()
+
+# NEW (2026-11-03): story-clips callbacks live in the independent
+# app/bot/story_clips.py module. Guarded: never breaks existing handlers.
+if _STORY_CLIPS_OK:
+    try:
+        _register_story_handlers(router)
+    except Exception as _e:
+        log.warning("story_clips handlers not registered: %s", _e)
 
 
 def _new_request_id() -> str:
@@ -349,6 +365,13 @@ def _main_reply_kb(conn, user_id: int | None = None,
                 callback_data="menu:help"),
         ],
     ]
+    # NEW (2026-11-03): story clips button — one row from the independent
+    # module, inserted before Help. Guarded; menu works without it.
+    if _STORY_CLIPS_OK:
+        try:
+            rows.insert(-1, _story_button_row())
+        except Exception:
+            pass
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4449,6 +4472,14 @@ async def run_bot(config: Config) -> None:
         _asyncio_outer.create_task(_kabo_startup())
     except Exception as e:
         log.warning("kabo startup refresh not scheduled: %s", e)
+
+    # Story clips: periodic cache refresh (non-blocking, independent module).
+    # Same guarded pattern — a failure here never affects other features.
+    try:
+        from .story_clips import refresh_loop as _story_refresh_loop
+        _asyncio_outer.create_task(_story_refresh_loop())
+    except Exception as e:
+        log.warning("story_clips refresh not scheduled: %s", e)
 
     # Track last received update for the health endpoint
     _health["last_update"] = 0
