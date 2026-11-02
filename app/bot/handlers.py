@@ -279,7 +279,7 @@ def _main_reply_kb(conn, user_id: int | None = None,
     in the main menu (admin only, beta). The identify feature itself is
     NOT deleted — only its main-menu slot is reused, restorable later.
     """
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
     ulang = _user_lang(conn, user_id)
 
     # Admin beta: remix replaces the identify slot. Import guarded once.
@@ -308,6 +308,12 @@ def _main_reply_kb(conn, user_id: int | None = None,
     # request. The identify feature itself is NOT deleted -- it remains
     # available on video/audio cards via the identify button there.
     rows = [
+        [
+            InlineKeyboardButton(
+                text="🎧 مینی‌اپ آوانو",
+                web_app=WebAppInfo(
+                    url="https://avano-miniapp-api.avano.workers.dev/")),
+        ],
         [
             InlineKeyboardButton(
                 text="📷 " + t("m_downloader_instagram", ulang),
