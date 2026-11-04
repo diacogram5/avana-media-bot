@@ -474,7 +474,7 @@ def subtopics_kb(cat_id: str) -> InlineKeyboardMarkup:
     c = _CAT_BY_ID[cat_id]
     rows = [[_btn(s["title"], f"story:sub:{cat_id}:{s['id']}")]
             for s in c["subtopics"]]
-    rows.append([_btn("🔙 دسته‌ها", callback_data="story:back")])
+    rows.append([_btn("🔙 دسته‌ها", "story:back")])
     return _markup(rows)
 
 
@@ -871,6 +871,19 @@ def run_self_test() -> bool:
         check("ConfigMissing raised", True)
     except Exception:
         check("ConfigMissing raised", False)
+
+    # 15. every keyboard builder constructs without exception
+    #     (regression: subtopics_kb once called _btn with a bad kwarg,
+    #     which silently broke the category tap in production)
+    try:
+        _ = categories_kb()
+        for c in CATEGORIES:
+            _ = subtopics_text(c["id"])
+            _ = subtopics_kb(c["id"])
+        kb_ok = True
+    except Exception:
+        kb_ok = False
+    check("all category/subtopic keyboards build", kb_ok)
 
     print("\nSELF-TEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     return ok
