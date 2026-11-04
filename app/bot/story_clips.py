@@ -4,13 +4,12 @@ Standalone module: no changes to existing bot code are required to use it.
 The parent only adds one menu button row (see story_button_row()) and calls
 register_story_handlers(router).
 
-Sources:
-  * Pexels Video API (primary) — free, documented, direct MP4 file URLs,
-    portrait orientation. License: free use incl. commercial; API guidelines
-    require a prominent link to Pexels + photographer credit when showing
-    results (honored in every caption).
-  * Pixabay (fallback, optional) — NOT wired yet; only after a careful review
-    of its API cache/hotlink terms.
+Source:
+  * Pixabay Video API — free key, documented, direct MP4 file URLs,
+    portrait orientation. License: Pixabay Content License (free use incl.
+    commercial); every caption credits the filmmaker + links the Pixabay page.
+  * Pexels was REMOVED 2026-11-04: it stopped issuing new API keys (~2 months
+    earlier, no reopen date), so no new applicant can obtain a key.
 
 What this module NEVER does:
   * No Instagram scraping / no bypassing of any platform's limits.
@@ -25,12 +24,12 @@ In-memory cache only (12h TTL per category/subtopic); no DB schema changes.
 Per-user navigation state is encoded entirely in callback_data (no global
 per-user dicts).
 
-Callback scheme:
+Callback scheme (unchanged from the Pexels version — byte-identical):
     story:cat                        → category list
     story:sublist:<cat_id>           → subtopic list of a category
     story:sub:<cat_id>:<sub_id>      → clip list, page 0
     story:page:<cat_id>:<sub_id>:<p> → clip list, page p
-    story:clip:<pexels_id>           → send the video
+    story:clip:<video_id>            → send the video
     story:back                       → back to categories
 """
 from __future__ import annotations
@@ -116,8 +115,9 @@ CATEGORIES = [
     ]},
 ]
 
-# Pre-approved English Pexels queries per subtopic (2-3 each).
+# Pre-approved English queries per subtopic (2-3 each).
 # Fixed and reviewable — no paid API, no ML classifier.
+# Pixabay searches its tag index, so the same English queries apply.
 SUBTOPIC_QUERIES: dict[tuple[str, str], list[str]] = {
     ("love", "express"): ["couple in love", "romantic couple kiss", "love couple sunset"],
     ("love", "longing"): ["missing someone", "lonely woman window rain", "longing love"],
@@ -147,13 +147,22 @@ _SUB_BY_ID = {(c["id"], s["id"]): s for c in CATEGORIES for s in c["subtopics"]}
 
 
 # ---------------------------------------------------------------------------
-# Pexels API client (urllib in executor; never blocks the event loop)
+# Pixabay Video API client (urllib in executor; never blocks the event loop)
+#
+#   GET https://pixabay.com/api/videos/?key={KEY}&q=...&video_type=film
+#       &orientation=vertical&safesearch=true&per_page=30
+# Response: {"total": N, "totalHits": N,
+#            "hits": [{"id", "pageURL", "tags", "duration",
+#                      "videos": {"large": {"url","width","height"},
+#                                 "medium": {...}, "small": {...}, "tiny": {...}},
+#                      "user", "userImageURL", "previewURL", ...}]}
+# Rate limit: 100 requests / 60s per key. Our pacing (3 concurrent + 2s
+# between subtopics) stays far below it.
 # ---------------------------------------------------------------------------
-PEXELS_SEARCH_URL = "https://api.pexels.com/v1/videos/search"
-PEXELS_POPULAR_URL = "https://api.pexels.com/v1/videos/popular"
+PIXABAY_VIDEOS_URL = "https://pixabay.com/api/videos/"
 FETCH_TIMEOUT = 15
 MAX_CONCURRENT_REQUESTS = 3
-CACHE_TTL_SEC = 12 * 3600
+CACHE_TTL_SEC = 24 * 3600  # Pixabay API terms require 24h response caching
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/120.0 Safari/537.36")
@@ -164,29 +173,28 @@ _req_count = 0
 
 
 class ConfigMissing(Exception):
-    """PEXELS_API_KEY is not configured. UI shows a short 'coming soon'."""
+    """PIXABAY_API_KEY is not configured. UI shows a short 'coming soon'."""
 
 
-def _pexels_key() -> str:
+def _pixabay_key() -> str:
     """Read the key at call time. Never logged, never embedded in messages."""
-    key = os.environ.get("PEXELS_API_KEY", "").strip()
+    key = os.environ.get("PIXABAY_API_KEY", "").strip()
     if not key:
-        raise ConfigMissing("PEXELS_API_KEY not set")
+        raise ConfigMissing("PIXABAY_API_KEY not set")
     return key
 
 
-def _http_get_json(url: str, params: dict) -> dict:
-    """Blocking GET with Authorization header. One retry. Executor only."""
+def _http_get_json(params: dict) -> dict:
+    """Blocking GET to the Pixabay video API. One retry. Executor only."""
     import json
     import urllib.parse
     import urllib.request
 
-    key = _pexels_key()  # raises ConfigMissing before any network use
-    qs = urllib.parse.urlencode(params)
+    key = _pixabay_key()  # raises ConfigMissing before any network use
+    qs = urllib.parse.urlencode({"key": key, **params})
     req = urllib.request.Request(
-        f"{url}?{qs}",
-        headers={"Authorization": key,
-                 "User-Agent": USER_AGENT,
+        f"{PIXABAY_VIDEOS_URL}?{qs}",
+        headers={"User-Agent": USER_AGENT,
                  "Accept": "application/json"},
     )
     last_err: Exception | None = None
@@ -194,21 +202,21 @@ def _http_get_json(url: str, params: dict) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
                 if resp.status != 200:
-                    raise RuntimeError(f"Pexels HTTP {resp.status}")
+                    raise RuntimeError(f"Pixabay HTTP {resp.status}")
                 return json.loads(resp.read().decode("utf-8"))
         except ConfigMissing:
             raise
         except Exception as e:  # noqa: BLE001 - retry once, then raise
             last_err = e
             time.sleep(1)
-    raise RuntimeError(f"Pexels request failed: {last_err}")
+    raise RuntimeError(f"Pixabay request failed: {last_err}")
 
 
-async def _pexels_get(url: str, params: dict) -> dict:
+async def _pixabay_get(params: dict) -> dict:
     global _req_count
     async with _sem:
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, _http_get_json, url, params)
+        data = await loop.run_in_executor(None, _http_get_json, params)
         _req_count += 1
         return data
 
@@ -216,43 +224,44 @@ async def _pexels_get(url: str, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Clip parsing helpers (pure functions — unit-tested)
 # ---------------------------------------------------------------------------
-def _title_from_url(page_url: str) -> str:
-    """Pexels API has no title field; derive it from the page slug.
+def _title_from_tags(tags: str) -> str:
+    """Pixabay has no title field; derive one from the tag list.
 
-    https://www.pexels.com/video/moody-silhouette-in-dramatic-lighting-36644497/
-    -> "Moody Silhouette In Dramatic Lighting"
+    "couple, love, romantic sunset" -> "Couple, Love, Romantic Sunset"
     """
     try:
-        slug = page_url.rstrip("/").rsplit("/", 1)[-1]
-        slug = slug.rsplit("-", 1)[0]  # strip trailing numeric id
-        words = [w for w in slug.split("-") if w]
-        return " ".join(w.capitalize() for w in words) or "Untitled"
+        words = [t.strip() for t in (tags or "").split(",")]
+        words = [w for w in words if w][:4]
+        return ", ".join(w.title() for w in words) or "Untitled"
     except Exception:
         return "Untitled"
 
 
-def _pick_file_url(video_files: list[dict]) -> tuple[str | None, int]:
-    """Pick the smallest MP4 rendition with width >= 720p.
+def _pick_file(videos: dict) -> tuple[str | None, int, int]:
+    """Pick the smallest rendition with width >= 720.
 
-    Returns (url, width). Falls back to the smallest MP4 of any size.
+    Pixabay shape: {"large": {"url","width","height"}, "medium": {...}, ...}
+    Returns (url, width, height). Falls back to the smallest rendition.
     """
-    cands: list[tuple[int, str]] = []
-    for f in video_files or []:
-        link = (f.get("link") or "").strip()
-        ftype = f.get("file_type") or ""
-        if not link or ("mp4" not in ftype and not link.endswith(".mp4")):
+    cands: list[tuple[int, int, str]] = []
+    for rend in (videos or {}).values():
+        if not isinstance(rend, dict):
             continue
+        url = (rend.get("url") or "").strip()
         try:
-            w = int(f.get("width") or 0)
+            w = int(rend.get("width") or 0)
+            h = int(rend.get("height") or 0)
         except (TypeError, ValueError):
-            w = 0
-        cands.append((w, link))
+            w, h = 0, 0
+        if url:
+            cands.append((w, h, url))
     if not cands:
-        return None, 0
-    ok = [(w, l) for w, l in cands if w >= 720]
+        return None, 0, 0
+    ok = [(w, h, u) for w, h, u in cands if w >= 720]
     pool = ok or cands
     pool.sort(key=lambda x: x[0])
-    return pool[0][1], pool[0][0]
+    w, h, u = pool[0]
+    return u, w, h
 
 
 def _quality_label(width: int) -> str:
@@ -268,27 +277,28 @@ def _quality_label(width: int) -> str:
 
 
 def _parse_video(v: dict) -> dict | None:
-    """Convert one Pexels API video object into our clip dict."""
+    """Convert one Pixabay video hit into our clip dict.
+
+    Landscape videos are dropped (story clips are portrait only).
+    """
     try:
         vid = int(v.get("id"))
     except (TypeError, ValueError):
         return None
-    file_url, width = _pick_file_url(v.get("video_files") or [])
+    file_url, width, height = _pick_file(v.get("videos") or {})
     if not file_url:
         return None
-    try:
-        height = int(v.get("height") or 0)
-    except (TypeError, ValueError):
-        height = 0
+    if width and height and width >= height:
+        return None  # landscape — skip
     try:
         duration = int(v.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0
-    filmmaker = ((v.get("user") or {}).get("name") or "Pexels").strip() or "Pexels"
-    page_url = v.get("url") or ""
+    filmmaker = (v.get("user") or "Pixabay").strip() or "Pixabay"
+    page_url = v.get("pageURL") or ""
     return {
-        "pexels_id": vid,
-        "title": _title_from_url(page_url)[:120],
+        "video_id": vid,
+        "title": _title_from_tags(v.get("tags") or "")[:120],
         "duration": duration,
         "width": width,
         "height": height,
@@ -296,7 +306,7 @@ def _parse_video(v: dict) -> dict | None:
         "filmmaker": filmmaker[:80],
         "page_url": page_url,
         "file_url": file_url,
-        "preview_image": v.get("image") or "",
+        "preview_image": v.get("previewURL") or v.get("userImageURL") or "",
         "first_seen": int(time.time()),
     }
 
@@ -305,7 +315,7 @@ def _parse_video(v: dict) -> dict | None:
 # In-memory cache (12h TTL per category/subtopic). No DB changes.
 # ---------------------------------------------------------------------------
 _cache: dict[tuple[str, str], dict] = {}
-# pexels_id -> (cat_id, sub_id), for the clip-view "back" button
+# video_id -> (cat_id, sub_id), for the clip-view "back" button
 _origin: dict[int, tuple[str, str]] = {}
 
 
@@ -321,43 +331,41 @@ async def _refresh_subtopic(cat_id: str, sub_id: str) -> list[dict]:
     for (c, s), entry in _cache.items():
         if c == cat_id and (c, s) != (cat_id, sub_id):
             for it in entry.get("items", []):
-                seen.add(it["pexels_id"])
+                seen.add(it["video_id"])
     items: list[dict] = []
     for q in queries:
-        data = await _pexels_get(PEXELS_SEARCH_URL, {
-            "query": q, "orientation": "portrait",
-            "per_page": 30, "size": "medium",
+        data = await _pixabay_get({
+            "q": q, "video_type": "film", "orientation": "vertical",
+            "safesearch": "true", "per_page": 30,
         })
-        for v in data.get("videos", []):
+        for v in data.get("hits", []):
             clip = _parse_video(v)
-            if clip and clip["pexels_id"] not in seen:
-                seen.add(clip["pexels_id"])
+            if clip and clip["video_id"] not in seen:
+                seen.add(clip["video_id"])
                 items.append(clip)
         if len(items) >= 25:
             break
-    # Thin result? Fill from the popular endpoint (portrait only).
+    # Thin result? Fill from popular videos (portrait filtered client-side).
     if len(items) < 5:
         try:
-            pop = await _pexels_get(PEXELS_POPULAR_URL, {"per_page": 30})
-            for v in pop.get("videos", []):
-                try:
-                    if int(v.get("height") or 0) <= int(v.get("width") or 0):
-                        continue  # landscape — skip
-                except (TypeError, ValueError):
-                    continue
+            pop = await _pixabay_get({
+                "video_type": "film", "orientation": "vertical",
+                "safesearch": "true", "order": "popular", "per_page": 30,
+            })
+            for v in pop.get("hits", []):
                 clip = _parse_video(v)
-                if clip and clip["pexels_id"] not in seen:
-                    seen.add(clip["pexels_id"])
+                if clip and clip["video_id"] not in seen:
+                    seen.add(clip["video_id"])
                     items.append(clip)
                 if len(items) >= 10:
                     break
         except Exception as e:  # noqa: BLE001 - filler is best-effort
             log.warning("story: popular filler failed (%s)", e)
     if not items:
-        raise RuntimeError("empty result from Pexels")
+        raise RuntimeError("empty result from Pixabay")
     _cache[(cat_id, sub_id)] = {"items": items, "fetched_at": time.time()}
     for it in items:
-        _origin[it["pexels_id"]] = (cat_id, sub_id)
+        _origin[it["video_id"]] = (cat_id, sub_id)
     log.info("story: refreshed %s/%s -> %d clips", cat_id, sub_id, len(items))
     return items
 
@@ -384,11 +392,11 @@ async def get_clips(cat_id: str, sub_id: str) -> list[dict]:
             raise
 
 
-def find_clip(pexels_id: int) -> dict | None:
+def find_clip(video_id: int) -> dict | None:
     """Locate a clip by id across all cached subtopics (stateless lookup)."""
     for entry in _cache.values():
         for it in entry.get("items", []):
-            if it["pexels_id"] == pexels_id:
+            if it["video_id"] == video_id:
                 return it
     return None
 
@@ -403,7 +411,7 @@ async def refresh_loop(interval_sec: int = CACHE_TTL_SEC) -> None:
                     if not entry or _is_expired(entry["fetched_at"]):
                         await _refresh_subtopic(*key)
                 except ConfigMissing:
-                    log.info("story: PEXELS_API_KEY missing; refresher idle")
+                    log.info("story: PIXABAY_API_KEY missing; refresher idle")
                     break
                 except Exception as e:  # noqa: BLE001 - one bad subtopic
                     log.warning("story: background refresh %s failed (%s)",
@@ -488,7 +496,7 @@ def clip_list_kb(cat_id: str, sub_id: str, page: int,
                  items: list[dict], total_pages: int) -> InlineKeyboardMarkup:
     start = page * CLIPS_PER_PAGE
     page_items = items[start:start + CLIPS_PER_PAGE]
-    num_btns = [_btn(_fa(i + 1), f"story:clip:{clip['pexels_id']}")
+    num_btns = [_btn(_fa(i + 1), f"story:clip:{clip['video_id']}")
                 for i, clip in enumerate(page_items)]
     rows: list[list[InlineKeyboardButton]] = []
     if num_btns:
@@ -505,16 +513,16 @@ def clip_list_kb(cat_id: str, sub_id: str, page: int,
 
 
 def clip_caption(clip: dict) -> str:
-    # Attribution per Pexels API guidelines: filmmaker + link to Pexels page.
+    # Attribution: filmmaker + link to the Pixabay page.
     return (f"🎬 {clip['title']}\n"
             f"{BADGE}\n"
             f"⏱ {_fmt_duration(clip['duration'])} | 🎞 {clip['quality']}\n"
-            f"🎥 {clip['filmmaker']} via Pexels\n"
+            f"🎥 {clip['filmmaker']} via Pixabay\n"
             f"🔗 {clip['page_url']}")
 
 
-def clip_back_kb(pexels_id: int) -> InlineKeyboardMarkup:
-    origin = _origin.get(pexels_id)
+def clip_back_kb(video_id: int) -> InlineKeyboardMarkup:
+    origin = _origin.get(video_id)
     if origin:
         cb = f"story:sub:{origin[0]}:{origin[1]}"
     else:
@@ -571,8 +579,8 @@ async def _show_clip_list(callback, cat_id: str, sub_id: str, page: int) -> None
                                       parse_mode="HTML")
 
 
-async def _send_clip(callback, pexels_id: int) -> None:
-    clip = find_clip(pexels_id)
+async def _send_clip(callback, video_id: int) -> None:
+    clip = find_clip(video_id)
     if not clip:
         await callback.answer("❌ کلیپ پیدا نشد.", show_alert=True)
         return
@@ -582,10 +590,10 @@ async def _send_clip(callback, pexels_id: int) -> None:
         await callback.message.answer_video(
             video=url,
             caption=clip_caption(clip),
-            reply_markup=clip_back_kb(pexels_id),
+            reply_markup=clip_back_kb(video_id),
         )
     except Exception as e:
-        log.warning("story: send_video failed for %s (%s)", pexels_id, e)
+        log.warning("story: send_video failed for %s (%s)", video_id, e)
         await callback.message.answer(
             "❌ ارسال ویدیو ناموفق بود. لطفاً دوباره تلاش کنید.")
 
@@ -645,13 +653,13 @@ def register_story_handlers(router) -> None:
     async def story_clip(callback, conn=None, config=None):
         parts = callback.data.split(":")
         try:
-            pexels_id = int(parts[2]) if len(parts) > 2 else 0
+            video_id = int(parts[2]) if len(parts) > 2 else 0
         except (TypeError, ValueError):
-            pexels_id = 0
-        if not pexels_id:
+            video_id = 0
+        if not video_id:
             await callback.answer("❌", show_alert=True)
             return
-        await _send_clip(callback, pexels_id)
+        await _send_clip(callback, video_id)
 
     log.info("story: handlers registered (watermark_enabled=%s)",
              WATERMARK_ENABLED)
@@ -663,7 +671,7 @@ def register_story_handlers(router) -> None:
 def get_api_status() -> dict:
     """Diagnostic snapshot. Never includes the API key value."""
     return {
-        "pexels_key_configured": bool(os.environ.get("PEXELS_API_KEY", "").strip()),
+        "pixabay_key_configured": bool(os.environ.get("PIXABAY_API_KEY", "").strip()),
         "cached_subtopics": len(_cache),
         "cached_clips": sum(len(e.get("items", [])) for e in _cache.values()),
         "requests_made": _req_count,
@@ -675,17 +683,18 @@ def get_api_status() -> dict:
 # ---------------------------------------------------------------------------
 # Self-test (no network, no API key, no aiogram needed)
 # ---------------------------------------------------------------------------
-def _fixture_files():
-    return [
-        {"link": "https://x/v-uhd.mp4", "file_type": "video/mp4",
-         "width": 2160, "height": 3840},
-        {"link": "https://x/v-hd.mp4", "file_type": "video/mp4",
-         "width": 1080, "height": 1920},
-        {"link": "https://x/v-sd.mp4", "file_type": "video/mp4",
-         "width": 720, "height": 1280},
-        {"link": "https://x/v-tiny.mp4", "file_type": "video/mp4",
-         "width": 480, "height": 854},
-    ]
+def _fixture_videos():
+    # Mirrors the real Pixabay /api/videos/ hit shape.
+    return {
+        "large": {"url": "https://cdn.pixabay.com/vimeo/1/v-uhd.mp4",
+                  "width": 2160, "height": 3840, "size": 9000000},
+        "medium": {"url": "https://cdn.pixabay.com/vimeo/1/v-hd.mp4",
+                   "width": 1080, "height": 1920, "size": 3000000},
+        "small": {"url": "https://cdn.pixabay.com/vimeo/1/v-sd.mp4",
+                  "width": 720, "height": 1280, "size": 1200000},
+        "tiny": {"url": "https://cdn.pixabay.com/vimeo/1/v-tiny.mp4",
+                 "width": 480, "height": 854, "size": 500000},
+    }
 
 
 def run_self_test() -> bool:
@@ -718,19 +727,19 @@ def run_self_test() -> bool:
           all(2 <= len(q) <= 3 and all(x.strip() for x in q)
               for q in SUBTOPIC_QUERIES.values()))
 
-    # 2. callback-data round-trip
+    # 2. callback-data round-trip (byte-identical to the Pexels version)
     cb = "story:page:occasion:calendar:2"
     parts = cb.split(":")
     check("callback round-trip",
           parts == ["story", "page", "occasion", "calendar", "2"]
           and len(cb) <= 64)
     check("clip callback fits 64B",
-          len("story:clip:36644497") <= 64)
+          len("story:clip:272487468") <= 64)
 
     # 3. pagination math (12 items, 5 per page -> 3 pages: 5/5/2)
-    items = [{"pexels_id": i, "title": f"T{i}", "duration": 10,
+    items = [{"video_id": i, "title": f"T{i}", "duration": 10,
               "quality": "HD", "filmmaker": "F",
-              "page_url": "https://www.pexels.com/video/x-1/",
+              "page_url": "https://pixabay.com/videos/x-1/",
               "file_url": "https://x.mp4"} for i in range(12)]
     total = (len(items) + CLIPS_PER_PAGE - 1) // CLIPS_PER_PAGE
     check("12 items -> 3 pages", total == 3)
@@ -754,7 +763,8 @@ def run_self_test() -> bool:
     # 4. cache TTL
     now = time.time()
     check("fresh entry not expired", not _is_expired(now - 3600))
-    check("13h-old entry expired", _is_expired(now - 13 * 3600))
+    check("13h-old entry NOT expired (24h TTL)", not _is_expired(now - 13 * 3600))
+    check("25h-old entry expired", _is_expired(now - 25 * 3600))
 
     # 5. dedup helper logic
     seen = {1, 2, 3}
@@ -762,37 +772,51 @@ def run_self_test() -> bool:
     kept = [i for i in new_ids if i not in seen]
     check("dedup filters known ids", kept == [4, 5])
 
-    # 6. file picker: smallest mp4 >= 720p
-    url, w = _pick_file_url(_fixture_files())
-    check("picks 720p rendition", url == "https://x/v-sd.mp4" and w == 720)
-    url2, w2 = _pick_file_url([{"link": "https://x/a.mp4",
-                                "file_type": "video/mp4",
-                                "width": 480, "height": 854}])
-    check("fallback to smallest mp4", url2 == "https://x/a.mp4" and w2 == 480)
-    check("no mp4 -> None", _pick_file_url([]) == (None, 0))
+    # 6. file picker: smallest rendition >= 720p wide
+    url, w, h = _pick_file(_fixture_videos())
+    check("picks 720p rendition",
+          url == "https://cdn.pixabay.com/vimeo/1/v-sd.mp4"
+          and w == 720 and h == 1280)
+    url2, w2, _h2 = _pick_file({
+        "tiny": {"url": "https://x/a.mp4", "width": 480, "height": 854}})
+    check("fallback to smallest rendition",
+          url2 == "https://x/a.mp4" and w2 == 480)
+    check("no renditions -> None", _pick_file({}) == (None, 0, 0))
     check("quality labels",
           _quality_label(2160) == "4K" and _quality_label(1080) == "Full HD"
           and _quality_label(720) == "HD" and _quality_label(480) == "SD")
 
-    # 7. title from slug
-    check("title from url",
-          _title_from_url("https://www.pexels.com/video/"
-                          "moody-silhouette-in-dramatic-lighting-36644497/")
-          == "Moody Silhouette In Dramatic Lighting")
+    # 7. title from tags
+    check("title from tags",
+          _title_from_tags("couple, love, romantic sunset")
+          == "Couple, Love, Romantic Sunset")
+    check("empty tags -> Untitled", _title_from_tags("") == "Untitled")
 
-    # 8. parse_video fixture (mirrors real Pexels API shape)
-    v = {"id": 36644497, "width": 2160, "height": 3840, "duration": 23,
-         "url": "https://www.pexels.com/video/moody-silhouette-36644497/",
-         "image": "https://images.pexels.com/x.jpg",
-         "user": {"name": "Cemrecan Yurtman"},
-         "video_files": _fixture_files()}
+    # 8. parse_video fixture (mirrors real Pixabay /api/videos/ hit shape)
+    v = {"id": 272487468, "pageURL": "https://pixabay.com/videos/poppy-field-272487468/",
+         "type": "film", "tags": "poppy, field, flowers, nature",
+         "duration": 23,
+         "videos": _fixture_videos(),
+         "user": "coverr", "userImageURL": "https://cdn.pixabay.com/u.jpg",
+         "previewURL": "https://i.vimeocdn.com/video/x.jpg"}
     clip = _parse_video(v)
     check("parse_video fields",
-          clip is not None and clip["pexels_id"] == 36644497
+          clip is not None and clip["video_id"] == 272487468
           and clip["quality"] == "HD"
-          and clip["filmmaker"] == "Cemrecan Yurtman"
+          and clip["filmmaker"] == "coverr"
           and clip["duration"] == 23
+          and clip["title"] == "Poppy, Field, Flowers, Nature"
+          and clip["page_url"].startswith("https://pixabay.com/videos/")
           and clip["first_seen"] > 0)
+    # landscape hit is dropped
+    land = dict(v)
+    land["videos"] = {
+        "medium": {"url": "https://x/land.mp4", "width": 1280, "height": 720}}
+    check("landscape dropped", _parse_video(land) is None)
+    # no renditions -> dropped
+    norend = dict(v)
+    norend["videos"] = {}
+    check("no renditions dropped", _parse_video(norend) is None)
 
     # 9. watermark hook is a pass-through while disabled
     check("WATERMARK_ENABLED False", WATERMARK_ENABLED is False)
@@ -801,43 +825,52 @@ def run_self_test() -> bool:
 
     # 10. find_clip + origin back-button
     _cache[("deep", "silence")] = {"items": [clip], "fetched_at": now}
-    _origin[36644497] = ("deep", "silence")
-    check("find_clip", find_clip(36644497)["pexels_id"] == 36644497)
+    _origin[272487468] = ("deep", "silence")
+    check("find_clip", find_clip(272487468)["video_id"] == 272487468)
     check("find_clip miss", find_clip(999) is None)
-    back = clip_back_kb(36644497)
+    back = clip_back_kb(272487468)
     bcb = back.inline_keyboard[0][0].callback_data
     check("back button -> origin list", bcb == "story:sub:deep:silence")
     back2 = clip_back_kb(12345)
     check("back button fallback -> categories",
           back2.inline_keyboard[0][0].callback_data == "story:cat")
     _cache.pop(("deep", "silence"), None)
-    _origin.pop(36644497, None)
+    _origin.pop(272487468, None)
 
     # 11. captions carry attribution + never claim IG trends
     cap = clip_caption(clip)
     check("caption attribution",
-          "via Pexels" in cap and "Cemrecan Yurtman" in cap
-          and BADGE in cap)
+          "via Pixabay" in cap and "coverr" in cap
+          and BADGE in cap and "pixabay.com/videos/" in cap)
     check("no fake IG-trend wording",
           "اینستاگرام" not in cap and "ترند" not in cap)
 
     # 12. diagnostics never leak the key
-    os.environ["PEXELS_API_KEY"] = "secret-should-not-appear"
+    os.environ["PIXABAY_API_KEY"] = "secret-should-not-appear"
     try:
         st = get_api_status()
-        check("status configured flag", st["pexels_key_configured"] is True)
+        check("status configured flag", st["pixabay_key_configured"] is True)
         check("status leaks nothing",
               "secret-should-not-appear" not in str(st))
     finally:
-        del os.environ["PEXELS_API_KEY"]
+        del os.environ["PIXABAY_API_KEY"]
     check("status unconfigured",
-          get_api_status()["pexels_key_configured"] is False)
+          get_api_status()["pixabay_key_configured"] is False)
 
     # 13. main-menu button row
     row = story_button_row()
     check("menu row",
           len(row) == 1 and row[0].callback_data == "story:cat"
           and "استوری" in row[0].text)
+
+    # 14. ConfigMissing before any network use
+    try:
+        _http_get_json({"q": "test"})
+        check("ConfigMissing raised", False)
+    except ConfigMissing:
+        check("ConfigMissing raised", True)
+    except Exception:
+        check("ConfigMissing raised", False)
 
     print("\nSELF-TEST:", "ALL PASS" if ok else "FAILURES PRESENT")
     return ok
