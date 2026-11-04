@@ -584,7 +584,7 @@ def register_story_archive_handlers(router) -> None:
     """
     from aiogram import F  # lazy: aiogram is present on Render
     from aiogram.fsm.context import FSMContext
-    from aiogram.fsm.filter import StateFilter
+    from aiogram.filters import StateFilter
     from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                                InlineKeyboardMarkup, Message)
 
