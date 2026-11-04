@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Avano Motion Watermark v2 — final design prototype (NOT enabled for users).
+"""Avano Motion Watermark v2 — live in the story-clips send pipeline
+(app/bot/story_clips.py calls apply_watermark for every clip).
 
 Reference: the attached brand PNG (glassy neon-green pill, play button,
 @AvanoMediaBot, clapperboard). The attached PNG has NO real alpha channel
@@ -179,6 +180,15 @@ def probe(path):
             int(st["height"]))
 
 
+def _audio_codec(path):
+    """First audio stream's codec name, or None when the file is silent."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+        capture_output=True, text=True)
+    return out.stdout.strip() or None
+
+
 def apply_watermark(in_path, out_path, text=TEXT):
     dur, W, H = probe(in_path)
     start = dur * APPEAR_RATIO
@@ -218,14 +228,25 @@ def apply_watermark(in_path, out_path, text=TEXT):
             "[tmp][gl]overlay="
             f"x='{x}+{_ox}+{pw/2:.1f}+({pw/2+16:.1f})*cos(2*PI*(t-{start:.2f})/{GLOW_ORBIT_S})-{gw/2}':"
             f"y='{y}+{_oy}+{ph/2:.1f}+({ph/2+12:.1f})*sin(2*PI*(t-{start:.2f})/{GLOW_ORBIT_S})-{gh/2}':"
-            f"enable='between(t,{start:.2f},{end:.2f})',format=yuv420p[v]"
+            f"enable='between(t,{start:.2f},{end:.2f})',"
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
         )
+        # audio: preserved whenever the source has it. AAC is copied
+        # losslessly; any other codec is re-encoded to AAC 128k (Telegram
+        # compatible). Silent sources stay silent — never add fake audio.
+        acodec = _audio_codec(in_path)
+        if acodec == "aac":
+            audio_args = ["-map", "0:a?", "-c:a", "copy"]
+        elif acodec:
+            audio_args = ["-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
+        else:
+            audio_args = []
         cmd = ["ffmpeg", "-v", "error", "-y", "-i", in_path,
                "-loop", "1", "-t", f"{dur:.2f}", "-i", pill_path,
                "-loop", "1", "-t", f"{dur:.2f}", "-i", glow_path,
-               "-filter_complex", fc, "-map", "[v]", "-map", "0:a?",
+               "-filter_complex", fc, "-map", "[v]", *audio_args,
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-               "-c:a", "copy", "-movflags", "+faststart", "-shortest", out_path]
+               "-movflags", "+faststart", "-shortest", out_path]
         subprocess.run(cmd, check=True)
 
     return {"duration": round(dur, 2), "size": [W, H],
