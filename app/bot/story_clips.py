@@ -616,21 +616,22 @@ def clip_list_kb(cat_id: str, sub_id: str, page: int,
 
 
 def clip_caption(clip: dict) -> str:
-    # Brand-first template (2026-11-04): no raw URLs in the caption.
-    # Pixabay Content License does NOT require attribution or a link
-    # (verified on pixabay.com/service/license-summary), so no source
-    # button is needed; the creator name is kept voluntarily.
-    # @AvanoMediaBot is also burned into the video itself (watermark).
+    # Corporate AVANO MEDIA identity (2026-11-04): minimal, identical on
+    # every clip. No raw URLs, no creator name — the Pixabay Content License
+    # requires neither attribution nor a link (verified), so no source
+    # button is needed. @AvanoMediaBot is also burned into the video
+    # itself (watermark), independent of the caption.
     m, s = divmod(max(0, int(clip["duration"])), 60)
     dur = _fa(f"{m:02d}:{s:02d}")
-    return (f"🎬 کلیپ منتخب آوانو\n"
+    return (f"🎬 AVANO MEDIA\n"
+            f"✨ منتخب استوری آوانو\n"
             f"\n"
-            f"✨ @AvanoMediaBot\n"
+            f"کیفیت: {clip['quality']}\n"
+            f"مدت: {dur}\n"
             f"\n"
-            f"🎞 کیفیت: {clip['quality']}\n"
-            f"⏱ مدت: {dur}\n"
+            f"لحظه‌هایت را متفاوت به اشتراک بگذار.\n"
             f"\n"
-            f"ساخته‌شده توسط: {clip['filmmaker']}")
+            f"@AvanoMediaBot")
 
 
 def clip_back_kb(video_id: int) -> InlineKeyboardMarkup:
@@ -980,14 +981,17 @@ def run_self_test() -> bool:
     _cache.pop(("deep", "silence"), None)
     _origin.pop(272487468, None)
 
-    # 11. brand-first caption: @AvanoMediaBot prominent, creator kept,
-    # no raw URLs (Pixabay license requires no link), never IG trends
+    # 11. corporate caption: AVANO MEDIA identity, minimal, no raw URLs,
+    # no creator name (license requires neither), never IG trends
     cap = clip_caption(clip)
     check("caption template",
-          "🎬 کلیپ منتخب آوانو" in cap and "✨ @AvanoMediaBot" in cap
-          and "🎞 کیفیت:" in cap and "⏱ مدت:" in cap
-          and "ساخته‌شده توسط:" in cap and "coverr" in cap
-          and "http" not in cap and "pixabay.com/videos/" not in cap)
+          "🎬 AVANO MEDIA" in cap and "✨ منتخب استوری آوانو" in cap
+          and "کیفیت:" in cap and "مدت:" in cap
+          and "لحظه‌هایت را متفاوت به اشتراک بگذار." in cap
+          and cap.strip().endswith("@AvanoMediaBot")
+          and "http" not in cap and "pixabay.com/videos/" not in cap
+          and "ساخته‌شده توسط" not in cap
+          and "OFFICIAL" not in cap)
     check("no fake IG-trend wording",
           "اینستاگرام" not in cap and "ترند" not in cap)
 
