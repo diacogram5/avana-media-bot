@@ -15,9 +15,13 @@ What this module NEVER does:
   * No Instagram scraping / no bypassing of any platform's limits.
   * Clips are NEVER presented as real Instagram trends — every list carries
     the «⭐ منتخب آوانو» badge.
-  * No watermark is applied here. WATERMARK_ENABLED = False and
-    maybe_watermark() is a clearly-marked hook: the Avano Motion Watermark
-    track stays in design/sample stage until the user approves it.
+  * The v2 Avano Motion Watermark (@AvanoMediaBot glassy pill, 25% opacity,
+    appears at 45% of duration, 800ms fades) is burned into every clip
+    before sending: download → ffprobe validate → GIF→MP4 if needed →
+    ffmpeg watermark (audio preserved, AAC when re-encoded) → upload →
+    temp cleanup. All blocking work runs in executor threads, max 1
+    concurrent ffmpeg job (Render Free RAM control). GIF sources are
+    detected and converted to MP4 (animation preserved) before watermarking.
 
 All network I/O runs in executor threads — the event loop is never blocked.
 In-memory cache only (12h TTL per category/subtopic); no DB schema changes.
@@ -35,9 +39,14 @@ Callback scheme (unchanged from the Pexels version — byte-identical):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
+import urllib.request
 
 log = logging.getLogger("avana.story_clips")
 
@@ -62,20 +71,114 @@ except Exception:  # pragma: no cover - sandbox fallback
 
 
 # ---------------------------------------------------------------------------
-# Watermark hook — DESIGN TRACK ONLY. Do NOT enable until the user approves
-# the Avano Motion Watermark sample (appearance, opacity, timing, position).
+# Watermark pipeline (v2 Avano Motion Watermark — user-approved 2026-11-04).
+# Every clip is downloaded, validated, watermarked and uploaded; the source
+# file is never modified and temp files are removed after sending.
+# The watermark module is imported LAZILY so a missing PIL/numpy can never
+# break the menu — only the send step reports a clear, trackable error.
 # ---------------------------------------------------------------------------
-WATERMARK_ENABLED = False
+WATERMARK_ENABLED = True
+
+# Max concurrent ffmpeg jobs (Render Free has 512MB RAM; one 720p watermark
+# pass peaked ~220MB in testing). Downloads are capped as well.
+_WM_SEM = asyncio.Semaphore(1)
+_DL_TIMEOUT = 120
+_DL_MAX_BYTES = 200 * 1024 * 1024
+_PROCESS_TIMEOUT = 300  # max seconds for download+watermark of one clip
 
 
-def maybe_watermark(file_url: str) -> str:
-    """Hook for the future Avano Motion Watermark pipeline.
+def _watermark_module():
+    """Lazy import of the v2 motion watermark (PIL/numpy needed)."""
+    try:
+        from app.bot import motion_watermark
+        return motion_watermark
+    except ImportError:
+        import motion_watermark  # type: ignore[no-redef]
+        return motion_watermark
 
-    Currently returns the URL unchanged (WATERMARK_ENABLED = False).
-    When the watermark design is approved, this function will route the
-    download through the watermark processor and return the processed file.
+
+def _download_file(url: str, dest: str,
+                   timeout: int = _DL_TIMEOUT,
+                   max_bytes: int = _DL_MAX_BYTES) -> str:
+    """Blocking download with size cap. Executor only."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    total = 0
+    with urllib.request.urlopen(req, timeout=timeout) as r, \
+            open(dest, "wb") as f:
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError("clip file too large")
+            f.write(chunk)
+    if total == 0:
+        raise RuntimeError("empty download")
+    return dest
+
+
+def _probe_media(path: str) -> dict:
+    """Blocking ffprobe. Executor only. Never sends broken files onward."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=index,codec_type,codec_name,width,height: format=duration",
+         "-of", "json", path],
+        capture_output=True, text=True, timeout=60, check=True)
+    j = json.loads(out.stdout)
+    info = {"video_codec": None, "width": 0, "height": 0, "duration": 0.0,
+            "has_audio": False, "audio_codec": None, "is_gif": False}
+    for s in j.get("streams", []):
+        if s.get("codec_type") == "video" and not info["video_codec"]:
+            info["video_codec"] = s.get("codec_name")
+            info["width"] = int(s.get("width") or 0)
+            info["height"] = int(s.get("height") or 0)
+            info["is_gif"] = (s.get("codec_name") == "gif")
+        elif s.get("codec_type") == "audio" and not info["has_audio"]:
+            info["has_audio"] = True
+            info["audio_codec"] = s.get("codec_name")
+    try:
+        info["duration"] = float(
+            j.get("format", {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        pass
+    if not info["video_codec"] or info["duration"] <= 0:
+        raise RuntimeError("invalid media file")
+    return info
+
+
+def _gif_to_mp4(src: str, dst: str) -> str:
+    """Blocking GIF→MP4 conversion, animation preserved. Executor only."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", src,
+         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+         "-movflags", "+faststart", dst],
+        check=True, timeout=120)
+    return dst
+
+
+def _process_clip(clip: dict, tmpdir: str) -> str:
+    """Blocking: download → validate → GIF→MP4 → watermark. Executor only.
+
+    Returns the path of the final watermarked MP4. Raises with a clear
+    message on any failure — the caller turns it into a short user-facing
+    error (never a silent un-watermarked send).
     """
-    return file_url
+    src = os.path.join(tmpdir, "src.bin")
+    _download_file(clip["file_url"], src)
+    info = _probe_media(src)
+    work = src
+    if info["is_gif"]:
+        conv = os.path.join(tmpdir, "conv.mp4")
+        _gif_to_mp4(src, conv)
+        work = conv
+        info = _probe_media(work)
+    mw = _watermark_module()
+    out = os.path.join(tmpdir, "wm.mp4")
+    mw.apply_watermark(work, out)
+    if not os.path.getsize(out):
+        raise RuntimeError("watermark produced empty file")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +617,9 @@ def clip_list_kb(cat_id: str, sub_id: str, page: int,
 
 def clip_caption(clip: dict) -> str:
     # Attribution: filmmaker + link to the Pixabay page.
+    # @AvanoMediaBot rides on every content the bot sends (brand rule).
     return (f"🎬 {clip['title']}\n"
-            f"{BADGE}\n"
+            f"{BADGE} • @AvanoMediaBot\n"
             f"⏱ {_fmt_duration(clip['duration'])} | 🎞 {clip['quality']}\n"
             f"🎥 {clip['filmmaker']} via Pixabay\n"
             f"🔗 {clip['page_url']}")
@@ -584,18 +688,48 @@ async def _send_clip(callback, video_id: int) -> None:
     if not clip:
         await callback.answer("❌ کلیپ پیدا نشد.", show_alert=True)
         return
-    await callback.answer("🎬 در حال ارسال...")
+    await callback.answer("🎬 در حال آماده‌سازی...")
+    status_msg = None
     try:
-        url = maybe_watermark(clip["file_url"])
+        status_msg = await callback.message.answer(
+            "⏳ در حال آماده‌سازی کلیپ...")
+    except Exception:
+        status_msg = None
+    tmpdir = None
+    try:
+        from aiogram.types import FSInputFile  # lazy: present on Render
+        loop = asyncio.get_running_loop()
+        tmpdir = tempfile.mkdtemp(prefix="avano_clip_")
+        async with _WM_SEM:
+            out_path = await asyncio.wait_for(
+                loop.run_in_executor(None, _process_clip, clip, tmpdir),
+                timeout=_PROCESS_TIMEOUT)
         await callback.message.answer_video(
-            video=url,
+            video=FSInputFile(out_path),
             caption=clip_caption(clip),
             reply_markup=clip_back_kb(video_id),
         )
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
     except Exception as e:
         log.warning("story: send_video failed for %s (%s)", video_id, e)
-        await callback.message.answer(
-            "❌ ارسال ویدیو ناموفق بود. لطفاً دوباره تلاش کنید.")
+        err = "❌ ارسال ویدیو ناموفق بود. لطفاً دوباره تلاش کنید."
+        try:
+            if status_msg:
+                await status_msg.edit_text(err)
+            else:
+                await callback.message.answer(err)
+        except Exception:
+            try:
+                await callback.message.answer(err)
+            except Exception:
+                pass
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def register_story_handlers(router) -> None:
@@ -818,10 +952,11 @@ def run_self_test() -> bool:
     norend["videos"] = {}
     check("no renditions dropped", _parse_video(norend) is None)
 
-    # 9. watermark hook is a pass-through while disabled
-    check("WATERMARK_ENABLED False", WATERMARK_ENABLED is False)
-    check("maybe_watermark passthrough",
-          maybe_watermark("https://x.mp4") == "https://x.mp4")
+    # 9. watermark pipeline is enabled (v2, user-approved)
+    check("WATERMARK_ENABLED True", WATERMARK_ENABLED is True)
+    check("_process_clip present", callable(_process_clip))
+    check("_probe_media present", callable(_probe_media))
+    check("_gif_to_mp4 present", callable(_gif_to_mp4))
 
     # 10. find_clip + origin back-button
     _cache[("deep", "silence")] = {"items": [clip], "fetched_at": now}
@@ -837,11 +972,12 @@ def run_self_test() -> bool:
     _cache.pop(("deep", "silence"), None)
     _origin.pop(272487468, None)
 
-    # 11. captions carry attribution + never claim IG trends
+    # 11. captions carry attribution + brand handle, never claim IG trends
     cap = clip_caption(clip)
     check("caption attribution",
           "via Pixabay" in cap and "coverr" in cap
-          and BADGE in cap and "pixabay.com/videos/" in cap)
+          and BADGE in cap and "pixabay.com/videos/" in cap
+          and "@AvanoMediaBot" in cap)
     check("no fake IG-trend wording",
           "اینستاگرام" not in cap and "ترند" not in cap)
 
