@@ -752,6 +752,22 @@ def register_story_handlers(router) -> None:
     @router.callback_query(F.data == "story:cat")
     async def story_cat(callback, conn=None, config=None):
         await callback.answer()
+        # NEW (2026-11-05): Iranian curated archive chooser. Guarded and
+        # additive only: when the archive is empty, behavior is unchanged.
+        try:
+            from .story_archive import iranian_clip_count, iranian_chooser_kb
+            if iranian_clip_count() > 0:
+                try:
+                    await callback.message.edit_text(
+                        "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
+                        parse_mode="HTML", reply_markup=iranian_chooser_kb())
+                except Exception:
+                    await callback.message.answer(
+                        "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
+                        parse_mode="HTML", reply_markup=iranian_chooser_kb())
+                return
+        except Exception:
+            pass
         await _show_categories(callback)
 
     @router.callback_query(F.data == "story:back")

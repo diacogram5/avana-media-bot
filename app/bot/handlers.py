@@ -55,6 +55,13 @@ try:
     _STORY_CLIPS_OK = True
 except Exception:
     _STORY_CLIPS_OK = False
+# NEW (2026-11-05): Iranian story-clip archive — independent module.
+# Guarded import so a module bug can never break existing handlers.
+try:
+    from .story_archive import register_story_archive_handlers as _register_sarch_handlers
+    _STORY_ARCHIVE_OK = True
+except Exception:
+    _STORY_ARCHIVE_OK = False
 from ..bot.media_send import (
     answer_no_preview, has_audio_stream, probe_audio, send_music, send_video,
     transcode_mp3,
@@ -109,6 +116,14 @@ if _STORY_CLIPS_OK:
         _register_story_handlers(router)
     except Exception as _e:
         log.warning("story_clips handlers not registered: %s", _e)
+
+# NEW (2026-11-05): Iranian story-clip archive (story_archive.py).
+# Guarded: never breaks existing handlers.
+if _STORY_ARCHIVE_OK:
+    try:
+        _register_sarch_handlers(router)
+    except Exception as _e:
+        log.warning("story_archive handlers not registered: %s", _e)
 
 
 def _new_request_id() -> str:
@@ -1176,6 +1191,10 @@ async def cmd_admin(message: Message, conn: sqlite3.Connection, config: Config):
                      f"{t('cmn_blocked', ulang) if u.get('blocked') else ''}")
     buttons.append([InlineKeyboardButton(text=t("m_admin_full", ulang), callback_data="adm:panel")])
     buttons.append([InlineKeyboardButton(text=t("m_bank_btn", ulang), callback_data="bank:panel")])
+    # NEW (2026-11-05): Iranian story-clip archive management (guarded).
+    if _STORY_ARCHIVE_OK:
+        buttons.append([InlineKeyboardButton(text="🎬 آرشیو استوری ایرانی",
+                                             callback_data="sarch:panel")])
     await _answer(message, conn, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 

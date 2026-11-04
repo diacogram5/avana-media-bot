@@ -260,3 +260,255 @@ if __name__ == "__main__":
     info = apply_watermark(sys.argv[1], sys.argv[2])
     info["elapsed_s"] = round(time.time() - t0, 2)
     print(json.dumps(info, ensure_ascii=False, indent=1))
+
+# ==================================================== Avano Waveframe v3 ===
+# Chosen by the user (2026-11-05) as the official story-clips watermark.
+# "Living" edition: the EQ signature pulses like real audio, the badge
+# enters with a cinematic ease-out, a light sweep crosses the glass every
+# few seconds, and the whole badge gently floats. Custom to AvanoMediaBot.
+# apply_watermark() (v2 glass pill, mid-clip) is kept untouched for the
+# legacy Pixabay flow until it is retired.
+DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+WAVEFRAME_ALPHA = 0.28  # on-screen opacity for the fixed badge
+WAVEFRAME_FPS = 15      # animation frame rate (smooth enough, cheap)
+
+
+def _vgrad(w, h, top_c, bot_c):
+    g = Image.new("RGBA", (1, h))
+    for yy in range(h):
+        t = yy / max(h - 1, 1)
+        g.putpixel((0, yy), tuple(int(top_c[i] + (bot_c[i] - top_c[i]) * t)
+                                  for i in range(4)))
+    return g.resize((w, h))
+
+
+def _chamfer_points(x0, y0, x1, y1, ch):
+    return [(x0 + ch, y0), (x1 - ch, y0), (x1, y0 + ch), (x1, y1 - ch),
+            (x1 - ch, y1), (x0 + ch, y1), (x0, y1 - ch), (x0, y0 + ch)]
+
+
+def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
+    """Build the Avano Waveframe badge as a transparent RGBA asset.
+
+    eq_ratios: 5 EQ bar heights (0..1). scale: entrance zoom (1.0 = final).
+    """
+    bw = int(video_w * 0.47)
+    bh = int(video_w * 0.104)
+    ch = int(bh * 0.30)
+    pad = 44
+    aw, ah = bw + pad * 2, bh + pad * 2 + 18
+    ox, oy = pad, pad
+    base = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    pts = _chamfer_points(ox, oy, ox + bw, oy + bh, ch)
+
+    # drop shadow
+    sh = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).polygon([(x, y + 9) for x, y in pts], fill=(0, 0, 0, 95))
+    base = Image.alpha_composite(base, sh.filter(ImageFilter.GaussianBlur(10)))
+
+    # glass gradient body
+    grad = _vgrad(bw, bh, (34, 96, 88, 255), (10, 42, 38, 255))
+    mask = Image.new("L", (bw, bh), 0)
+    ImageDraw.Draw(mask).polygon([(x - ox, y - oy) for x, y in pts], fill=255)
+    base.paste(grad, (ox, oy), mask)
+
+    # outer neon glow ring following the chamfered silhouette
+    glow_pts = _chamfer_points(ox - 5, oy - 5, ox + bw + 5, oy + bh + 5, ch + 5)
+    gl = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    ImageDraw.Draw(gl).line(glow_pts + [glow_pts[0]],
+                            fill=(110, 255, 185, 65), width=8, joint="curve")
+    base = Image.alpha_composite(base, gl.filter(ImageFilter.GaussianBlur(7)))
+
+    d = ImageDraw.Draw(base)
+    d.line(pts + [pts[0]], fill=(212, 255, 232, 160), width=2, joint="curve")
+    d.line([(ox + ch + 8, oy + 3), (ox + bw - ch - 8, oy + 3)],
+           fill=(235, 255, 242, 120), width=2)
+
+    # sheen across the upper area
+    sheen = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    ImageDraw.Draw(sheen).polygon(
+        [(ox + ch, oy + 9), (ox + bw - ch, oy + 9),
+         (ox + bw - ch - 16, oy + int(bh * 0.40)),
+         (ox + ch + 16, oy + int(bh * 0.40))], fill=(255, 255, 255, 20))
+    base = Image.alpha_composite(base, sheen.filter(ImageFilter.GaussianBlur(2)))
+    d = ImageDraw.Draw(base)
+
+    # monogram: chamfered plaque (same design language as the frame)
+    m = int(bh * 0.31)
+    mcx, mcy = ox + int(bh * 0.55), oy + bh // 2
+    mc = int(m * 0.45)
+    mpts = _chamfer_points(mcx - m, mcy - m, mcx + m, mcy + m, mc)
+    mdisc = _vgrad(m * 2, m * 2, (56, 132, 116, 255), (24, 70, 62, 255))
+    mmask = Image.new("L", (m * 2, m * 2), 0)
+    ImageDraw.Draw(mmask).polygon(
+        [(x - (mcx - m), y - (mcy - m)) for x, y in mpts], fill=255)
+    base.paste(mdisc, (mcx - m, mcy - m), mmask)
+    d = ImageDraw.Draw(base)
+    d.line(mpts + [mpts[0]], fill=(215, 255, 232, 175), width=2, joint="curve")
+    af = ImageFont.truetype(DEJAVU_BOLD, int(m * 1.02))
+    ab = af.getbbox("A")
+    d.text((mcx - (ab[0] + ab[2]) / 2, mcy - (ab[1] + ab[3]) / 2),
+           "A", font=af, fill=(230, 255, 242, 255))
+
+    # divider
+    x_div = mcx + m + int(bh * 0.20)
+    d.line([x_div, oy + int(bh * 0.27), x_div, oy + bh - int(bh * 0.27)],
+           fill=(190, 255, 220, 75), width=1)
+
+    # EQ signature pulse (animated via eq_ratios)
+    ratios = eq_ratios or [0.35, 0.62, 1.0, 0.62, 0.35]
+    nbars = len(ratios)
+    bw_bar, gap = max(3, int(bh * 0.045)), max(3, int(bh * 0.038))
+    max_h = int(bh * 0.46)
+    total_w = nbars * bw_bar + (nbars - 1) * gap
+    ex = ox + bw - int(bh * 0.24) - total_w
+    ecy = oy + bh // 2
+    bars = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bars)
+    for i, r in enumerate(ratios):
+        hbar = max(4, int(max_h * r))
+        x = ex + i * (bw_bar + gap)
+        bd.rounded_rectangle([x, ecy - hbar / 2, x + bw_bar, ecy + hbar / 2],
+                             radius=bw_bar // 2, fill=(150, 255, 195, 235))
+    base = Image.alpha_composite(base, bars.filter(ImageFilter.GaussianBlur(1)))
+    base = Image.alpha_composite(base, bars)
+    d = ImageDraw.Draw(base)
+
+    # wordmark between divider and equalizer
+    tf = ImageFont.truetype(FONT_PATH, int(bh * 0.255))
+    spacing = max(1, int(bh * 0.022))
+    widths = [d.textlength(ch_, font=tf) for ch_ in TEXT]
+    total = sum(widths) + spacing * (len(TEXT) - 1)
+    x0 = x_div + int(bh * 0.20)
+    x1 = ex - int(bh * 0.26)
+    sx = x0 + max(0, (x1 - x0 - total) / 2)
+    tb = tf.getbbox(TEXT)
+    sy = mcy - (tb[1] + tb[3]) / 2
+    x = sx
+    for ch_, wch in zip(TEXT, widths):
+        d.text((x, sy), ch_, font=tf, fill=(242, 255, 248, 255))
+        x += wch + spacing
+
+    if abs(scale - 1.0) > 1e-6:
+        sw_, sh_ = max(1, int(aw * scale)), max(1, int(ah * scale))
+        small = base.resize((sw_, sh_), Image.BICUBIC)
+        canvas = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+        canvas.paste(small, ((aw - sw_) // 2, (ah - sh_) // 2), small)
+        base = canvas
+    return base
+
+
+def _waveframe_frame(video_w, t, alpha):
+    """One animation frame of the living badge at time t (seconds)."""
+    # cinematic entrance: ease-out zoom + fade over the first 1.2s
+    TIN = 1.2
+    if t < TIN:
+        e = max(t, 0.0) / TIN
+        sc = 0.90 + 0.10 * (1 - (1 - e) ** 3)
+        ain = min(1.0, max(t, 0.0) / 0.7)
+    else:
+        sc, ain = 1.0, 1.0
+    # living EQ: each bar dances at its own frequency/phase + a slow beat
+    beat = 0.8 + 0.2 * math.sin(2 * math.pi * 1.3 * t + 0.5)
+    ratios = []
+    for i in range(5):
+        f = 0.8 + i * 0.27
+        ph = i * 1.9
+        r = 0.15 + 0.85 * (0.5 + 0.5 * math.sin(2 * math.pi * f * t + ph))
+        ratios.append(max(0.12, min(1.0, r * beat)))
+    badge = build_waveframe_badge(video_w, eq_ratios=ratios, scale=sc)
+    # light sweep across the glass every 7s (starts at t=2s)
+    SWEEP_EVERY, SWEEP_DUR = 7.0, 1.4
+    cyc = (t - 2.0) % SWEEP_EVERY
+    if 0 <= cyc <= SWEEP_DUR:
+        p = cyc / SWEEP_DUR
+        Wb, Hb = badge.size
+        sw = Image.new("RGBA", (Wb, Hb), (0, 0, 0, 0))
+        xc = Wb * (-0.25 + 1.5 * p)
+        bwid = Wb * 0.10
+        ImageDraw.Draw(sw).polygon(
+            [(xc - bwid, 0), (xc + bwid * 0.4, 0),
+             (xc - bwid * 0.4, Hb), (xc - bwid, Hb)],
+            fill=(255, 255, 255, int(46 * math.sin(math.pi * p))))
+        badge = Image.alpha_composite(badge, sw.filter(ImageFilter.GaussianBlur(3)))
+    # bake the global opacity (badge alpha * entrance fade)
+    k = alpha * ain
+    if k < 1.0:
+        arr = np.asarray(badge).astype(np.float32)
+        arr[..., 3] *= k
+        badge = Image.fromarray(arr.astype(np.uint8), "RGBA")
+    return badge
+
+
+def render_waveframe_frames(video_w, dur, alpha, fps=WAVEFRAME_FPS, out_dir=None):
+    """Render the living-badge PNG sequence covering the whole clip."""
+    n = int(math.ceil(dur * fps)) + 1
+    for i in range(n):
+        t = i / fps
+        frame = _waveframe_frame(video_w, t, alpha)
+        frame.save(os.path.join(out_dir, f"f{i:04d}.png"))
+    return n
+
+
+def _audio_args_for(in_path):
+    acodec = _audio_codec(in_path)
+    if acodec == "aac":
+        return ["-map", "0:a?", "-c:a", "copy"]
+    if acodec:
+        return ["-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
+    return []
+
+
+def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
+                          animated=True, fps=WAVEFRAME_FPS):
+    """Apply the Avano Waveframe corner badge for the whole clip.
+
+    animated=True (default): the living edition — EQ pulses like real audio,
+    cinematic ease-out entrance, light sweep across the glass every 7s and a
+    gentle float. animated=False: the original static badge.
+    Audio is preserved (AAC copied, other codecs re-encoded to AAC,
+    silent sources stay silent).
+    """
+    dur, W, H = probe(in_path)
+    with tempfile.TemporaryDirectory() as td:
+        if animated:
+            render_waveframe_frames(W, dur, alpha, fps, td)
+            badge_probe = Image.open(os.path.join(td, "f0000.png"))
+            aw, ah = badge_probe.size
+            mx = int(W * 0.06)
+            x, y = W - aw - mx, int(H * 0.90) - ah
+            fc = (
+                "[1:v]format=rgba[wm];"
+                "[0:v][wm]overlay="
+                f"x={x}:y='{y}+4*sin(2*PI*t/5)':eof_action=pass,"
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+            )
+            inputs = ["-i", in_path, "-framerate", str(fps),
+                      "-i", os.path.join(td, "f%04d.png")]
+        else:
+            badge_path = os.path.join(td, "waveframe.png")
+            badge = build_waveframe_badge(W)
+            badge.save(badge_path)
+            aw, ah = badge.size
+            mx = int(W * 0.06)
+            x, y = W - aw - mx, int(H * 0.90) - ah
+            fc = (
+                "[1:v]format=rgba,"
+                f"colorchannelmixer=aa={alpha},"
+                "fade=t=in:st=0:d=0.5:alpha=1[wm];"
+                "[0:v][wm]overlay="
+                f"x={x}:y={y},"
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+            )
+            inputs = ["-i", in_path, "-loop", "1", "-t", f"{dur:.2f}",
+                      "-i", badge_path]
+        cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
+               "-filter_complex", fc, "-map", "[v]",
+               *_audio_args_for(in_path),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-movflags", "+faststart", "-shortest", out_path]
+        subprocess.run(cmd, check=True)
+
+    return {"duration": round(dur, 2), "size": [W, H],
+            "badge": [aw, ah], "position": [x, y], "alpha": alpha,
+            "animated": animated, "style": "waveframe-fixed"}
