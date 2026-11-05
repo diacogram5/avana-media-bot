@@ -15,21 +15,22 @@ What this module NEVER does:
   * No Instagram scraping / no bypassing of any platform's limits.
   * Clips are NEVER presented as real Instagram trends — every list carries
     the «⭐ منتخب آوانو» badge.
-  * The v2 Avano Motion Watermark (@AvanoMediaBot glassy pill, 25% opacity,
-    appears at 45% of duration, 800ms fades) is burned into every clip
-    before sending: download → ffprobe validate → GIF→MP4 if needed →
+  * The Waveframe watermark (@AvanoMediaBot glass badge: A monogram left,
+    "@AvanoMediaBot" centre, green EQ wave right, bottom-right, ~28%
+    opacity, whole duration) is burned into every clip before sending:
+    download → ffprobe validate → GIF→MP4 if needed →
     ffmpeg watermark (audio preserved, AAC when re-encoded) → upload →
-    temp cleanup. All blocking work runs in executor threads, max 1
-    concurrent ffmpeg job (Render Free RAM control). GIF sources are
-    detected and converted to MP4 (animation preserved) before watermarking.
+    temp cleanup. The old v2 pill (play icon + clapperboard) is RETIRED
+    2026-11-05 — it must never run for new clips again.
 
 All network I/O runs in executor threads — the event loop is never blocked.
 In-memory cache only (12h TTL per category/subtopic); no DB schema changes.
 Per-user navigation state is encoded entirely in callback_data (no global
 per-user dicts).
 
-Callback scheme (unchanged from the Pexels version — byte-identical):
-    story:cat                        → category list
+Callback scheme:
+    story:cat                        → Iranian/foreign chooser (always)
+    story:foreign                    → foreign-stock (Pixabay) category list
     story:sublist:<cat_id>           → subtopic list of a category
     story:sub:<cat_id>:<sub_id>      → clip list, page 0
     story:page:<cat_id>:<sub_id>:<p> → clip list, page p
@@ -71,7 +72,7 @@ except Exception:  # pragma: no cover - sandbox fallback
 
 
 # ---------------------------------------------------------------------------
-# Watermark pipeline (v2 Avano Motion Watermark — user-approved 2026-11-04).
+# Watermark pipeline (Waveframe badge — user-approved 2026-11-05).
 # Every clip is downloaded, validated, watermarked and uploaded; the source
 # file is never modified and temp files are removed after sending.
 # The watermark module is imported LAZILY so a missing PIL/numpy can never
@@ -88,7 +89,7 @@ _PROCESS_TIMEOUT = 300  # max seconds for download+watermark of one clip
 
 
 def _watermark_module():
-    """Lazy import of the v2 motion watermark (PIL/numpy needed)."""
+    """Lazy import of the Waveframe watermark module (PIL/numpy needed)."""
     try:
         from app.bot import motion_watermark
         return motion_watermark
@@ -175,7 +176,9 @@ def _process_clip(clip: dict, tmpdir: str) -> str:
         info = _probe_media(work)
     mw = _watermark_module()
     out = os.path.join(tmpdir, "wm.mp4")
-    mw.apply_watermark(work, out)
+    # Waveframe badge (2026-11-05): the v2 pill (play icon + clapperboard)
+    # is retired — it must never run for new clips again.
+    mw.apply_waveframe_badge(work, out)
     if not os.path.getsize(out):
         raise RuntimeError("watermark produced empty file")
     return out
@@ -752,22 +755,31 @@ def register_story_handlers(router) -> None:
     @router.callback_query(F.data == "story:cat")
     async def story_cat(callback, conn=None, config=None):
         await callback.answer()
-        # NEW (2026-11-05): Iranian curated archive chooser. Guarded and
-        # additive only: when the archive is empty, behavior is unchanged.
+        # 2026-11-05 fix: ALWAYS show the Iranian/foreign chooser — even
+        # when the Iranian archive is still empty. Falling through to the
+        # Pixabay categories here sent unrelated foreign stock clips
+        # (e.g. a couple by the sea) for Persian subtopics like دلتنگی.
+        # The Iranian branch answers with «هنوز کلیپ مناسبی...» until
+        # its archive has a matching clip; Pixabay stays reachable only
+        # under the honestly-labelled «استوک خارجی» branch.
         try:
-            from .story_archive import iranian_clip_count, iranian_chooser_kb
-            if iranian_clip_count() > 0:
-                try:
-                    await callback.message.edit_text(
-                        "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
-                        parse_mode="HTML", reply_markup=iranian_chooser_kb())
-                except Exception:
-                    await callback.message.answer(
-                        "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
-                        parse_mode="HTML", reply_markup=iranian_chooser_kb())
-                return
+            from .story_archive import iranian_chooser_kb
+            try:
+                await callback.message.edit_text(
+                    "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
+                    parse_mode="HTML", reply_markup=iranian_chooser_kb())
+            except Exception:
+                await callback.message.answer(
+                    "🎬 <b>کلیپ‌های منتخب استوری</b>\nکدام بخش؟",
+                    parse_mode="HTML", reply_markup=iranian_chooser_kb())
+            return
         except Exception:
             pass
+        await _show_categories(callback)
+
+    @router.callback_query(F.data == "story:foreign")
+    async def story_foreign(callback, conn=None, config=None):
+        await callback.answer()
         await _show_categories(callback)
 
     @router.callback_query(F.data == "story:back")
@@ -977,7 +989,7 @@ def run_self_test() -> bool:
     norend["videos"] = {}
     check("no renditions dropped", _parse_video(norend) is None)
 
-    # 9. watermark pipeline is enabled (v2, user-approved)
+    # 9. watermark pipeline is enabled (Waveframe badge, user-approved)
     check("WATERMARK_ENABLED True", WATERMARK_ENABLED is True)
     check("_process_clip present", callable(_process_clip))
     check("_probe_media present", callable(_probe_media))

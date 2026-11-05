@@ -564,7 +564,7 @@ def iranian_chooser_kb():
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 کلیپ‌های ایرانی", callback_data="sarch:home")],
-        [InlineKeyboardButton(text="🌍 استوک خارجی", callback_data="story:cat")],
+        [InlineKeyboardButton(text="🌍 استوک خارجی", callback_data="story:foreign")],
     ])
 
 
@@ -588,8 +588,13 @@ def register_story_archive_handlers(router) -> None:
     from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                                InlineKeyboardMarkup, Message)
 
-    def _btn(text, cb):
-        return InlineKeyboardButton(text=text, callback_data=cb)
+    def _btn(text, cb=None, callback_data=None):
+        # NOTE (2026-11-05): ~40 call sites pass callback_data= as a
+        # keyword; the old def _btn(text, cb) rejected it with TypeError,
+        # so EVERY archive keyboard crashed (same bug class as the
+        # 2026-11-04 story_clips _btn fix). Accept both forms.
+        return InlineKeyboardButton(text=text,
+                                    callback_data=cb or callback_data)
 
 
     # Callback prefix: sarch:  (story: is the Pixabay module — untouched)
@@ -1135,17 +1140,14 @@ def register_story_archive_handlers(router) -> None:
     async def deliver_clip(bot, chat_id: int, clip: dict) -> str:
         """Deliver one clip. Returns 'ok'|'gone'|'blocked'|'error'.
 
-        User order 2026-11-05: badge on ALL forwards. A true Telegram
-        forward cannot be modified, so forward-mode clips are downloaded,
-        badged and re-sent (source credit stays in the corporate caption).
-        Plain forward remains only as a last-resort fallback.
+        User order 2026-11-05 (error report — SUPERSEDES the 09:41
+        'badge on ALL forwards' order): a direct Telegram forward is
+        NEVER processed or watermarked — raw forward_message, original
+        source header preserved. Only resend-mode clips with
+        watermark_ok=1 go through the Waveframe badge.
         """
         try:
             if clip.get("mode") == "forward":
-                res = await deliver_waveframed(bot, chat_id, clip)
-                if res == "ok":
-                    return "ok"
-                # last resort: plain forward (original behavior)
                 if clip.get("source_chat_id") and clip.get("source_message_id"):
                     try:
                         await bot.forward_message(
@@ -1156,12 +1158,12 @@ def register_story_archive_handlers(router) -> None:
                         if "message to forward not found" in msg or "message_id_invalid" in msg:
                             set_clip_status(clip["id"], "unavailable")
                             return "gone"
-                        if "protected" in msg:
+                        if "protected" in msg or "can't be forwarded" in msg:
                             set_clip_status(clip["id"], "unavailable")
                             return "blocked"
-                        _log.warning("deliver forward fallback failed: %s", e)
+                        _log.warning("deliver forward failed: %s", e)
                         return "error"
-                return res
+                return "error"
             # resend mode: Waveframe badge first when permitted, else plain
             # resend with corporate caption.
             if int(clip.get("watermark_ok") or 0) == 1:
@@ -1246,7 +1248,7 @@ def register_story_archive_handlers(router) -> None:
                f"🎞 {sum(1 for _ in clips)} کلیپ در این صفحه"
                if clips else
                f"{_cat_title(cat)} ← {_sub_title(cat, sub)}\n"
-               f"⏳ هنوز کلیپی در این بخش نیست؛ به‌زودی اضافه می‌شود.")
+               f"هنوز کلیپ مناسبی برای این موضوع موجود نیست.")
         try:
             await callback.message.edit_text(txt, reply_markup=kb)
         except Exception:
