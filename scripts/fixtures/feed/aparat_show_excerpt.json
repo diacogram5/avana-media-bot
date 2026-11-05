@@ -1,0 +1,263 @@
+{
+ "data": {
+  "type": "VideoShow",
+  "id": "63556249",
+  "attributes": {
+   "id": 63556249,
+   "title": "کلیپ عاشقانه با متن / آهنگ عاشقانه / ماه خودم میمونی",
+   "description": "",
+   "uid": "jtk01l2",
+   "visit_cnt": "21,213",
+   "visit_cnt_non_formatted": 21213,
+   "like_cnt_non_formatted": 44,
+   "big_poster": "https://static.cdn.asset.aparat.com/avt/63556249-2499-l__8643.jpg?width=900&quality=90&secret=8chj6TFYKDJ8qnmEBeORJA",
+   "medium_poster": "https://static.cdn.asset.aparat.com/avt/63556249-2499-l__8643.jpg?width=700&quality=90&secret=F2ThUQAs74p5hxonZrkvIA",
+   "small_poster": "https://static.cdn.asset.aparat.com/avt/63556249-2499-l__8643.jpg?width=300&quality=90&secret=y358Jj7ZS-IGc4vs5bg3Kg",
+   "duration": "14",
+   "meta_duration": "PT14S",
+   "date_exact": "17 اسفند 1403 17:45",
+   "sdate": "1 سال پیش",
+   "sdate_timediff": 52522684,
+   "sdate_real": "2025-03-07 17:45:50",
+   "deleted": "no",
+   "mdate": "2025-03-07T17:45:50+03:30",
+   "file_link_all": [
+    {
+     "text": "با کیفیت 144p",
+     "profile": "144p",
+     "urls": [
+      "https://caspian19.asset.aparat.com/aparat-video/0617612f4a28a220a13d33775a1468e863556249-144p.mp4?wmsAuthSign=WMS"
+     ]
+    },
+    {
+     "text": "با کیفیت 240p",
+     "profile": "240p",
+     "urls": [
+      "https://caspian20.asset.aparat.com/aparat-video/0617612f4a28a220a13d33775a1468e863556249-240p.mp4?wmsAuthSign=WMS"
+     ]
+    }
+   ],
+   "file_link": "https://caspian20.asset.aparat.com/aparat-video/0617612f4a28a220a13d33775a1468e863556249-480p.apt?wmsAuthSign=WMS",
+   "hls_link": "https://www.aparat.com/external/chelsea/manifest.m3u8?q=fyTcX5jcV4Njl6zOJIL+h0cv2pu9SzyrgH1m8vh2TdMbRPKRjn6YW+0hyRuxjjxbKPGtGx16GLi02XiBwnNXGBAnLtt027sEM4wdd4DUTLw/TmKtVcVDdLQA2vaRvHMQ3JjWEVhEeO2VuDZkP7rM5U7DpdD7vHAogWIVa9ZWUrqV2RL01wGfigxnmhI+VY9ppUkqRRclX1k9iHfZTME+R3gPT0IBWuwrkO0U5GOgvu9vdFSz0SS7tofs59EJpcZDsUI733BjFxrIvzGDyMsm7+crzQk7tF5zz6femEGA5/sjGlKY8AjldG7tcV7P23NsLDGTAPnekvwefB/fdKqOE1j6j2pg0YIrPIDS4wVMFl+JBU42mdOcE5NWJirSMOmbEPTvFpx6CZSR0u0flC6a68WgueHGkZz3y6ygRv6uhx5UrM4OkHZGVdVcDESBeRRERYhO3SLq/rjoCi4Ny/iZdmR/QLwitz1REb5uM5GHpEioDJ2QNT/6AXSHQo/gJrbLYG8dOK/H5IIoyau3HltFZOsk5MKMy3qzj6/37UE7VLdkNYkBQ/Tiz/1e+XmNwth8qJT6Zh0Y1QnWRhDTNyih92nMwyN/hFejMWLS0McgBSWaPu8YDQaTbFIID0DU++rf4aapZQAkYo/FscRvcjR9tYOHCslOFoMKYHFYRvRroqwzjmiAJQquRAecw+QuoFwt&opt=sFWVJBQ0UpWKCtmNNk1UDz8QLsS+iRPqjfVHadcn+O9JJIf0YAg+H7TAveRg3WWPcpi2hkbtrRsllc7jGy+XyA==",
+   "can_download": true,
+   "tags": [
+    "کلیپ عاشقانه",
+    "عاشقانه",
+    "آهنگ عاشقانه",
+    "کلیپ احساسی و عاشقانه"
+   ],
+   "tags_str": "کلیپ عاشقانه,عاشقانه,آهنگ عاشقانه,کلیپ احساسی و عاشقانه",
+   "tags_fa": [],
+   "frame_src": "https://www.aparat.com/video/video/embed/videohash/jtk01l2/vt/frame",
+   "category": {
+    "name": "موسیقی",
+    "name_en": "music",
+    "id": "7"
+   },
+   "360d": "no",
+   "process": "done",
+   "video_pass": "",
+   "comment_enable": "yes",
+   "playeradvertcornel": "",
+   "autoplay": true,
+   "official": "no",
+   "extra_data": null,
+   "link_oembed": {
+    "json": "https://www.aparat.com/oembed?url=https://www.aparat.com/api/fa/v1/v/jtk01l2&format=json",
+    "xml": "https://www.aparat.com/oembed?url=https://www.aparat.com/api/fa/v1/v/jtk01l2&format=xml"
+   },
+   "content_type": "video",
+   "file_hash": "fbf9bfaa38edc52d5e9e77e356a6a07b",
+   "isCompany": false,
+   "isAbroad": true,
+   "linkDspDiscovery": "https://dsp.aparat.com/v1/dsp/bid?ads_type=preroll&channel=3139348&channel_username=faezehradmanesh&provider=0&location=abroad&cat_id=IAB1_6&device_type=desktop&pos_type=discovery&posTypeCnt%5Bdiscovery%5D=1&client_type=app&referer=one&get_ids_v=v4&tags_dsp_index=1&os_device_type=site&keywords=کلیپ عاشقانه&keywords=عاشقانه&keywords=آهنگ عاشقانه&keywords=کلیپ احساسی و عاشقانه&keywords=موسیقی عاشقانه&keywords=کلیپ ویدئویی&keywords=هنر و سرگرمی&keywords=عشق و احساسات&keywords=آهنگ عاشقانه فارسی&keywords=کلیپ احساسی",
+   "previewDspDiscovery": null,
+   "kids_friendly": "yes",
+   "userOptMessage": null,
+   "userOptMessageCode": null,
+   "owner_username": "faezehradmanesh",
+   "bandwidth_text": "",
+   "max_width": "720",
+   "max_height": "1280",
+   "is_reportable": false,
+   "has_iframe_ad": false,
+   "show_logo_watermark": true,
+   "meta_description": "کلیپ عاشقانه با متن / آهنگ عاشقانه / ماه خودم میمونی",
+   "meta_title": "کلیپ عاشقانه با متن / آهنگ عاشقانه / ماه خودم میمونی",
+   "playeradvert_arr": {
+    "type": "video",
+    "link": "",
+    "linkVast": "https://plus.sabavision.com/video/site/acc41016-7df1-4275-b1ac-134681db3662/10393-Z080?duration=14&categories=iab1-6&vid=63556249&tchannel=3139348&displaymanager=app&userid=3139348&interface=imaApp&keywords=کلیپ عاشقانه&keywords=عاشقانه&keywords=آهنگ عاشقانه&keywords=کلیپ احساسی و عاشقانه&keywords=موسیقی عاشقانه&keywords=کلیپ ویدئویی&keywords=هنر و سرگرمی&keywords=عشق و احساسات&keywords=آهنگ عاشقانه فارسی&keywords=کلیپ احساسی",
+    "pauseAd": "https://plus.sabavision.com/site/edf0f4c1-788f-44d3-bca7-b1da21f66a75/ALL?zones=3146-Z264&interface=imaApp",
+    "boostAd": null,
+    "syncReplaceAd": "https://plus.sabavision.com/site/edf0f4c1-788f-44d3-bca7-b1da21f66a75/ALL?zones=3679-Z436&categories=music&interface=imaApp&duration=14"
+   },
+   "playListAllLink": "/api/fa/v1/login?afterlogin=addtoplaylist&uid=jtk01l2",
+   "playListAllLinkStatus": "login",
+   "playListCreateLink": "https://www.aparat.com/api/fa/v1/video/playlist/add/videohash/jtk01l2/pid/-1/tty/1793879634/hash/ef9fc5c4cd488720be59043572612d00916fc03e",
+   "video_cnt": "40949",
+   "share": {
+    "status": "login",
+    "link": null
+   },
+   "hls": {
+    "enable": true,
+    "link": "https://www.aparat.com/external/chelsea/manifest.m3u8?q=fyTcX5jcV4Njl6zOJIL+h0cv2pu9SzyrgH1m8vh2TdMbRPKRjn6YW+0hyRuxjjxbKPGtGx16GLi02XiBwnNXGBAnLtt027sEM4wdd4DUTLw/TmKtVcVDdLQA2vaRvHMQ3JjWEVhEeO2VuDZkP7rM5U7DpdD7vHAogWIVa9ZWUrqV2RL01wGfigxnmhI+VY9ppUkqRRclX1k9iHfZTME+R3gPT0IBWuwrkO0U5GOgvu9vdFSz0SS7tofs59EJpcZDsUI733BjFxrIvzGDyMsm7+crzQk7tF5zz6femEGA5/sjGlKY8AjldG7tcV7P23NsLDGTAPnekvwefB/fdKqOE1j6j2pg0YIrPIDS4wVMFl+JBU42mdOcE5NWJirSMOmbEPTvFpx6CZSR0u0flC6a68WgueHGkZz3y6ygRv6uhx5UrM4OkHZGVdVcDESBeRRERYhO3SLq/rjoCi4Ny/iZdmR/QLwitz1REb5uM5GHpEioDJ2QNT/6AXSHQo/gJrbLYG8dOK/H5IIoyau3HltFZOsk5MKMy3qzj6/37UE7VLdkNYkBQ/Tiz/1e+XmNwth8qJT6Zh0Y1QnWRhDTNyih92nMwyN/hFejMWLS0McgBSWaPu8YDQaTbFIID0DU++rf4aapZQAkYo/FscRvcjR9tYOHCslOFoMKYHFYRvRroqwzjmiAJQquRAecw+QuoFwt&opt=sFWVJBQ0UpWKCtmNNk1UDz8QLsS+iRPqjfVHadcn+O9JJIf0YAg+H7TAveRg3WWPcpi2hkbtrRsllc7jGy+XyA=="
+   },
+   "reportCategory": [
+    {
+     "reason_id": 45,
+     "text": "اخبار جعلی"
+    },
+    {
+     "reason_id": 24,
+     "text": "ملاحظات امنیت ملی یا ضد تروریسم"
+    },
+    {
+     "reason_id": 25,
+     "text": "پوشش نامناسب"
+    },
+    {
+     "reason_id": 26,
+     "text": "محتوای تحریک آمیز جنسی"
+    },
+    {
+     "reason_id": 27,
+     "text": "توهین به قومیت ها / محتوای نژادپرستی"
+    },
+    {
+     "reason_id": 28,
+     "text": "توهین به اقلیت های مذهبی"
+    },
+    {
+     "reason_id": 29,
+     "text": "اهانت به مقامات سیاسی"
+    },
+    {
+     "reason_id": 30,
+     "text": "داشتن محتوای خشن یا زننده"
+    },
+    {
+     "reason_id": 31,
+     "text": "تهمت و افترا"
+    },
+    {
+     "reason_id": 32,
+     "text": "فعالیت‌های آسیب‌زا یا خطرناک"
+    },
+    {
+     "reason_id": 33,
+     "text": "نفرت پراکنی، ارعاب و تهدید"
+    },
+    {
+     "reason_id": 34,
+     "text": "کودک آزاری"
+    },
+    {
+     "reason_id": 35,
+     "text": "محتوای نامناسب برای کودکان"
+    },
+    {
+     "reason_id": 36,
+     "text": "رفتار تقلیدی یا ضد اجتماعی"
+    },
+    {
+     "reason_id": 37,
+     "text": "داشتن محتوای گمراه کننده"
+    },
+    {
+     "reason_id": 38,
+     "text": " مغایرت داشتن با شئونات یا قوانین کشور "
+    },
+    {
+     "reason_id": 39,
+     "text": "مغایرت داشتن تیتر و توضیح با محتوای ویدیو"
+    },
+    {
+     "reason_id": 40,
+     "text": "عدم رعایت حریم خصوصی افراد"
+    },
+    {
+     "reason_id": 41,
+     "text": "عدم رعایت حق نشر"
+    },
+    {
+     "reason_id": 42,
+     "text": "استفاده تبلیغاتی غیرمجاز"
+    },
+    {
+     "reason_id": 43,
+     "text": "مشکل فنی صدا یا تصویر"
+    },
+    {
+     "reason_id": 44,
+     "text": "سایر موارد"
+    }
+   ],
+   "comment_cnt": "0",
+   "comment_cnt_non_formatted": "0",
+   "badge": "normal",
+   "commentSendLink": "https://www.aparat.com/api/fa/v1/video/comment/new/videohash/jtk01l2/tty/1793879634/hash/c7ac523ecaa0d975c0724ef7e96163aec60c9c21",
+   "isIncome": true,
+   "income_type": "republisher",
+   "annotation": {
+    "duration": 20,
+    "start_time": 80
+   },
+   "playerOption": {
+    "stats": {
+     "statUrl": "https://www.aparat.com/external/visitpost/uid/0/vid/63556249/dt/mobile/ip/1746780706/prv/none/afcn/0/pid/3139348/pt/none/it/republisher/ts/direct/plid/13374936/cid/7/dur/14/emb/0/vt/video/af/none/fol/0/key/d47caf89989e9d8f3393594babeb272a"
+    }
+   },
+   "link_pixel_sabavision": "https://plus.sabavision.com/pixel/aparat/pixel.jpg?pid=prm63556249&keywords=موسیقی عاشقانه&keywords=کلیپ ویدئویی&keywords=هنر و سرگرمی&keywords=عشق و احساسات&keywords=آهنگ عاشقانه فارسی&keywords=کلیپ احساسی&rand=377188",
+   "is_full_processed": true
+  }
+ },
+ "included": [
+  {
+   "type": "Video",
+   "id": "23975056",
+   "attributes": {
+    "uid": "dobi73z",
+    "title": "آهنگ عاشقانه / زیبای منی یارم / کلیپ عاشقانه برای استوری",
+    "duration": "28"
+   }
+  },
+  {
+   "type": "Video",
+   "id": "23975907",
+   "attributes": {
+    "uid": "iaoxws9",
+    "title": "آهنگ ترکی عاشقانه برای استوری / سوگیلیم سنین اوچون وارام بو سودا دا",
+    "duration": "12"
+   }
+  },
+  {
+   "type": "Video",
+   "id": "23975934",
+   "attributes": {
+    "uid": "pabhg06",
+    "title": "ویدیو لاو / عاشقانه جدید / استوری عاشقانه / تو هر شرایطی کنارتم",
+    "duration": "11"
+   }
+  },
+  {
+   "type": "Video",
+   "id": "24079212",
+   "attributes": {
+    "uid": "shbf47c",
+    "title": "آهنگ عاشقانه با متن / جز تو کسی تو قلبم نیست",
+    "duration": "26"
+   }
+  },
+  {
+   "type": "Video",
+   "id": "24109779",
+   "attributes": {
+    "uid": "xzf3937",
+    "title": "آهنگ ترکی شاد / آی آی آی ایشیقیندا / دنیا سنین یاراشیقیندا",
+    "duration": "12"
+   }
+  }
+ ]
+}

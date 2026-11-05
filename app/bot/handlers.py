@@ -4518,6 +4518,17 @@ async def run_bot(config: Config) -> None:
     except Exception as e:
         log.warning("story_clips refresh not scheduled: %s", e)
 
+    # Hourly clip feed for the Iranian story archive (Telegram @ehsaspaak
+    # + Aparat, app/bot/clip_feed.py). Same guarded pattern: all network
+    # and download work runs in an executor, the loop never raises, and
+    # a failure here never affects other features. The first run is a
+    # bounded bootstrap so the archive stocks immediately.
+    try:
+        from .clip_feed import clip_feed_loop as _clip_feed_loop
+        _asyncio_outer.create_task(_clip_feed_loop())
+    except Exception as e:
+        log.warning("clip_feed loop not scheduled: %s", e)
+
     # Track last received update for the health endpoint
     _health["last_update"] = 0
 

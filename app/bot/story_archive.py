@@ -87,6 +87,11 @@ _TABLE_DDLS = [
         payload TEXT NOT NULL,
         fetched_at INTEGER NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS feed_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    )""",
 ]
 
 def _get_conn():
@@ -136,6 +141,11 @@ _NEW_COLUMNS = [
     ("last_error", "TEXT DEFAULT ''"),
     ("processed_file_id", "TEXT DEFAULT ''"),
     ("processed_at", "INTEGER DEFAULT 0"),
+    # Feed columns (2026-11-05, clip_feed.py): web-sourced clips start
+    # with file_id='' and keep their public source_url; feed_key is the
+    # exact-dedup key (tg:<post_id> / ap:<videohash>).
+    ("source_url", "TEXT DEFAULT ''"),
+    ("feed_key", "TEXT DEFAULT ''"),
 ]
 
 
@@ -436,7 +446,8 @@ def archive_clip(*, file_unique_id: str, file_id: str, category: str,
                  watermark_ok: int = 0,
                  status: str = "active", added_by: int = 0,
                  file_size: int = 0, forward_only: int = 0,
-                 categorized_by: str = "", categorized_at: int = 0
+                 categorized_by: str = "", categorized_at: int = 0,
+                 source_url: str = "", feed_key: str = ""
                  ) -> tuple[bool, str]:
     """Insert a clip. Returns (ok, 'ok'|'duplicate'|'db')."""
     if is_duplicate(file_unique_id, source_chat_id, source_message_id):
@@ -450,14 +461,16 @@ def archive_clip(*, file_unique_id: str, file_id: str, category: str,
             (file_unique_id, file_id, source_chat_id, source_message_id,
              source_username, mode, category, subcategory, orig_caption,
              duration, width, height, watermark_ok, status, added_at, added_by,
-             file_size, forward_only, categorized_by, categorized_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             file_size, forward_only, categorized_by, categorized_at,
+             source_url, feed_key)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (file_unique_id, file_id, source_chat_id, source_message_id,
               source_username, mode, category, subcategory, orig_caption[:500],
               duration, width, height, int(watermark_ok or 0), status,
               int(time.time()), added_by,
               int(file_size or 0), int(forward_only or 0),
-              categorized_by, int(categorized_at or 0)))
+              categorized_by, int(categorized_at or 0),
+              source_url or "", feed_key or ""))
         conn.commit()
         return (True, "ok")
     except Exception as e:
@@ -513,6 +526,24 @@ def get_clip(clip_id: int) -> dict | None:
         return dict(zip([d[0] for d in cur.description], row))
     except Exception as e:
         _log.warning("get_clip failed: %s", e)
+        return None
+
+
+def get_clip_by_unique(file_unique_id: str) -> dict | None:
+    """Fetch a clip by its Telegram file_unique_id (exact match)."""
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        cur = conn.execute(
+            "SELECT * FROM story_archive WHERE file_unique_id=?",
+            (file_unique_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip([d[0] for d in cur.description], row))
+    except Exception as e:
+        _log.warning("get_clip_by_unique failed: %s", e)
         return None
 
 
@@ -626,6 +657,56 @@ def save_suggestion(clip_id: int, *, title: str = "", artist: str = "",
         return False
 
 
+def set_clip_error(clip_id: int, error: str) -> bool:
+    """Record a processing/analysis error on a clip (shown on its card)."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        conn.execute("UPDATE story_archive SET last_error=? WHERE id=?",
+                     (error or "", clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("set_clip_error failed: %s", e)
+        return False
+
+
+def save_processed(clip_id: int, file_id: str) -> bool:
+    """Store the final (badged) file_id after one-time processing."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        conn.execute(
+            "UPDATE story_archive SET processed_file_id=?, processed_at=?"
+            " WHERE id=?", (file_id, int(time.time()), clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("save_processed failed: %s", e)
+        return False
+
+
+def set_clip_file_id(clip_id: int, file_id: str) -> bool:
+    """Store a Telegram file_id captured from a send (queue preview by
+    public URL, or first delivery). Lets later sends reuse the file_id
+    instead of the URL. Never raises."""
+    if not file_id:
+        return False
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        conn.execute("UPDATE story_archive SET file_id=? WHERE id=?",
+                     (file_id, clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("set_clip_file_id failed: %s", e)
+        return False
+
+
 def approve_clip(clip_id: int) -> bool:
     """Approve a pending clip: apply the stored suggestion (if any) as its
     final category, mark categorized_by='admin', status='active'.
@@ -702,8 +783,24 @@ async def analyze_clip_for_queue(bot, clip: dict) -> None:
     tmpd = tempfile.mkdtemp(prefix="sarch_an_")
     try:
         src = os.path.join(tmpd, "src.mp4")
-        f = await bot.get_file(clip["file_id"])
-        await bot.download_file(f.file_path, destination=src)
+        if clip.get("file_id"):
+            f = await bot.get_file(clip["file_id"])
+            await bot.download_file(f.file_path, destination=src)
+        elif clip.get("source_url"):
+            # Feed clip (web source, no Telegram file_id yet): download
+            # from the public URL instead of getFile.
+            import asyncio
+            from .clip_feed import download_url_to_file
+            _loop = asyncio.get_running_loop()
+            _p, _e = await _loop.run_in_executor(
+                None, download_url_to_file, clip["source_url"], src,
+                BOT_API_DOWNLOAD_LIMIT)
+            if not _p:
+                save_suggestion(clip["id"], error="source_gone")
+                return
+        else:
+            save_suggestion(clip["id"], error="analysis_failed")
+            return
         with open(src, "rb") as fh:
             data = fh.read()
         title, artist = await _identify_audio_bytes(data)
@@ -897,6 +994,24 @@ def register_story_archive_handlers(router) -> None:
             return
         await callback.answer()
         st = archive_stats()
+        try:
+            from .clip_feed import get_feed_status as _feed_status
+            _fs = _feed_status()
+        except Exception:
+            _fs = None
+        feed_lines = ""
+        if _fs is not None:
+            if _fs.get("last_run_at"):
+                _ago_min = max(0, int((time.time() - _fs["last_run_at"]) / 60))
+                _ago = (f"{_ago_min} دقیقه پیش" if _ago_min < 60
+                        else f"{_ago_min // 60} ساعت پیش")
+                feed_lines = (f"\n📰 فید ساعتی: آخرین بررسی {_ago}، "
+                              f"{_fs.get('last_new', 0)} کلیپ تازه"
+                              f" ({_fs.get('pending_feed', 0)} در صف فید)")
+                if _fs.get("last_error"):
+                    feed_lines += f"\n⚠️ آخرین خطای فید: {_fs['last_error']}"
+            else:
+                feed_lines = "\n📰 فید ساعتی: هنوز اجرا نشده."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [_btn("➕ ثبت کانال جدید", callback_data="sarch:addchan")],
             [_btn("📋 کانال‌ها", callback_data="sarch:chans")],
@@ -908,7 +1023,7 @@ def register_story_archive_handlers(router) -> None:
         txt = (f"🎬 <b>آرشیو استوری ایرانی</b>\n\n"
                f"📡 کانال‌های فعال: {st['channels']}\n"
                f"🎞 کلیپ‌های فعال: {st['clips']}\n"
-               f"⏳ در انتظار تأیید: {st['pending']}\n\n"
+               f"⏳ در انتظار تأیید: {st['pending']}{feed_lines}\n\n"
                f"💡 برای افزودن کلیپ قدیمی، آن را به همین‌جا فوروارد کنید"
                f" (بعد از «📥 افزودن دستی کلیپ»).")
         try:
@@ -1147,6 +1262,15 @@ def register_story_archive_handlers(router) -> None:
             if clip.get("mode") == "forward" and clip.get("source_chat_id") and clip.get("source_message_id"):
                 await callback.message.bot.forward_message(
                     callback.message.chat.id, clip["source_chat_id"], clip["source_message_id"])
+            elif clip.get("source_url") and not clip.get("file_id"):
+                # Feed clip preview: Telegram fetches the public URL and
+                # the returned message carries the file_id — store it so
+                # later sends reuse the file instead of the URL.
+                msg = await callback.message.bot.send_video(
+                    callback.message.chat.id, clip["source_url"])
+                fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
+                if fid:
+                    set_clip_file_id(clip["id"], fid)
             else:
                 await callback.message.bot.send_video(
                     callback.message.chat.id, clip["file_id"])
@@ -1433,14 +1557,85 @@ def register_story_archive_handlers(router) -> None:
             except Exception:
                 pass
 
+    async def deliver_feed_first(bot, chat_id: int, clip: dict) -> str:
+        """First delivery of a feed clip (web source, no stored final).
+
+        Download from source_url -> apply the MAIN user badge once ->
+        send -> store the resulting file_id as the processed final, so
+        later deliveries are instant file_id sends. On badge failure,
+        fall back to sending the raw public URL and capture its file_id.
+        Returns 'ok'|'error'. Temp dir always cleaned.
+        """
+        import asyncio
+        import os
+        import shutil
+        import tempfile
+        tmpd = tempfile.mkdtemp(prefix="sarch_feed_")
+        try:
+            # A clip whose badge already failed once keeps its stored raw
+            # file_id: send it instantly instead of paying a doomed
+            # download+badge attempt on every delivery.
+            if clip.get("file_id") and (clip.get("last_error") or "") == "badge_failed":
+                try:
+                    await bot.send_video(chat_id, clip["file_id"],
+                                         caption=corporate_caption(clip))
+                    return "ok"
+                except Exception:
+                    pass  # fall through to the badge attempt below
+            async with _wm_sem():
+                src = os.path.join(tmpd, "src.mp4")
+                out = os.path.join(tmpd, "badged.mp4")
+                from .clip_feed import download_url_to_file
+                loop = asyncio.get_running_loop()
+                _p, _e = await loop.run_in_executor(
+                    None, download_url_to_file, clip["source_url"], src,
+                    BOT_API_DOWNLOAD_LIMIT)
+                if not _p:
+                    raise RuntimeError(f"feed download failed: {_e}")
+
+                def _run():
+                    from .motion_watermark import apply_user_badge
+                    return apply_user_badge(src, out)
+
+                await loop.run_in_executor(None, _run)
+                from aiogram.types import FSInputFile
+                msg = await bot.send_video(
+                    chat_id, FSInputFile(out), caption=corporate_caption(clip))
+                fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
+                if fid:
+                    save_processed(clip["id"], fid)
+                    set_clip_file_id(clip["id"], fid)
+                return "ok"
+        except Exception as e:
+            _log.warning("deliver_feed_first badge path failed (%s); "
+                         "falling back to raw URL: %s", clip.get("id"), e)
+            set_clip_error(clip["id"], "badge_failed")
+            try:
+                msg = await bot.send_video(
+                    chat_id, clip["source_url"], caption=corporate_caption(clip))
+                fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
+                if fid:
+                    set_clip_file_id(clip["id"], fid)
+                return "ok"
+            except Exception as e2:
+                _log.warning("deliver_feed_first raw fallback failed: %s", e2)
+                return "error"
+        finally:
+            try:
+                shutil.rmtree(tmpd, ignore_errors=True)
+            except Exception:
+                pass
+
     async def deliver_clip(bot, chat_id: int, clip: dict) -> str:
         """Deliver one clip. Returns 'ok'|'gone'|'blocked'|'error'.
 
         User order 2026-11-05 (error report — SUPERSEDES the 09:41
         'badge on ALL forwards' order): a direct Telegram forward is
         NEVER processed or watermarked — raw forward_message, original
-        source header preserved. Only resend-mode clips with
-        watermark_ok=1 go through the Waveframe badge.
+        source header preserved. Resend-mode clips prefer the stored
+        FINAL file (user badge, applied once at first delivery for feed
+        clips); legacy clips without a final fall back to the on-delivery
+        Waveframe badge when permitted, else plain resend.
         """
         try:
             if clip.get("mode") == "forward":
@@ -1460,8 +1655,15 @@ def register_story_archive_handlers(router) -> None:
                         _log.warning("deliver forward failed: %s", e)
                         return "error"
                 return "error"
-            # resend mode: Waveframe badge first when permitted, else plain
-            # resend with corporate caption.
+            # resend mode: stored final first, then Waveframe, then plain
+            if clip.get("processed_file_id"):
+                await bot.send_video(chat_id, clip["processed_file_id"],
+                                     caption=corporate_caption(clip))
+                return "ok"
+            if clip.get("source_url"):
+                # Feed clip without a stored final: badge once at first
+                # delivery (or send the raw URL when the badge fails).
+                return await deliver_feed_first(bot, chat_id, clip)
             if int(clip.get("watermark_ok") or 0) == 1:
                 return await deliver_waveframed(bot, chat_id, clip)
             await bot.send_video(chat_id, clip["file_id"],

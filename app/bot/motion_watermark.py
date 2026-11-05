@@ -512,3 +512,119 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
     return {"duration": round(dur, 2), "size": [W, H],
             "badge": [aw, ah], "position": [x, y], "alpha": alpha,
             "animated": animated, "style": "waveframe-fixed"}
+
+
+# ------------------------------------------------------- user badge (v3) ---
+# MAIN brand badge (user order 2026-11-05): the user-designed plaque
+# (neon cyan->violet rim, octagon A emblem, "AvanoMediaBot" wordmark with a
+# play-button "o", gradient swoosh underline, live EQ at the right end).
+# Brand placement: FIXED bottom-right corner for the whole video (like a TV
+# channel bug — never wanders), 0.38 * W wide, 0.7 opacity, gentle 1s
+# fade-in only; the ONLY motion is the live EQ inside the badge.
+# Asset: app/assets/user_badge.png — the EQ-less rebuild (EQ is drawn live
+# per frame). Built by ~/workspace/wm_demo/build_user_badge.py.
+USER_BADGE_ASSET = os.path.join(os.path.dirname(__file__), "..", "assets",
+                                "user_badge.png")
+USER_BADGE_SCALE = 0.38
+USER_BADGE_ALPHA = 0.7
+USER_BADGE_MARGIN_F = 0.05
+USER_BADGE_FPS = 15
+# EQ live area in the badge asset's design coords (944x264).
+_USER_BADGE_EQ = (808, 100, 86, 64)
+_USER_BADGE_NEON = [(34, 211, 238), (59, 130, 246),
+                    (139, 92, 246), (217, 70, 239)]
+
+
+def _user_badge_eq_frame(w, h, t):
+    """5 live EQ bars (right end of the badge), cyan->violet."""
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    n = 5
+    bw_bar = max(3, w // 9)
+    gap = (w - n * bw_bar) / (n - 1) if n > 1 else 0
+    beat = 0.8 + 0.2 * math.sin(2 * math.pi * 1.3 * t + 0.5)
+    ratios = [0.45, 0.8, 1.0, 0.7, 0.5]
+    for i in range(n):
+        f = 0.9 + i * 0.31
+        ph = i * 1.7
+        dance = 0.15 + 0.85 * (0.5 + 0.5 * math.sin(
+            2 * math.pi * f * t + ph)) * beat
+        r = max(0.2, min(1.0, dance)) * ratios[i]
+        bh = max(4, int((h - 4) * r))
+        x = int(i * (bw_bar + gap))
+        y = (h - bh) // 2
+        g = (i / max(1, n - 1)) * (len(_USER_BADGE_NEON) - 1)
+        gi = min(len(_USER_BADGE_NEON) - 2, int(g))
+        gf = g - gi
+        c = tuple(int(_USER_BADGE_NEON[gi][k]
+                      + (_USER_BADGE_NEON[gi + 1][k]
+                         - _USER_BADGE_NEON[gi][k]) * gf)
+                  for k in range(3)) + (240,)
+        d.rounded_rectangle([x, y, x + bw_bar, y + bh], radius=bw_bar // 2,
+                            fill=c)
+    return img
+
+
+def _user_badge_frame(video_w, t, alpha):
+    """One overlay frame (badge-sized): badge + live EQ, faded in."""
+    src = Image.open(USER_BADGE_ASSET).convert("RGBA")
+    sc = (USER_BADGE_SCALE * video_w) / src.width
+    bw, bh = int(src.width * sc), int(src.height * sc)
+    badge = src.resize((bw, bh), Image.LANCZOS)
+    ex0, ey0, ewd, ehd = _USER_BADGE_EQ
+    eq = _user_badge_eq_frame(max(8, int(ewd * sc)),
+                              max(8, int(ehd * sc)), t)
+    badge.alpha_composite(eq, (int(ex0 * sc), int(ey0 * sc)))
+    # gentle 1s ease-out fade-in, then hold at `alpha`
+    e = max(0.0, min(1.0, t / 1.0))
+    ease = 1 - (1 - e) ** 3
+    badge.putalpha(badge.split()[3].point(
+        lambda v: int(v * alpha * ease)))
+    return badge
+
+
+def apply_user_badge(in_path, out_path, alpha=USER_BADGE_ALPHA,
+                     animated=True, fps=USER_BADGE_FPS):
+    """Apply the MAIN user badge as a fixed bottom-right corner bug.
+
+    animated=True (default): the EQ inside the badge dances like real
+    audio; animated=False: one mid-dance EQ pose, static.
+    Audio is preserved (AAC copied, other codecs re-encoded to AAC,
+    silent sources stay silent). The badge never moves, never covers the
+    clip's main subject area beyond its discreet corner.
+    """
+    dur, W, H = probe(in_path)
+    with tempfile.TemporaryDirectory() as td:
+        if animated:
+            n = int(math.ceil(dur * fps)) + 1
+            for i in range(n):
+                _user_badge_frame(W, i / fps, alpha).save(
+                    os.path.join(td, f"f{i:04d}.png"))
+            badge_probe = Image.open(os.path.join(td, "f0000.png"))
+            aw, ah = badge_probe.size
+            inputs = ["-i", in_path, "-framerate", str(fps),
+                      "-i", os.path.join(td, "f%04d.png")]
+        else:
+            badge_path = os.path.join(td, "user_badge.png")
+            _user_badge_frame(W, 0.6, alpha).save(badge_path)
+            aw, ah = Image.open(badge_path).size
+            inputs = ["-i", in_path, "-loop", "1", "-t", f"{dur:.2f}",
+                      "-i", badge_path]
+        m = int(W * USER_BADGE_MARGIN_F)
+        x, y = W - aw - m, H - ah - m
+        fc = (
+            "[1:v]format=rgba[wm];"
+            "[0:v][wm]overlay="
+            f"x={x}:y={y}:eof_action=pass,"
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+        )
+        cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
+               "-filter_complex", fc, "-map", "[v]",
+               *_audio_args_for(in_path),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-movflags", "+faststart", "-shortest", out_path]
+        subprocess.run(cmd, check=True)
+
+    return {"duration": round(dur, 2), "size": [W, H],
+            "badge": [aw, ah], "position": [x, y], "alpha": alpha,
+            "animated": animated, "style": "user-badge-fixed"}
