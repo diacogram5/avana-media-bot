@@ -15,6 +15,18 @@ Hard constraints honored:
   Similar clips are NEVER removed (user req #5).
 - Every DB op is try/except isolated: this module can never crash the bot.
 - Protected-content posts are never archived (respect author restriction).
+
+Final design (user-approved 2026-11-05, Phase 1):
+- NO auto-accept at start: EVERY clip goes to the moderation queue first;
+  the system suggests a subcategory (song + lyrics + caption + source) and
+  the admin confirms or picks another. After >=20 clips + an accuracy
+  review, auto-accept is reconsidered.
+- Suggestion is ADVISORY only — the admin decides (approve_clip).
+- Files > Bot API download limit (20MB) are forward-only (no processing).
+- Processing (Waveframe + outro) happens ONCE at approval — Phase 2.
+- Before ANY schema change, _init_tables copies the current rows into
+  *_bak_20261105 tables (rollback: INSERT OR REPLACE ... SELECT * FROM
+  the backup table).
 """
 from __future__ import annotations
 
@@ -92,18 +104,7 @@ def _get_conn():
     try:
         import libsql_experimental as libsql
         conn = libsql.connect(url, auth_token=token)
-        for _ddl in _TABLE_DDLS:
-            conn.execute(_ddl)
-        # defensive migration for DBs created before watermark_ok existed
-        for _mig in (
-            "ALTER TABLE story_channels ADD COLUMN watermark_ok INTEGER DEFAULT 0",
-            "ALTER TABLE story_archive ADD COLUMN watermark_ok INTEGER DEFAULT 0",
-        ):
-            try:
-                conn.execute(_mig)
-            except Exception:
-                pass  # column already exists
-        conn.commit()
+        _init_tables(conn)
         _ta_conn = conn
         _ta_ok = True
         _log.info("story_archive: Turso tables ready")
@@ -116,6 +117,62 @@ def _get_conn():
         _log.warning("story_archive: Turso connect failed: %s", e)
         _ta_ok = False
         return None
+
+
+# New columns added by the 2026-11-05 final design (Phase 1: suggestion
+# fields; Phase 2: processed-file fields). Additive only — never dropped.
+_NEW_COLUMNS = [
+    ("file_size", "INTEGER DEFAULT 0"),
+    ("forward_only", "INTEGER DEFAULT 0"),
+    ("identified_title", "TEXT DEFAULT ''"),
+    ("identified_artist", "TEXT DEFAULT ''"),
+    ("lyrics_excerpt", "TEXT DEFAULT ''"),
+    ("sugg_category", "TEXT DEFAULT ''"),
+    ("sugg_subcategory", "TEXT DEFAULT ''"),
+    ("cat_score", "INTEGER DEFAULT 0"),
+    ("cat_reasons", "TEXT DEFAULT ''"),
+    ("categorized_by", "TEXT DEFAULT ''"),
+    ("categorized_at", "INTEGER DEFAULT 0"),
+    ("last_error", "TEXT DEFAULT ''"),
+    ("processed_file_id", "TEXT DEFAULT ''"),
+    ("processed_at", "INTEGER DEFAULT 0"),
+]
+
+
+def _init_tables(conn) -> None:
+    """Create tables + backup snapshot + additive migrations (idempotent).
+
+    Backup (user req 2026-11-05 #9): BEFORE any schema change, the current
+    rows are copied into *_bak_20261105 tables. CREATE TABLE IF NOT EXISTS
+    keeps the ORIGINAL snapshot on later runs — the backup is never
+    overwritten by a re-run. Rollback: INSERT OR REPLACE INTO <table>
+    SELECT * FROM <table>_bak_20261105.
+    """
+    for _ddl in _TABLE_DDLS:
+        conn.execute(_ddl)
+    for _tbl in ("story_archive", "story_channels", "story_seen"):
+        try:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {_tbl}_bak_20261105"
+                f" AS SELECT * FROM {_tbl}")
+        except Exception as e:
+            _log.warning("story_archive: backup of %s failed: %s", _tbl, e)
+    for _col, _typ in _NEW_COLUMNS:
+        try:
+            conn.execute(
+                f"ALTER TABLE story_archive ADD COLUMN {_col} {_typ}")
+        except Exception:
+            pass  # column already exists
+    # defensive migration for DBs created before watermark_ok existed
+    for _mig in (
+        "ALTER TABLE story_channels ADD COLUMN watermark_ok INTEGER DEFAULT 0",
+        "ALTER TABLE story_archive ADD COLUMN watermark_ok INTEGER DEFAULT 0",
+    ):
+        try:
+            conn.execute(_mig)
+        except Exception:
+            pass  # column already exists
+    conn.commit()
 
 
 def turso_available() -> bool:
@@ -173,6 +230,56 @@ def relevance_verdict(caption: str, category: str, subcategory: str) -> tuple[st
         return ("review", 0)  # cannot verify an empty caption -> human check
     score = sum(1 for kw in kws if _norm_fa(kw) in cap)
     return ("ok", score) if score > 0 else ("review", 0)
+
+
+# ---------------------------------------------------------------------------
+# Subcategory suggestion (final design 2026-11-05, Phase 1).
+# Combined score over three signals; the suggestion is ADVISORY ONLY —
+# auto-accept is OFF and the admin always decides in the queue.
+# ---------------------------------------------------------------------------
+BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # 20 MB (Bot API getFile limit)
+
+
+def _score_keywords(text: str, keywords: list[str]) -> tuple[int, list[str]]:
+    norm = _norm_fa(text)
+    hits = [kw for kw in keywords
+            if _norm_fa(kw) and _norm_fa(kw) in norm]
+    return len(hits), hits
+
+
+def suggest_subcategory(lyrics_text: str, caption: str,
+                        channel_category: str, channel_subcategory: str
+                        ) -> tuple[str | None, str | None, int, list[str]]:
+    """Suggest ONE subcategory from lyrics + caption + channel prior.
+
+    score = 2 * lyric keyword hits + 1 * caption keyword hits
+            + 1 channel prior when the candidate == the channel's own
+            category/subcategory.
+    A suggestion is returned ONLY when best >= 3 AND it leads the
+    runner-up by >= 2; otherwise (None, None, best_score, reasons) —
+    the clip goes to the admin queue with no suggestion and the admin
+    decides by watching it. No clip is ever auto-categorized.
+    """
+    scored = []
+    for (cat, sub), kws in SUBCAT_KEYWORDS.items():
+        lh, lhits = _score_keywords(lyrics_text or "", kws)
+        ch, chits = _score_keywords(caption or "", kws)
+        prior = 1 if (cat, sub) == (channel_category, channel_subcategory) else 0
+        score = 2 * lh + ch + prior
+        reasons = []
+        if lhits:
+            reasons.append("ترانه: " + "، ".join(lhits[:4]))
+        if chits:
+            reasons.append("کپشن: " + "، ".join(chits[:4]))
+        if prior:
+            reasons.append("دسته کانال")
+        scored.append((score, cat, sub, reasons))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0
+    if best[0] >= 3 and best[0] - second >= 2:
+        return best[1], best[2], best[0], best[3]
+    return None, None, best[0], best[3]
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +434,10 @@ def archive_clip(*, file_unique_id: str, file_id: str, category: str,
                  source_username: str = "", orig_caption: str = "",
                  duration: int = 0, width: int = 0, height: int = 0,
                  watermark_ok: int = 0,
-                 status: str = "active", added_by: int = 0) -> tuple[bool, str]:
+                 status: str = "active", added_by: int = 0,
+                 file_size: int = 0, forward_only: int = 0,
+                 categorized_by: str = "", categorized_at: int = 0
+                 ) -> tuple[bool, str]:
     """Insert a clip. Returns (ok, 'ok'|'duplicate'|'db')."""
     if is_duplicate(file_unique_id, source_chat_id, source_message_id):
         return (False, "duplicate")
@@ -339,12 +449,15 @@ def archive_clip(*, file_unique_id: str, file_id: str, category: str,
             INSERT INTO story_archive
             (file_unique_id, file_id, source_chat_id, source_message_id,
              source_username, mode, category, subcategory, orig_caption,
-             duration, width, height, watermark_ok, status, added_at, added_by)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             duration, width, height, watermark_ok, status, added_at, added_by,
+             file_size, forward_only, categorized_by, categorized_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (file_unique_id, file_id, source_chat_id, source_message_id,
               source_username, mode, category, subcategory, orig_caption[:500],
               duration, width, height, int(watermark_ok or 0), status,
-              int(time.time()), added_by))
+              int(time.time()), added_by,
+              int(file_size or 0), int(forward_only or 0),
+              categorized_by, int(categorized_at or 0)))
         conn.commit()
         return (True, "ok")
     except Exception as e:
@@ -357,25 +470,35 @@ def intake_channel_post(*, file_unique_id: str, file_id: str, chat_id: int,
                         subcategory: str, caption: str, duration: int,
                         width: int, height: int,
                         auto_approve: bool,
-                        watermark_ok: bool = False) -> tuple[bool, str]:
+                        watermark_ok: bool = False,
+                        file_size: int = 0) -> tuple[bool, str]:
     """Phase-2 intake for a new channel post. Returns (ok, outcome).
 
     outcome: 'ok' | 'duplicate' | 'pending' | 'db'
+
+    Final design 2026-11-05: auto-accept is OFF — EVERY clip starts
+    'pending' in the moderation queue, even when the caption matches or
+    auto_approve is set. (The flag is kept for the post-20-clip review.)
+    Files larger than the Bot API download limit cannot be downloaded
+    for analysis/processing: they are marked forward_only and stay
+    raw-forward forever.
     """
     if is_duplicate(file_unique_id, chat_id, message_id):
         return (False, "duplicate")
     verdict, _score = relevance_verdict(caption, category, subcategory)
-    status = "active" if (verdict == "ok" or auto_approve) else "pending"
+    _ = verdict  # caption verdict no longer activates a clip (queue-first)
+    forward_only = 1 if int(file_size or 0) > BOT_API_DOWNLOAD_LIMIT else 0
     ok, res = archive_clip(
         file_unique_id=file_unique_id, file_id=file_id,
         category=category, subcategory=subcategory, mode="forward",
         source_chat_id=chat_id, source_message_id=message_id,
         source_username=username, orig_caption=caption,
         duration=duration, width=width, height=height,
-        watermark_ok=1 if watermark_ok else 0, status=status)
+        watermark_ok=1 if watermark_ok else 0, status="pending",
+        file_size=int(file_size or 0), forward_only=forward_only)
     if not ok:
         return (False, res)
-    return (True, "pending" if status == "pending" else "ok")
+    return (True, "pending")
 
 
 def get_clip(clip_id: int) -> dict | None:
@@ -471,13 +594,137 @@ def move_clip(clip_id: int, category: str, subcategory: str) -> bool:
         return False
     try:
         conn.execute(
-            "UPDATE story_archive SET category=?, subcategory=?, status='active'"
-            " WHERE id=?", (category, subcategory, clip_id))
+            "UPDATE story_archive SET category=?, subcategory=?, status='active',"
+            " categorized_by='admin', categorized_at=? WHERE id=?",
+            (category, subcategory, int(time.time()), clip_id))
         conn.commit()
         return True
     except Exception as e:
         _log.warning("move_clip failed: %s", e)
         return False
+
+
+def save_suggestion(clip_id: int, *, title: str = "", artist: str = "",
+                    lyrics_excerpt: str = "", sugg_category: str = "",
+                    sugg_subcategory: str = "", score: int = 0,
+                    reasons: str = "", error: str = "") -> bool:
+    """Store the system's one-time suggestion for a pending clip."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        conn.execute(
+            "UPDATE story_archive SET identified_title=?, identified_artist=?,"
+            " lyrics_excerpt=?, sugg_category=?, sugg_subcategory=?, cat_score=?,"
+            " cat_reasons=?, last_error=? WHERE id=?",
+            (title, artist, (lyrics_excerpt or "")[:500], sugg_category,
+             sugg_subcategory, int(score), (reasons or "")[:500], error, clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("save_suggestion failed: %s", e)
+        return False
+
+
+def approve_clip(clip_id: int) -> bool:
+    """Approve a pending clip: apply the stored suggestion (if any) as its
+    final category, mark categorized_by='admin', status='active'.
+
+    Phase 2 wires the one-time processing (Waveframe + outro + storage)
+    into this step; Phase 1 only records the approval. On a processing
+    failure (Phase 2) the clip must NOT become active — see user req #8.
+    """
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        clip = get_clip(clip_id)
+        if not clip:
+            return False
+        cat = clip.get("sugg_category") or clip.get("category")
+        sub = clip.get("sugg_subcategory") or clip.get("subcategory")
+        conn.execute(
+            "UPDATE story_archive SET category=?, subcategory=?, status='active',"
+            " categorized_by='admin', categorized_at=? WHERE id=?",
+            (cat, sub, int(time.time()), clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("approve_clip failed: %s", e)
+        return False
+
+
+async def _identify_audio_bytes(data: bytes) -> tuple[str, str]:
+    """Shazam-identify raw file bytes (lazy import; sandbox-safe)."""
+    try:
+        from ..services.shazam_id import identify_bytes_shazam
+        res = await identify_bytes_shazam(data)
+        if res and getattr(res, "status", "") == "identified":
+            return (res.title or "", res.artist or "")
+    except Exception as e:
+        _log.warning("queue identify failed: %s", e)
+    return ("", "")
+
+
+async def _fetch_lyrics_text(title: str, artist: str) -> str:
+    """Exact-match lyrics for an identified song (lazy import)."""
+    if not title:
+        return ""
+    try:
+        from ..search.lyrics import fetch_lyrics
+        return await fetch_lyrics(title, artist) or ""
+    except Exception as e:
+        _log.warning("queue lyrics failed: %s", e)
+        return ""
+
+
+async def analyze_clip_for_queue(bot, clip: dict) -> None:
+    """One-time suggestion analysis for a pending clip (queue time only).
+
+    Downloads the file (<=20MB only), Shazam-identifies, fetches lyrics,
+    scores, stores the suggestion. Never raises; every failure is stored
+    as last_error so the card can say so and the admin decides by
+    watching the clip. Intake stays download-free (user req); this runs
+    only when the admin opens the queue, and only once per clip.
+    """
+    import os
+    import shutil
+    import tempfile
+    if int(clip.get("forward_only") or 0) == 1:
+        cat, sub, score, reasons = suggest_subcategory(
+            "", clip.get("orig_caption") or "",
+            clip.get("category") or "", clip.get("subcategory") or "")
+        save_suggestion(
+            clip["id"], sugg_category=cat or "", sugg_subcategory=sub or "",
+            score=score, reasons="؛ ".join(reasons),
+            error="forward_only")
+        return
+    tmpd = tempfile.mkdtemp(prefix="sarch_an_")
+    try:
+        src = os.path.join(tmpd, "src.mp4")
+        f = await bot.get_file(clip["file_id"])
+        await bot.download_file(f.file_path, destination=src)
+        with open(src, "rb") as fh:
+            data = fh.read()
+        title, artist = await _identify_audio_bytes(data)
+        lyrics = await _fetch_lyrics_text(title, artist) if title else ""
+        cat, sub, score, reasons = suggest_subcategory(
+            lyrics, clip.get("orig_caption") or "",
+            clip.get("category") or "", clip.get("subcategory") or "")
+        save_suggestion(
+            clip["id"], title=title, artist=artist,
+            lyrics_excerpt=lyrics[:500] if lyrics else "",
+            sugg_category=cat or "", sugg_subcategory=sub or "",
+            score=score, reasons="؛ ".join(reasons),
+            error="" if title else "not_identified")
+    except Exception as e:
+        _log.warning("queue analysis failed: %s", e)
+        save_suggestion(clip["id"], error="analysis_failed")
+    finally:
+        try:
+            shutil.rmtree(tmpd, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def delete_clip(clip_id: int) -> bool:
@@ -847,11 +1094,46 @@ def register_story_archive_handlers(router) -> None:
                                               inline_keyboard=[[ _btn("🔙", callback_data="sarch:panel")]]))
             return
         clip = items[0]
+        # One-time suggestion analysis when the admin opens the queue —
+        # never at intake (intake stays download-free). Runs once per
+        # clip; the result is stored, so reopening the queue is instant.
+        if (not clip.get("sugg_category") and not clip.get("last_error")
+                and not clip.get("identified_title")):
+            try:
+                await analyze_clip_for_queue(callback.message.bot, clip)
+                clip = get_clip(clip["id"]) or clip
+            except Exception as e:
+                _log.warning("queue analysis outer failed: %s", e)
         cap = (clip.get("orig_caption") or "")[:200]
+        if clip.get("identified_title"):
+            song = (f"{clip['identified_title']} — "
+                    f"{clip.get('identified_artist') or '؟'}")
+        elif clip.get("last_error") == "not_identified":
+            song = "شناسایی نشد"
+        elif clip.get("last_error") == "forward_only":
+            song = "بررسی صوتی ممکن نیست (فایل بزرگ)"
+        elif clip.get("last_error"):
+            song = "بررسی ناموفق بود"
+        else:
+            song = "—"
+        if clip.get("sugg_category"):
+            sugg = (f"💡 پیشنهاد سیستم: {_cat_title(clip['sugg_category'])} ← "
+                    f"{_sub_title(clip['sugg_category'], clip['sugg_subcategory'])}"
+                    f" (امتیاز {clip.get('cat_score') or 0})")
+            if clip.get("cat_reasons"):
+                sugg += f"\n   {clip['cat_reasons']}"
+        else:
+            sugg = "💡 پیشنهاد سیستم: نیست — خودتان دسته را انتخاب کنید."
+        lyr = (f"\n📝 ترانه: {(clip.get('lyrics_excerpt') or '')[:100]}"
+               if clip.get("lyrics_excerpt") else "")
+        fwd_note = ("\n⚠️ فایل بزرگ‌تر از ۲۰ مگابایت — فقط فوروارد، بدون پردازش."
+                    if int(clip.get("forward_only") or 0) == 1 else "")
         txt = (f"⏳ <b>بررسی ارتباط موضوعی</b>\n"
-               f"دسته: {_cat_title(clip['category'])} ← {_sub_title(clip['category'], clip['subcategory'])}\n"
+               f"دسته کانال: {_cat_title(clip['category'])} ← {_sub_title(clip['category'], clip['subcategory'])}\n"
                f"منبع: @{clip.get('source_username') or '—'}\n"
-               f"کپشن: {cap or '—'}\n\n"
+               f"🎵 آهنگ: {song}{lyr}\n"
+               f"{sugg}\n"
+               f"کپشن: {cap or '—'}{fwd_note}\n\n"
                f"این کلیپ را ببینید و تأیید کنید:")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [_btn("✅ تأیید", callback_data=f'sarch:qok:{clip["id"]}')],
@@ -877,7 +1159,10 @@ def register_story_archive_handlers(router) -> None:
     async def sarch_qok(callback: CallbackQuery, config, state: FSMContext):
         if not _is_owner_cb(callback, config):
             return
-        set_clip_status(int(callback.data.split(":")[2]), "active")
+        # Approval applies the stored suggestion (if any) as the final
+        # category. Phase 2 adds the one-time processing here; a
+        # processing failure must NOT activate the clip (user req #8).
+        approve_clip(int(callback.data.split(":")[2]))
         await callback.answer("✅ تأیید شد")
         await sarch_queue(callback, config, state)
 
@@ -886,7 +1171,10 @@ def register_story_archive_handlers(router) -> None:
     async def sarch_qdel(callback: CallbackQuery, config, state: FSMContext):
         if not _is_owner_cb(callback, config):
             return
-        delete_clip(int(callback.data.split(":")[2]))
+        # Reject keeps the row (status='rejected') so the same clip can
+        # never re-enter the queue; deleting it would let a re-post
+        # come back. is_duplicate() blocks re-intake of any stored row.
+        set_clip_status(int(callback.data.split(":")[2]), "rejected")
         await callback.answer("🗑 رد شد")
         await sarch_queue(callback, config, state)
 
@@ -984,6 +1272,7 @@ def register_story_archive_handlers(router) -> None:
             sarch_man_dur=getattr(media, "duration", 0) or 0,
             sarch_man_w=getattr(media, "width", 0) or 0,
             sarch_man_h=getattr(media, "height", 0) or 0,
+            sarch_man_size=getattr(media, "file_size", 0) or 0,
             sarch_man_cap=message.caption or "",
             sarch_man_srcu=src_username, sarch_man_srcc=src_chat, sarch_man_srcm=src_msg)
         await state.set_state("sarch:manual:cat")
@@ -1029,6 +1318,9 @@ def register_story_archive_handlers(router) -> None:
         if not (cat and data.get("sarch_man_unique")):
             return
         # admin chose the category: the human IS the relevance check (req #4)
+        # — a manual add is itself the manager's approval, so it goes
+        # active directly (unlike channel intake, which always queues).
+        _fsize = int(data.get("sarch_man_size") or 0)
         ok, res = archive_clip(
             file_unique_id=data["sarch_man_unique"], file_id=data["sarch_man_file_id"],
             category=cat, subcategory=sub, mode="resend",
@@ -1038,7 +1330,10 @@ def register_story_archive_handlers(router) -> None:
             orig_caption=data.get("sarch_man_cap") or "",
             duration=data.get("sarch_man_dur") or 0,
             width=data.get("sarch_man_w") or 0, height=data.get("sarch_man_h") or 0,
-            status="active", added_by=callback.from_user.id)
+            status="active", added_by=callback.from_user.id,
+            file_size=_fsize,
+            forward_only=1 if _fsize > BOT_API_DOWNLOAD_LIMIT else 0,
+            categorized_by="admin", categorized_at=int(time.time()))
         if ok:
             await callback.message.answer(
                 f"✅ در آرشیو ذخیره شد.\n{_cat_title(cat)} ← {_sub_title(cat, sub)}")
@@ -1074,7 +1369,8 @@ def register_story_archive_handlers(router) -> None:
                 width=getattr(media, "width", 0) or 0,
                 height=getattr(media, "height", 0) or 0,
                 auto_approve=bool(ch.get("auto_approve")),
-                watermark_ok=bool(ch.get("watermark_ok")))
+                watermark_ok=bool(ch.get("watermark_ok")),
+                file_size=getattr(media, "file_size", 0) or 0)
             _log.info("sarch intake @%s msg=%s -> %s", username, post.message_id, outcome)
         except Exception as e:
             _log.warning("sarch_channel_intake failed: %s", e)
@@ -1233,15 +1529,19 @@ def register_story_archive_handlers(router) -> None:
         for i, clip in enumerate(clips, start=1):
             rows.append([_btn(_clip_row_label(clip, base_n + i),
                               callback_data=f'sarch:play:{clip["id"]}:{cat}:{sub}:{page}')])
-        nav = []
-        if page > 0:
-            nav.append(_btn("◀ قبلی", callback_data=f"sarch:sub:{cat}:{sub}:{page-1}"))
-        nav.append(_btn(f"{page+1}/{pages}", callback_data="sarch:noop"))
-        if page < pages - 1:
-            nav.append(_btn("بعدی ▶", callback_data=f"sarch:sub:{cat}:{sub}:{page+1}"))
-        if nav:
-            rows.append(nav)
-        rows.append([_btn("🎥 تماشا در یوتیوب", callback_data=f"sarch:yt:{cat}:{sub}")])
+        if clips:
+            # Empty state (user req 2026-11-05 #6): NO page indicator
+            # ("1/1") and NO YouTube button — only the not-available
+            # message and Back.
+            nav = []
+            if page > 0:
+                nav.append(_btn("◀ قبلی", callback_data=f"sarch:sub:{cat}:{sub}:{page-1}"))
+            nav.append(_btn(f"{page+1}/{pages}", callback_data="sarch:noop"))
+            if page < pages - 1:
+                nav.append(_btn("بعدی ▶", callback_data=f"sarch:sub:{cat}:{sub}:{page+1}"))
+            if nav:
+                rows.append(nav)
+            rows.append([_btn("🎥 تماشا در یوتیوب", callback_data=f"sarch:yt:{cat}:{sub}")])
         rows.append([_btn("🔙", callback_data=f"sarch:cat:{cat}")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         txt = (f"{_cat_title(cat)} ← {_sub_title(cat, sub)}\n"
