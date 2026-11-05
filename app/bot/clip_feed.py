@@ -53,7 +53,6 @@ from __future__ import annotations
 import asyncio
 import html as _html
 import json
-import logging
 import os
 import re
 import subprocess
@@ -64,8 +63,9 @@ import urllib.parse
 import urllib.request
 
 from . import story_archive as _sarch
+from ..logging_config import get_logger
 
-_log = logging.getLogger("avana.clip_feed")
+_log = get_logger("avana.clip_feed")
 
 # ---------------------------------------------------------------------------
 # Constants
