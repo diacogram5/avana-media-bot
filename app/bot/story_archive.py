@@ -1135,28 +1135,35 @@ def register_story_archive_handlers(router) -> None:
     async def deliver_clip(bot, chat_id: int, clip: dict) -> str:
         """Deliver one clip. Returns 'ok'|'gone'|'blocked'|'error'.
 
-        Priority: direct Telegram forward preserving source (user req #8).
-        Fallbacks per user req #6: source deleted / forward restricted.
+        User order 2026-11-05: badge on ALL forwards. A true Telegram
+        forward cannot be modified, so forward-mode clips are downloaded,
+        badged and re-sent (source credit stays in the corporate caption).
+        Plain forward remains only as a last-resort fallback.
         """
         try:
-            if (clip.get("mode") == "forward" and clip.get("source_chat_id")
-                    and clip.get("source_message_id")):
-                try:
-                    await bot.forward_message(
-                        chat_id, clip["source_chat_id"], clip["source_message_id"])
+            if clip.get("mode") == "forward":
+                res = await deliver_waveframed(bot, chat_id, clip)
+                if res == "ok":
                     return "ok"
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "message to forward not found" in msg or "message_id_invalid" in msg:
-                        set_clip_status(clip["id"], "unavailable")
-                        return "gone"
-                    if "protected" in msg:
-                        set_clip_status(clip["id"], "unavailable")
-                        return "blocked"
-                    _log.warning("deliver forward failed: %s", e)
-                    return "error"
+                # last resort: plain forward (original behavior)
+                if clip.get("source_chat_id") and clip.get("source_message_id"):
+                    try:
+                        await bot.forward_message(
+                            chat_id, clip["source_chat_id"], clip["source_message_id"])
+                        return "ok"
+                    except Exception as e:
+                        msg = str(e).lower()
+                        if "message to forward not found" in msg or "message_id_invalid" in msg:
+                            set_clip_status(clip["id"], "unavailable")
+                            return "gone"
+                        if "protected" in msg:
+                            set_clip_status(clip["id"], "unavailable")
+                            return "blocked"
+                        _log.warning("deliver forward fallback failed: %s", e)
+                        return "error"
+                return res
             # resend mode: Waveframe badge first when permitted, else plain
-            # resend with corporate caption. Forwarded clips never reach here.
+            # resend with corporate caption.
             if int(clip.get("watermark_ok") or 0) == 1:
                 return await deliver_waveframed(bot, chat_id, clip)
             await bot.send_video(chat_id, clip["file_id"],
