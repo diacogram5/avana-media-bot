@@ -7,21 +7,24 @@ invented, and a mood with no catalog result returns [].
 from __future__ import annotations
 
 # mood key -> (keywords, catalog search terms)
+# Term order (fix 2026-11-05): the PERSIAN term runs FIRST — the audience
+# is Persian, and the first term with real results wins, so an English-first
+# list filled the suggestions with Western songs.
 MOODS = {
     "sad_night": (["غمگین", "غم", "sad", "شب", "night", "دلتنگ"],
-                  ["sad song", "غمگین", "night sad"]),
+                  ["غمگین", "sad song", "night sad"]),
     "happy": (["شاد", "happy", "انرژی", "پرانرژی", "رقص"],
-              ["happy song", "شاد", "dance"]),
+              ["شاد", "happy song", "dance"]),
     "gym": (["باشگاه", "ورزش", "gym", "workout", "تمرین"],
-            ["workout", "gym music", "باشگاه"]),
+            ["باشگاه", "workout", "gym music"]),
     "driving": (["رانندگی", "ماشین", "driving", "سفر", "جاده"],
-                ["driving song", "رانندگی", "road trip"]),
+                ["رانندگی", "driving song", "road trip"]),
     "bass": (["بیس", "bass", "سیستم", "بم", "قدرتمند"],
-             ["bass", "بیس دار", "bass boosted"]),
+             ["بیس دار", "bass", "bass boosted"]),
     "calm": (["آرام", "calm", "ریلکس", "آرامش", "خواب"],
-             ["calm song", "آرام", "relaxing"]),
+             ["آرام", "calm song", "relaxing"]),
     "love": (["عاشقانه", "عشق", "love", "رومانتیک"],
-             ["love song", "عاشقانه", "romantic"]),
+             ["عاشقانه", "love song", "romantic"]),
 }
 
 

@@ -3770,6 +3770,16 @@ async def _run_suggest_body(message, conn, text: str, config):
     except Exception:
         await _answer(message, conn, brief_error("suggest", ulang)); return
     if not results:
+        # The audience taps «درخواست آهنگ» to request a SONG by name/artist,
+        # not only a mood sentence. A plain catalog search on the text
+        # itself runs before giving up (fix 2026-11-05 — before this, a
+        # song-name request always ended in «m_suggest_none»).
+        try:
+            results = await _cat(text)
+            mood = text
+        except Exception:
+            results = []
+    if not results:
         await _answer(message, conn, t("m_suggest_none", ulang))
         return
     dbmod.record_search(conn, message.from_user.id, text, source="suggest", ok=True)
@@ -3784,20 +3794,28 @@ async def _run_suggest_body(message, conn, text: str, config):
             seen.add(k)
             uniq.append(r)
 
-    # Filter: only songs with full version available (user requirement 2026-11-01)
-    # Check each against the full-song sources
+    # Filter: only songs with a full version available (user req 2026-11-01).
+    # BUG fixed 2026-11-05: the old code called find_full_song_file(...,
+    # timeout=8.0) — but that function takes NO timeout arg AND returns no
+    # "url" key, so EVERY call raised TypeError (swallowed by the except)
+    # and the filter NEVER ran. Now we use the SAME parallel lookup the
+    # delivery path uses (find_full_song_file_v2), checked in parallel
+    # with an 8s cap per song — fast and consistent with delivery.
     try:
-        from app.search.fullsong import find_full_song_file
-        full_only = []
-        for r in uniq:
+        import asyncio as _aio
+        from app.search.adapters import find_full_song_file_v2
+
+        async def _has_full(r):
             try:
-                # Quick check: try to find full song file
-                result = await find_full_song_file(
-                    r.artist or "", r.title or "", timeout=8.0)
-                if result and result.get("url"):
-                    full_only.append(r)
+                res = await _aio.wait_for(
+                    find_full_song_file_v2(r.artist or "", r.title or ""),
+                    timeout=8.0)
+                return r if res else None
             except Exception:
-                pass
+                return None
+
+        _checked = await _aio.gather(*[_has_full(r) for r in uniq])
+        full_only = [r for r in _checked if r is not None]
         # Use full-version songs if we found any, otherwise fall back to all
         # (better to show something than nothing, but prefer full versions)
         if full_only:

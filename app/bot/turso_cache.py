@@ -64,6 +64,17 @@ def _get_conn():
                 expires_at INTEGER NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS suggest_results (
+                result_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                url TEXT NOT NULL,
+                preview_url TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
         conn.commit()
         _turso_conn = conn
         _turso_ok = True
@@ -125,4 +136,56 @@ def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30
         return True
     except Exception as e:
         _log.debug("turso_cache: store failed: %s", e)
+        return False
+
+
+def get_suggest_result(key: str) -> dict | None:
+    """Get a persisted suggestion result. None if miss/expired/error."""
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        cur = conn.execute(
+            "SELECT title, artist, url, preview_url, expires_at "
+            "FROM suggest_results WHERE result_key = ?",
+            (key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        title, artist, url, preview_url, expires_at = (
+            row[0], row[1], row[2], row[3], row[4])
+        if int(expires_at) < int(time.time()):
+            # Expired - delete
+            try:
+                conn.execute("DELETE FROM suggest_results WHERE result_key = ?",
+                             (key,))
+                conn.commit()
+            except Exception:
+                pass
+            return None
+        return {"title": title, "artist": artist,
+                "url": url, "preview_url": preview_url}
+    except Exception as e:
+        _log.debug("turso_cache: get_suggest_result failed: %s", e)
+        return None
+
+
+def store_suggest_result(key: str, title: str, artist: str = "", url: str = "",
+                         preview_url: str = "", ttl_days: int = 7) -> bool:
+    """Persist a suggestion result so its button survives restarts."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        now = int(time.time())
+        expires = now + (ttl_days * 86400)
+        conn.execute("""
+            INSERT OR REPLACE INTO suggest_results
+            (result_key, title, artist, url, preview_url, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (key, title, artist, url, preview_url, now, expires))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.debug("turso_cache: store_suggest_result failed: %s", e)
         return False

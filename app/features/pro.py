@@ -27,16 +27,37 @@ RESULTS: dict[str, dict] = {}
 
 def remember_result(title: str, artist: str = "", url: str = "", preview_url: str = "",
                     own_media: tuple[str, str] | None = None) -> str:
-    """Store a song-card result; return a short key (12 hex chars) for callbacks."""
+    """Store a song-card result; return a short key (12 hex chars) for callbacks.
+
+    Stored in memory AND in the persistent Turso cache, so the button keeps
+    working after a restart (fix 2026-11-05 — in-memory-only keys expired
+    on every Render restart/sleep and the tap answered "expired").
+    """
     key = secrets.token_hex(6)
     RESULTS[key] = {"title": title, "artist": artist, "url": url,
                     "preview_url": preview_url, "own_media": own_media}
+    try:
+        from ..bot.turso_cache import store_suggest_result
+        store_suggest_result(key, title, artist, url, preview_url)
+    except Exception:
+        pass
     return key
 
 
 def get_result(key: str) -> dict | None:
     """Return the stored result for a key, or None if unknown/expired."""
-    return RESULTS.get(key)
+    res = RESULTS.get(key)
+    if res is not None:
+        return res
+    try:
+        from ..bot.turso_cache import get_suggest_result
+        stored = get_suggest_result(key)
+        if stored:
+            RESULTS[key] = {**stored, "own_media": None}
+            return RESULTS[key]
+    except Exception:
+        pass
+    return None
 
 
 def build_song_card_buttons(key: str, is_fav: bool,
