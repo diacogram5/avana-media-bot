@@ -1,0 +1,22 @@
+# Render blueprint: deploys the bot as-is (polling). No code changes.
+# Secrets marked sync:false are filled by the owner in the Render dashboard.
+services:
+  - type: web
+    name: avana-media-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: WEB_ADMIN_PORT=$PORT python -m app.main
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        value: "572595158"
+      - key: WEB_ADMIN_TOKEN
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AUDD_API_TOKEN
+        sync: false
