@@ -126,6 +126,24 @@ APARAT_SEEDS = (
     # Single-seed (related=0, deliberate): celebratory مادر clip.
     ("toop_media", "grkx541"),
 )
+# SEED_PRIOR: verified single-theme seeds only (hunt REPORT2/REPORT3:
+# the seed's own video + a sampled related graph were checked clip by
+# clip). Key = seed video UID; value = (category, subcategory) stored
+# on intaked clips as a +1 corroboration for the scorer — NEVER a
+# categorization by itself. Mixed-graph seeds (nasi20: کنایه + غمگین;
+# Amirabbas.b / AparatVision / Tafrihi_Best / Multimedia2020 /
+# Clip_film2023 / faezehradmanesh / Masafinia.m-xse8if0) carry NO
+# prior: their graph spans several subcategories, so a prior would
+# mislead as often as it helps.
+SEED_PRIOR = {
+    "mtnx5t2": ("deep", "sarcasm"),       # Kartoonchi — تیکه‌دار
+    "cxoia5d": ("occasion", "parents"),   # vidoma — تبریک روز مادر
+    "ryg56w3": ("occasion", "parents"),   # Sargarmi_kids — تبریک روز مادر
+    "mwrma4b": ("occasion", "parents"),   # Film_Tvs — تبریک روز پدر
+    "d27o7qv": ("happy", "success"),      # Masafinia.m 2nd — موفقیت/انگیزشی
+    "o214420": ("occasion", "anniversary"),  # Aparat_Media_pars — سالگرد
+    "grkx541": ("occasion", "parents"),   # toop_media — تبریک روز مادر
+}
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run
 AP_SEEDS_PER_RUN = 3            # Aparat seeds walked per later run (2026-11-06:
@@ -612,7 +630,8 @@ def get_feed_status() -> dict:
 # ---------------------------------------------------------------------------
 async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
                            duration_hint: int | None = None,
-                           source_username: str = ""
+                           source_username: str = "",
+                           seed_uid: str = ""
                            ) -> tuple[bool, str]:
     """Download, validate and archive ONE feed clip as status='pending'.
 
@@ -622,6 +641,11 @@ async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
     Intake itself never auto-accepts: the clip is stored pending. A
     separate post-intake pass (run_auto_approve_pass) may activate it
     later on a confident suggestion — see the module docstring.
+    A clip intaked from a seed with a VERIFIED single theme stores
+    that theme as its category/subcategory (seed prior): it is NOT
+    a categorization, only a +1 corroboration for the scorer — the
+    clip still needs its own title/lyric evidence to be suggested.
+    Seeds with mixed graphs carry no prior ("", "").
     """
     import shutil
 
@@ -651,7 +675,9 @@ async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
             return (False, "too_long")
         ok, why = _sarch.archive_clip(
             file_unique_id="feed:" + feed_key, file_id="",
-            category="", subcategory="", mode="resend",
+            category=SEED_PRIOR.get(seed_uid, ("", ""))[0],
+            subcategory=SEED_PRIOR.get(seed_uid, ("", ""))[1],
+            mode="resend",
             source_username=source_username,
             orig_caption=(title or "")[:500],
             duration=int(dur), width=info.get("width") or 0,
@@ -770,10 +796,13 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
         for seed_owner, seed_uid in run_seeds:
             _log.info("clip_feed aparat cycle seed=%s (%s)",
                       seed_owner, seed_uid)
-        queue = [uid for _, uid in run_seeds]
+        # Queue items are (uid, origin_seed_uid): a clip inherits the
+        # VERIFIED theme of the seed whose graph it was found in
+        # (SEED_PRIOR) — the origin travels with the UID through the BFS.
+        queue = [(uid, uid) for _, uid in run_seeds]
         seen_uids: set[str] = set()
         while queue and out["calls"] < max_calls and out["new"] < max_new:
-            uid = queue.pop(0)
+            uid, origin = queue.pop(0)
             if uid in seen_uids:
                 continue
             seen_uids.add(uid)
@@ -784,7 +813,7 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
             for rel in parse_aparat_related(payload):
                 if (rel["uid"] not in seen_uids
                         and _aparat_candidate(rel)):
-                    queue.append(rel["uid"])
+                    queue.append((rel["uid"], origin))
             info = parse_aparat_show(payload)
             if not info:
                 continue
@@ -793,7 +822,7 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
             ok, why = await intake_feed_item(
                 feed_key=f"ap:{info['uid']}", source_url=info["file_link"],
                 title=info["title"], duration_hint=info["duration"],
-                source_username=info["owner"])
+                source_username=info["owner"], seed_uid=origin)
             if ok:
                 out["new"] += 1
                 out["new_keys"].append(f"ap:{info['uid']}")
@@ -840,9 +869,12 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
     manual approval forever is not feasible).
 
     Gate: a clip is approved ONLY when the stored suggestion is confident
-    (suggest_subcategory returned a category — best >= 3 AND margin >= 2;
-    the margin stays strict on purpose: a near-tie is genuinely ambiguous
-    and must stay queued). Candidates, at most AUTO_APPROVE_PER_CYCLE per
+    (suggest_subcategory returned a category — (a) best >= 3 AND
+    margin >= 2, or (b) the unanimous distinctive-title rule: the
+    caption names one subcategory, the verified seed theme agrees,
+    and nothing competes at all, second-best total == 0; the margin
+    stays strict on purpose: a near-tie is genuinely ambiguous and
+    must stay queued). Candidates, at most AUTO_APPROVE_PER_CYCLE per
     call: this cycle's newly intaken clips first, then the oldest pending
     feed clips. Each candidate is analyzed once with the same analysis as
     the moderation queue (analyze_clip_for_queue, bot=None — feed clips

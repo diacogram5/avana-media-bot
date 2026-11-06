@@ -265,13 +265,17 @@ def _score_keywords(text: str, keywords: list[str]) -> tuple[int, list[str]]:
 
 
 def suggest_subcategory(lyrics_text: str, caption: str,
-                        channel_category: str, channel_subcategory: str
-                        ) -> tuple[str | None, str | None, int, list[str]]:
-    """Suggest ONE subcategory from lyrics + caption + channel prior.
+                        channel_category: str, channel_subcategory: str,
+                        seed_category: str = "",
+                        seed_subcategory: str = "") -> tuple[str | None, str | None, int, list[str]]:
+    """Suggest ONE subcategory from lyrics + caption + priors.
 
     score = 2 * lyric keyword hits + 1 * caption keyword hits
             + 1 channel prior when the candidate == the channel's own
-            category/subcategory.
+            category/subcategory + 1 seed prior when the candidate ==
+            the feed seed's verified theme (a seed prior is stronger
+            than a channel label: the hunt verified the seed's graph
+            clip by clip, while a channel label is self-declared).
     A suggestion is returned ONLY when best >= 3 AND it leads the
     runner-up by >= 2; otherwise (None, None, best_score, reasons) —
     the clip goes to the admin queue with no suggestion and the admin
@@ -297,6 +301,19 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     ambiguous and NO suggestion is returned — it stays queued for a
     human to watch. Agreement (or no caption signal) leaves the
     normal gate untouched.
+
+    Unanimous distinctive-title rule (2026-11-06): a clip whose
+    caption names ONE subcategory distinctively, whose verified seed
+    theme agrees, and against which NOTHING competes (second-best
+    total == 0 — no lyric hit, no other caption hit anywhere) is
+    approved even below 3 points. This is NOT a margin loosening:
+    it requires zero competing signal, so the 2026-11-06 near-tie
+    (5 vs 4) still stays queued, and a lone weak caption with a
+    channel prior (score 2, e.g. «دلم برات تنگ شده») still gets no
+    suggestion — that case has no seed prior and its signal is
+    ambiguous between longing and sad. The rule only fires on
+    unanimous evidence: the creator's title + the verified seed
+    theme saying the same thing, with silence everywhere else.
     """
     scored = []
     cap_scored = []
@@ -304,7 +321,9 @@ def suggest_subcategory(lyrics_text: str, caption: str,
         lh, lhits = _score_keywords(lyrics_text or "", kws)
         ch, chits = _score_keywords(caption or "", kws)
         prior = 1 if (cat, sub) == (channel_category, channel_subcategory) else 0
-        score = 2 * lh + ch + prior
+        seed_prior = 1 if (seed_category
+                           and (cat, sub) == (seed_category, seed_subcategory)) else 0
+        score = 2 * lh + ch + prior + seed_prior
         reasons = []
         if lhits:
             reasons.append("ترانه: " + "، ".join(lhits[:4]))
@@ -312,18 +331,29 @@ def suggest_subcategory(lyrics_text: str, caption: str,
             reasons.append("کپشن: " + "، ".join(chits[:4]))
         if prior:
             reasons.append("دسته کانال")
+        if seed_prior:
+            reasons.append("تم سید")
         scored.append((score, cat, sub, reasons))
         cap_scored.append((ch, cat, sub))
     scored.sort(key=lambda t: t[0], reverse=True)
+    cap_scored.sort(key=lambda t: t[0], reverse=True)
     best = scored[0]
     second = scored[1][0] if len(scored) > 1 else 0
+    cap_best, cap_second = cap_scored[0], cap_scored[1][0]
+    cap_clear = cap_best[0] >= 1 and cap_best[0] > cap_second
     if best[0] >= 3 and best[0] - second >= 2:
-        cap_scored.sort(key=lambda t: t[0], reverse=True)
-        cap_best, cap_second = cap_scored[0], cap_scored[1][0]
-        if (cap_best[0] >= 1 and cap_best[0] > cap_second
+        if (cap_clear
                 and (cap_best[1], cap_best[2]) != (best[1], best[2])):
             return None, None, best[0], best[3] + [
                 "متن کلیپ با آهنگ هم‌خوانی ندارد"]
+        return best[1], best[2], best[0], best[3]
+    # (b) unanimous distinctive title (see docstring): the caption
+    # names one subcategory, the verified seed theme agrees, and
+    # nothing competes at all (second-best total == 0).
+    if (cap_clear
+            and (seed_category, seed_subcategory) == (cap_best[1], cap_best[2])
+            and (best[1], best[2]) == (cap_best[1], cap_best[2])
+            and second == 0 and best[0] >= 1):
         return best[1], best[2], best[0], best[3]
     return None, None, best[0], best[3]
 
@@ -693,6 +723,23 @@ def save_suggestion(clip_id: int, *, title: str = "", artist: str = "",
         return False
 
 
+def _priors_for_clip(clip: dict) -> tuple[str, str, str, str]:
+    """Split a clip's stored category into channel vs seed prior.
+
+    Returns (channel_cat, channel_sub, seed_cat, seed_sub). Feed clips
+    carry the VERIFIED seed theme in category/subcategory (stored at
+    intake from SEED_PRIOR); channel clips carry the channel's own
+    label there. Only a seed prior can fire the unanimous-title rule
+    in suggest_subcategory — a channel label is self-declared and
+    stays a plain +1.
+    """
+    cat = clip.get("category") or ""
+    sub = clip.get("subcategory") or ""
+    if clip.get("feed_key"):
+        return "", "", cat, sub
+    return cat, sub, "", ""
+
+
 def rescore_clip_from_stored(clip_id: int) -> bool:
     """Re-score an already-analyzed pending clip from its STORED data.
 
@@ -718,9 +765,9 @@ def rescore_clip_from_stored(clip_id: int) -> bool:
             return False
         scored = ((clip.get("identified_title") or "") + " " +
                   (clip.get("lyrics_excerpt") or "")).strip()
+        _cc, _cs, _sc, _ss = _priors_for_clip(clip)
         cat, sub, score, reasons = suggest_subcategory(
-            scored, clip.get("orig_caption") or "",
-            clip.get("category") or "", clip.get("subcategory") or "")
+            scored, clip.get("orig_caption") or "", _cc, _cs, _sc, _ss)
         if not cat:
             return False
         return bool(save_suggestion(
@@ -856,9 +903,9 @@ async def analyze_clip_for_queue(bot, clip: dict) -> None:
     import shutil
     import tempfile
     if int(clip.get("forward_only") or 0) == 1:
+        _cc, _cs, _sc, _ss = _priors_for_clip(clip)
         cat, sub, score, reasons = suggest_subcategory(
-            "", clip.get("orig_caption") or "",
-            clip.get("category") or "", clip.get("subcategory") or "")
+            "", clip.get("orig_caption") or "", _cc, _cs, _sc, _ss)
         save_suggestion(
             clip["id"], sugg_category=cat or "", sugg_subcategory=sub or "",
             score=score, reasons="؛ ".join(reasons),
@@ -893,9 +940,9 @@ async def analyze_clip_for_queue(bot, clip: dict) -> None:
         # highly thematic ("تولدت مبارک", "جدایی") and caption-only
         # clips otherwise never reach the confidence gate.
         scored = ((title or "") + " " + (lyrics or "")).strip()
+        _cc, _cs, _sc, _ss = _priors_for_clip(clip)
         cat, sub, score, reasons = suggest_subcategory(
-            scored, clip.get("orig_caption") or "",
-            clip.get("category") or "", clip.get("subcategory") or "")
+            scored, clip.get("orig_caption") or "", _cc, _cs, _sc, _ss)
         save_suggestion(
             clip["id"], title=title, artist=artist,
             lyrics_excerpt=lyrics[:500] if lyrics else "",

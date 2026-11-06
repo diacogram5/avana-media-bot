@@ -390,6 +390,33 @@ async def main():
         "دوستت دارم عاشقتم", "کلیپ عاشقانه", "", "")
     check("suggest: caption love + lyrics love agree -> love/express",
           (cat, sub) == ("love", "express"), f"got {(cat, sub, score)}")
+    # --- T4b: seed prior + unanimous distinctive title (2026-11-06) ---
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "کلیپ تیکه دار", "", "", "deep", "sarcasm")
+    check("suggest: «تیکه» + agreeing seed prior, nothing competing -> deep/sarcasm",
+          (cat, sub) == ("deep", "sarcasm") and score == 2,
+          f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "دوستت دارم عاشقتم", "کلیپ تیکه دار", "", "", "deep", "sarcasm")
+    check("suggest: «تیکه» + seed prior but romantic song -> no suggestion",
+          cat is None, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "کلیپ مادرم", "", "", "occasion", "parents")
+    check("suggest: «مادر» + agreeing seed prior -> occasion/parents",
+          (cat, sub) == ("occasion", "parents") and score == 2,
+          f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "روزت مبارک مادرم", "", "", "occasion", "parents")
+    check("suggest: «مادر» vs «مبارک» caption tie -> no suggestion (seed cannot break a caption tie)",
+          cat is None, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "کلیپ جدید", "", "", "deep", "sarcasm")
+    check("suggest: seed prior alone (no caption hit) -> no suggestion",
+          cat is None and score == 1, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "کلیپ تیکه دار", "deep", "sarcasm", "", "")
+    check("suggest: «تیکه» + channel prior only (no seed) -> no suggestion",
+          cat is None and score == 2, f"got {(cat, sub, score)}")
 
     # --- T5: approve_clip applies the stored suggestion ---------------
     sarch.save_suggestion(3, title="تردید", artist="سامان جلیلی",
