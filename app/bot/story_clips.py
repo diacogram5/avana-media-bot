@@ -181,7 +181,15 @@ def _process_clip(clip: dict, tmpdir: str) -> str:
     mw.apply_waveframe_badge(work, out)
     if not os.path.getsize(out):
         raise RuntimeError("watermark produced empty file")
-    return out
+    # AVANO MEDIA end bumper on the final 2.5s (portrait clips only;
+    # overlay_outro copies the file unchanged otherwise). A failing
+    # outro must not lose the badged file.
+    final = os.path.join(tmpdir, "final.mp4")
+    try:
+        mw.overlay_outro(out, final)
+        return final
+    except Exception:
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +769,7 @@ def register_story_handlers(router) -> None:
         # (e.g. a couple by the sea) for Persian subtopics like دلتنگی.
         # The Iranian branch answers with «هنوز کلیپ مناسبی...» until
         # its archive has a matching clip; Pixabay stays reachable only
-        # under the honestly-labelled «استوک خارجی» branch.
+        # under the «کلیپ‌های بین‌المللی» branch.
         try:
             from .story_archive import iranian_chooser_kb
             try:

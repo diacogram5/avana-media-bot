@@ -84,7 +84,13 @@ _log = get_logger("avana.clip_feed")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TG_CHANNELS = ("ehsaspaak", "SOBHbe", "yaldavamusic")
+TG_CHANNELS = ("ehsaspaak", "SOBHbe", "yaldavamusic",
+               "delll_nevveshteh", "dosti")
+# "dosti" is the wired name for the friendship channel: t.me/s/refaghat
+# serves the SAME page, but its posts carry data-post="dosti/..." — the
+# parser matches data-post, so wiring "refaghat" would parse zero posts
+# (verified 2026-11-06: parse as "refaghat" -> []; as "dosti" -> 9).
+# "delll_nevveshteh" is the sad/longing poetry channel (REPORT2).
 TG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
          "AppleWebKit/537.36 (KHTML, like Gecko) "
          "Chrome/120.0.0.0 Safari/537.36")
@@ -100,6 +106,13 @@ APARAT_SEEDS = (
     ("Multimedia2020", "t79ms8g"),
     ("Clip_film2023", "DCBas"),
     ("Masafinia.m", "xse8if0"),
+    # REPORT2 (2026-11-06, all show-verified live with a related graph):
+    ("Amirabbas.b", "lfe35b0"),      # کافه کلیپ عاشقانه — sad + سکوت/بی‌تفاوتی
+    ("AparatVision", "m569u20"),     # آپارات ویژن — sad + عشق یکطرفه + رفیق
+    ("Tafrihi_Best", "okm549l"),     # تفریح و سرگرمی — تولد + شروع تازه + عید
+    # Single-seed (related=0, deliberate): the ONLY verified anniversary
+    # clip found; it contributes one clip, then stays a duplicate.
+    ("Aparat_Media_pars", "o214420"),
 )
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run
@@ -108,7 +121,7 @@ AP_RUN_NEW = 5                  # max Aparat clips accepted on later runs
 
 # Auto-approve pass (user order 2026-11-06): at most this many feed
 # clips per cycle; feed_state key 'auto_accept' ("1" = on, default).
-AUTO_APPROVE_PER_CYCLE = 5
+AUTO_APPROVE_PER_CYCLE = 10
 AUTO_ACCEPT_KEY = "auto_accept"
 
 MIN_DURATION_SEC = 10
@@ -797,14 +810,18 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
     manual approval forever is not feasible).
 
     Gate: a clip is approved ONLY when the stored suggestion is confident
-    (suggest_subcategory returned a category — best >= 3 AND margin >= 2).
-    Candidates, at most AUTO_APPROVE_PER_CYCLE per call: this cycle's newly
-    intaken clips first, then the oldest pending feed clips. Each candidate
-    is analyzed once with the same analysis as the moderation queue
-    (analyze_clip_for_queue, bot=None — feed clips download from
-    source_url and never take the get_file branch). A clip that already
-    HAS a confident suggestion is approved without re-analysis; a clip
-    already analyzed without one stays pending. Ambiguous clips,
+    (suggest_subcategory returned a category — best >= 3 AND margin >= 2;
+    the margin stays strict on purpose: a near-tie is genuinely ambiguous
+    and must stay queued). Candidates, at most AUTO_APPROVE_PER_CYCLE per
+    call: this cycle's newly intaken clips first, then the oldest pending
+    feed clips. Each candidate is analyzed once with the same analysis as
+    the moderation queue (analyze_clip_for_queue, bot=None — feed clips
+    download from source_url and never take the get_file branch). A clip
+    already analyzed WITHOUT a suggestion is NOT re-downloaded: it is
+    cheaply re-scored from its stored title/lyrics/caption
+    (rescore_clip_from_stored), which recovers clips that pass the
+    current gate after a scoring change. A clip that already HAS a confident
+    suggestion is approved without re-analysis. Ambiguous clips,
     unidentified clips, analysis failures and forward_only clips stay
     pending for manual review. Feed clips ONLY (feed_key present) —
     manual/channel clips are never touched. The pass is switched off
@@ -817,9 +834,9 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
             return out
         out["enabled"] = True
         # --- candidates: this cycle's new intakes first, then oldest pending.
-        # Already-analyzed clips WITHOUT a confident suggestion are NOT
-        # candidates (re-analysis would give the same answer) — they must
-        # not take a slot, or the backlog would never drain.
+        # Already-analyzed clips WITHOUT a confident suggestion are
+        # candidates too — they are re-scored from stored data (cheap, no
+        # re-download) and may pass the current gate after a gate change.
         seen_ids: set[int] = set()
         raw: list[dict] = []
         for key in (new_keys or []):
@@ -839,12 +856,7 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
         for clip in raw:
             if int(clip.get("forward_only") or 0) == 1:
                 continue
-            has_sugg = bool(clip.get("sugg_category")
-                            and clip.get("sugg_subcategory"))
-            already = bool(clip.get("last_error")
-                           or clip.get("identified_title"))
-            if has_sugg or not already:
-                cands.append(clip)
+            cands.append(clip)
             if len(cands) >= AUTO_APPROVE_PER_CYCLE:
                 break
         for clip in cands[:AUTO_APPROVE_PER_CYCLE]:
@@ -853,7 +865,14 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
                 has_sugg = bool(clip.get("sugg_category")
                                 and clip.get("sugg_subcategory"))
                 if not has_sugg:
-                    await _sarch.analyze_clip_for_queue(None, clip)
+                    analyzed = bool(clip.get("last_error")
+                                    or clip.get("identified_title"))
+                    if analyzed:
+                        # Analyzed under the old gate: cheap re-score from
+                        # stored title/lyrics/caption (no re-download).
+                        _sarch.rescore_clip_from_stored(clip["id"])
+                    else:
+                        await _sarch.analyze_clip_for_queue(None, clip)
                     clip = _sarch.get_clip(clip["id"]) or clip
                     has_sugg = bool(clip.get("sugg_category")
                                     and clip.get("sugg_subcategory"))

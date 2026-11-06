@@ -271,6 +271,10 @@ if __name__ == "__main__":
 DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 WAVEFRAME_ALPHA = 0.28  # on-screen opacity for the fixed badge
 WAVEFRAME_FPS = 15      # animation frame rate (smooth enough, cheap)
+WAVEFRAME_SS = 2        # supersample factor (2026-11-06 real-test fix):
+# the badge is rasterized at 2x its on-screen size and downscaled with
+# LANCZOS in the ffmpeg overlay chain, so text and edges stay sharp
+# after the re-encode. The on-screen size stays 0.47 * video width.
 
 
 def _vgrad(w, h, top_c, bot_c):
@@ -287,24 +291,30 @@ def _chamfer_points(x0, y0, x1, y1, ch):
             (x1 - ch, y1), (x0 + ch, y1), (x0, y1 - ch), (x0, y0 + ch)]
 
 
-def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
+def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0, ss=1.0):
     """Build the Avano Waveframe badge as a transparent RGBA asset.
 
     eq_ratios: 5 EQ bar heights (0..1). scale: entrance zoom (1.0 = final).
+    ss: supersample factor — the badge is rasterized at ss x its on-screen
+    size (all geometry, incl. padding, line widths and blur radii, scales
+    with ss); the caller downscales it back with LANCZOS. ss=1.0 keeps
+    the legacy 1x render.
     """
-    bw = int(video_w * 0.47)
-    bh = int(video_w * 0.104)
+    bw = int(video_w * 0.47 * ss)
+    bh = int(video_w * 0.104 * ss)
     ch = int(bh * 0.30)
-    pad = 44
-    aw, ah = bw + pad * 2, bh + pad * 2 + 18
+    pad = int(44 * ss)
+    aw, ah = bw + pad * 2, bh + pad * 2 + int(18 * ss)
     ox, oy = pad, pad
     base = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
     pts = _chamfer_points(ox, oy, ox + bw, oy + bh, ch)
 
     # drop shadow
     sh = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
-    ImageDraw.Draw(sh).polygon([(x, y + 9) for x, y in pts], fill=(0, 0, 0, 95))
-    base = Image.alpha_composite(base, sh.filter(ImageFilter.GaussianBlur(10)))
+    ImageDraw.Draw(sh).polygon([(x, y + int(9 * ss)) for x, y in pts],
+                               fill=(0, 0, 0, 95))
+    base = Image.alpha_composite(base, sh.filter(
+        ImageFilter.GaussianBlur(int(10 * ss))))
 
     # glass gradient body
     grad = _vgrad(bw, bh, (34, 96, 88, 255), (10, 42, 38, 255))
@@ -313,24 +323,31 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
     base.paste(grad, (ox, oy), mask)
 
     # outer neon glow ring following the chamfered silhouette
-    glow_pts = _chamfer_points(ox - 5, oy - 5, ox + bw + 5, oy + bh + 5, ch + 5)
+    glow_pts = _chamfer_points(ox - int(5 * ss), oy - int(5 * ss),
+                               ox + bw + int(5 * ss), oy + bh + int(5 * ss),
+                               ch + int(5 * ss))
     gl = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
     ImageDraw.Draw(gl).line(glow_pts + [glow_pts[0]],
-                            fill=(110, 255, 185, 65), width=8, joint="curve")
-    base = Image.alpha_composite(base, gl.filter(ImageFilter.GaussianBlur(7)))
+                            fill=(110, 255, 185, 65),
+                            width=max(1, int(8 * ss)), joint="curve")
+    base = Image.alpha_composite(base, gl.filter(
+        ImageFilter.GaussianBlur(int(7 * ss))))
 
     d = ImageDraw.Draw(base)
-    d.line(pts + [pts[0]], fill=(212, 255, 232, 160), width=2, joint="curve")
+    d.line(pts + [pts[0]], fill=(212, 255, 232, 160),
+           width=max(1, int(2 * ss)), joint="curve")
     d.line([(ox + ch + 8, oy + 3), (ox + bw - ch - 8, oy + 3)],
-           fill=(235, 255, 242, 120), width=2)
+           fill=(235, 255, 242, 120), width=max(1, int(2 * ss)))
 
     # sheen across the upper area
     sheen = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
     ImageDraw.Draw(sheen).polygon(
-        [(ox + ch, oy + 9), (ox + bw - ch, oy + 9),
-         (ox + bw - ch - 16, oy + int(bh * 0.40)),
-         (ox + ch + 16, oy + int(bh * 0.40))], fill=(255, 255, 255, 20))
-    base = Image.alpha_composite(base, sheen.filter(ImageFilter.GaussianBlur(2)))
+        [(ox + ch, oy + int(9 * ss)), (ox + bw - ch, oy + int(9 * ss)),
+         (ox + bw - ch - int(16 * ss), oy + int(bh * 0.40)),
+         (ox + ch + int(16 * ss), oy + int(bh * 0.40))],
+        fill=(255, 255, 255, 20))
+    base = Image.alpha_composite(base, sheen.filter(
+        ImageFilter.GaussianBlur(max(1, int(2 * ss)))))
     d = ImageDraw.Draw(base)
 
     # monogram: chamfered plaque (same design language as the frame)
@@ -344,7 +361,8 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
         [(x - (mcx - m), y - (mcy - m)) for x, y in mpts], fill=255)
     base.paste(mdisc, (mcx - m, mcy - m), mmask)
     d = ImageDraw.Draw(base)
-    d.line(mpts + [mpts[0]], fill=(215, 255, 232, 175), width=2, joint="curve")
+    d.line(mpts + [mpts[0]], fill=(215, 255, 232, 175),
+           width=max(1, int(2 * ss)), joint="curve")
     af = ImageFont.truetype(DEJAVU_BOLD, int(m * 1.02))
     ab = af.getbbox("A")
     d.text((mcx - (ab[0] + ab[2]) / 2, mcy - (ab[1] + ab[3]) / 2),
@@ -353,7 +371,7 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
     # divider
     x_div = mcx + m + int(bh * 0.20)
     d.line([x_div, oy + int(bh * 0.27), x_div, oy + bh - int(bh * 0.27)],
-           fill=(190, 255, 220, 75), width=1)
+           fill=(190, 255, 220, 75), width=max(1, int(1 * ss)))
 
     # EQ signature pulse (animated via eq_ratios)
     ratios = eq_ratios or [0.35, 0.62, 1.0, 0.62, 0.35]
@@ -370,7 +388,8 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
         x = ex + i * (bw_bar + gap)
         bd.rounded_rectangle([x, ecy - hbar / 2, x + bw_bar, ecy + hbar / 2],
                              radius=bw_bar // 2, fill=(150, 255, 195, 235))
-    base = Image.alpha_composite(base, bars.filter(ImageFilter.GaussianBlur(1)))
+    base = Image.alpha_composite(base, bars.filter(
+        ImageFilter.GaussianBlur(max(1, int(1 * ss)))))
     base = Image.alpha_composite(base, bars)
     d = ImageDraw.Draw(base)
 
@@ -398,8 +417,12 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0):
     return base
 
 
-def _waveframe_frame(video_w, t, alpha):
-    """One animation frame of the living badge at time t (seconds)."""
+def _waveframe_frame(video_w, t, alpha, ss=1.0):
+    """One animation frame of the living badge at time t (seconds).
+
+    ss: supersample factor (see build_waveframe_badge) — the frame is
+    rasterized at ss x its on-screen size.
+    """
     # cinematic entrance: ease-out zoom + fade over the first 1.2s
     TIN = 1.2
     if t < TIN:
@@ -416,7 +439,7 @@ def _waveframe_frame(video_w, t, alpha):
         ph = i * 1.9
         r = 0.15 + 0.85 * (0.5 + 0.5 * math.sin(2 * math.pi * f * t + ph))
         ratios.append(max(0.12, min(1.0, r * beat)))
-    badge = build_waveframe_badge(video_w, eq_ratios=ratios, scale=sc)
+    badge = build_waveframe_badge(video_w, eq_ratios=ratios, scale=sc, ss=ss)
     # light sweep across the glass every 7s (starts at t=2s)
     SWEEP_EVERY, SWEEP_DUR = 7.0, 1.4
     cyc = (t - 2.0) % SWEEP_EVERY
@@ -430,7 +453,8 @@ def _waveframe_frame(video_w, t, alpha):
             [(xc - bwid, 0), (xc + bwid * 0.4, 0),
              (xc - bwid * 0.4, Hb), (xc - bwid, Hb)],
             fill=(255, 255, 255, int(46 * math.sin(math.pi * p))))
-        badge = Image.alpha_composite(badge, sw.filter(ImageFilter.GaussianBlur(3)))
+        badge = Image.alpha_composite(badge, sw.filter(
+            ImageFilter.GaussianBlur(max(1, int(3 * ss)))))
     # bake the global opacity (badge alpha * entrance fade)
     k = alpha * ain
     if k < 1.0:
@@ -440,12 +464,17 @@ def _waveframe_frame(video_w, t, alpha):
     return badge
 
 
-def render_waveframe_frames(video_w, dur, alpha, fps=WAVEFRAME_FPS, out_dir=None):
-    """Render the living-badge PNG sequence covering the whole clip."""
+def render_waveframe_frames(video_w, dur, alpha, fps=WAVEFRAME_FPS,
+                            out_dir=None, ss=1.0):
+    """Render the living-badge PNG sequence covering the whole clip.
+
+    ss: supersample factor — frames are rasterized at ss x on-screen size
+    (the caller downscales them with LANCZOS before overlay).
+    """
     n = int(math.ceil(dur * fps)) + 1
     for i in range(n):
         t = i / fps
-        frame = _waveframe_frame(video_w, t, alpha)
+        frame = _waveframe_frame(video_w, t, alpha, ss=ss)
         frame.save(os.path.join(out_dir, f"f{i:04d}.png"))
     return n
 
@@ -466,19 +495,26 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
     animated=True (default): the living edition — EQ pulses like real audio,
     cinematic ease-out entrance, light sweep across the glass every 7s and a
     gentle float. animated=False: the original static badge.
-    Audio is preserved (AAC copied, other codecs re-encoded to AAC,
-    silent sources stay silent).
+    Quality (2026-11-06 real-test fix): the badge is rasterized at 2x its
+    on-screen size (WAVEFRAME_SS) and downscaled with LANCZOS in the
+    overlay chain, so the wordmark and edges stay sharp after the
+    re-encode; the on-screen size stays 0.47 * video width. Encode is
+    CRF 18 (preset veryfast). Audio is preserved (AAC copied, other
+    codecs re-encoded to AAC, silent sources stay silent).
     """
     dur, W, H = probe(in_path)
+    ss = WAVEFRAME_SS
     with tempfile.TemporaryDirectory() as td:
         if animated:
-            render_waveframe_frames(W, dur, alpha, fps, td)
+            render_waveframe_frames(W, dur, alpha, fps, td, ss=ss)
             badge_probe = Image.open(os.path.join(td, "f0000.png"))
-            aw, ah = badge_probe.size
+            aw2, ah2 = badge_probe.size
+            # on-screen (1x) badge size — the frames are ss x larger
+            aw, ah = aw2 // ss, ah2 // ss
             mx = int(W * 0.06)
             x, y = W - aw - mx, int(H * 0.90) - ah
             fc = (
-                "[1:v]format=rgba[wm];"
+                f"[1:v]scale=iw/{ss}:ih/{ss}:flags=lanczos,format=rgba[wm];"
                 "[0:v][wm]overlay="
                 f"x={x}:y='{y}+4*sin(2*PI*t/5)':eof_action=pass,"
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
@@ -487,13 +523,14 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
                       "-i", os.path.join(td, "f%04d.png")]
         else:
             badge_path = os.path.join(td, "waveframe.png")
-            badge = build_waveframe_badge(W)
+            badge = build_waveframe_badge(W, ss=ss)
             badge.save(badge_path)
-            aw, ah = badge.size
+            aw2, ah2 = badge.size
+            aw, ah = aw2 // ss, ah2 // ss
             mx = int(W * 0.06)
             x, y = W - aw - mx, int(H * 0.90) - ah
             fc = (
-                "[1:v]format=rgba,"
+                f"[1:v]scale=iw/{ss}:ih/{ss}:flags=lanczos,format=rgba,"
                 f"colorchannelmixer=aa={alpha},"
                 "fade=t=in:st=0:d=0.5:alpha=1[wm];"
                 "[0:v][wm]overlay="
@@ -505,13 +542,65 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
         cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
                "-filter_complex", fc, "-map", "[v]",
                *_audio_args_for(in_path),
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                "-movflags", "+faststart", "-shortest", out_path]
         subprocess.run(cmd, check=True)
 
     return {"duration": round(dur, 2), "size": [W, H],
             "badge": [aw, ah], "position": [x, y], "alpha": alpha,
             "animated": animated, "style": "waveframe-fixed"}
+
+
+OUTRO_ASSET = os.path.join(os.path.dirname(__file__), "..", "assets",
+                           "avano_outro_wf_2s5.mp4")
+OUTRO_DUR = 2.5  # seconds of the AVANO MEDIA end bumper
+
+
+def overlay_outro(in_path, out_path, outro_path=None):
+    """Overlay the AVANO MEDIA end bumper on a clip's final seconds.
+
+    Final order 2026-11-06: the end motion graphic is kept for clips
+    whose processing and republishing is allowed. The bumper (2.5s,
+    Waveframe hero, Persian tagline) is overlaid on the clip's FINAL
+    2.5s — the clip's own audio plays on untouched, no silence is ever
+    added, and the total duration does not change (same design as the
+    approved Phase 2 process_clip_for_approval).
+
+    The bumper is a vertical 9:16 asset, so it applies only to portrait
+    clips (H > W) of at least OUTRO_DUR + 1s; otherwise the input is
+    copied unchanged and applied=False is returned. Never raises on a
+    missing asset — callers treat applied=False as "send the badged
+    file". Encode: libx264, preset veryfast, CRF 18 (same as the badge);
+    audio preserved (AAC copied, other codecs re-encoded to AAC).
+    """
+    import shutil
+    outro = outro_path or OUTRO_ASSET
+    dur, W, H = probe(in_path)
+    if H <= W or dur < OUTRO_DUR + 1.0 or not os.path.exists(outro):
+        shutil.copyfile(in_path, out_path)
+        reason = ("not_portrait" if H <= W else
+                  "too_short" if dur < OUTRO_DUR + 1.0 else "no_asset")
+        return {"applied": False, "duration": round(dur, 2),
+                "size": [W, H], "reason": reason}
+    start = dur - OUTRO_DUR
+    fc = (
+        f"[1:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
+        f"format=yuv420p[ov];"
+        f"[0:v][ov]overlay=enable='gte(t,{start:.2f})':eof_action=pass,"
+        f"scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+    )
+    cmd = ["ffmpeg", "-v", "error", "-y",
+           "-i", in_path,
+           "-itsoffset", f"{start:.2f}", "-i", outro,
+           "-filter_complex", fc, "-map", "[v]",
+           *_audio_args_for(in_path),
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+           "-movflags", "+faststart", out_path]
+    subprocess.run(cmd, check=True)
+    return {"applied": True, "duration": round(dur, 2), "size": [W, H],
+            "outro_start": round(start, 2),
+            "outro": os.path.basename(outro)}
 
 
 # ------------------------------------------------------- user badge (v3) ---
@@ -529,6 +618,30 @@ USER_BADGE_SCALE = 0.38
 USER_BADGE_ALPHA = 0.7
 USER_BADGE_MARGIN_F = 0.05
 USER_BADGE_FPS = 15
+USER_BADGE_SS = 2         # supersample factor (2026-11-06 real-test fix):
+# the badge is rasterized at 2x its on-screen size and downscaled with
+# LANCZOS in the ffmpeg overlay chain, so text and edges stay sharp
+# after the re-encode. The on-screen size stays 0.38 * video width
+# (or the boosted scale below for small videos).
+# Measured wordmark cap height in the asset (944x264): 42px (p95 of ink
+# columns; play-o circle excluded). At 360px phone width the cap height
+# is 42 * scale * 360 / 944 — 6.1px at the standard 0.38 scale, which is
+# why the wordmark was unreadable on small clips.
+_USER_BADGE_TEXT_H = 42
+_USER_BADGE_ASSET_W = 944
+_USER_BADGE_MIN_TEXT_PHONE = 9.0   # px at 360px phone width
+_USER_BADGE_SMALL_W = 720          # boost applies only below this width
+
+
+def _user_badge_scale_for(W):
+    """Badge scale (fraction of video width). Small videos (<720px wide)
+    get a boost so the wordmark cap height reaches >= 9px at 360px phone
+    width; larger videos keep the standard discreet 0.38 scale."""
+    if W >= _USER_BADGE_SMALL_W:
+        return USER_BADGE_SCALE
+    need = (_USER_BADGE_MIN_TEXT_PHONE * _USER_BADGE_ASSET_W
+            / (_USER_BADGE_TEXT_H * 360.0))
+    return max(USER_BADGE_SCALE, need)
 # EQ live area in the badge asset's design coords (944x264).
 _USER_BADGE_EQ = (808, 100, 86, 64)
 _USER_BADGE_NEON = [(34, 211, 238), (59, 130, 246),
@@ -565,10 +678,18 @@ def _user_badge_eq_frame(w, h, t):
     return img
 
 
-def _user_badge_frame(video_w, t, alpha):
-    """One overlay frame (badge-sized): badge + live EQ, faded in."""
+def _user_badge_frame(video_w, t, alpha, ss=1.0, scale=None):
+    """One overlay frame (badge-sized): badge + live EQ, faded in.
+
+    ss: supersample factor — the badge is rasterized at ss x its on-screen
+    size (asset scaled with LANCZOS, EQ drawn at ss x); the caller
+    downscales it back with LANCZOS. scale: badge-scale override
+    (fraction of video width); default is the small-video-aware
+    _user_badge_scale_for(video_w).
+    """
     src = Image.open(USER_BADGE_ASSET).convert("RGBA")
-    sc = (USER_BADGE_SCALE * video_w) / src.width
+    sc = ((scale if scale is not None else _user_badge_scale_for(video_w))
+          * video_w * ss) / src.width
     bw, bh = int(src.width * sc), int(src.height * sc)
     badge = src.resize((bw, bh), Image.LANCZOS)
     ex0, ey0, ewd, ehd = _USER_BADGE_EQ
@@ -589,31 +710,45 @@ def apply_user_badge(in_path, out_path, alpha=USER_BADGE_ALPHA,
 
     animated=True (default): the EQ inside the badge dances like real
     audio; animated=False: one mid-dance EQ pose, static.
-    Audio is preserved (AAC copied, other codecs re-encoded to AAC,
-    silent sources stay silent). The badge never moves, never covers the
-    clip's main subject area beyond its discreet corner.
+    Quality (2026-11-06 real-test fix): the badge is rasterized at 2x its
+    on-screen size (USER_BADGE_SS) and downscaled with LANCZOS in the
+    overlay chain, so the wordmark and edges stay sharp after the
+    re-encode; the on-screen size stays 0.38 * video width, except small
+    videos (<720px wide) where the scale is boosted so the wordmark cap
+    height reaches >= 9px at 360px phone width. Encode is CRF 18
+    (preset veryfast). Audio is preserved (AAC copied, other codecs
+    re-encoded to AAC, silent sources stay silent). The badge never
+    moves, never covers the clip's main subject area beyond its
+    discreet corner.
     """
     dur, W, H = probe(in_path)
+    ss = USER_BADGE_SS
+    scale = _user_badge_scale_for(W)
     with tempfile.TemporaryDirectory() as td:
         if animated:
             n = int(math.ceil(dur * fps)) + 1
             for i in range(n):
-                _user_badge_frame(W, i / fps, alpha).save(
+                _user_badge_frame(W, i / fps, alpha, ss=ss,
+                                  scale=scale).save(
                     os.path.join(td, f"f{i:04d}.png"))
             badge_probe = Image.open(os.path.join(td, "f0000.png"))
-            aw, ah = badge_probe.size
+            aw2, ah2 = badge_probe.size
+            # on-screen (1x) badge size — the frames are ss x larger
+            aw, ah = aw2 // ss, ah2 // ss
             inputs = ["-i", in_path, "-framerate", str(fps),
                       "-i", os.path.join(td, "f%04d.png")]
         else:
             badge_path = os.path.join(td, "user_badge.png")
-            _user_badge_frame(W, 0.6, alpha).save(badge_path)
-            aw, ah = Image.open(badge_path).size
+            _user_badge_frame(W, 0.6, alpha, ss=ss, scale=scale).save(
+                badge_path)
+            aw2, ah2 = Image.open(badge_path).size
+            aw, ah = aw2 // ss, ah2 // ss
             inputs = ["-i", in_path, "-loop", "1", "-t", f"{dur:.2f}",
                       "-i", badge_path]
         m = int(W * USER_BADGE_MARGIN_F)
         x, y = W - aw - m, H - ah - m
         fc = (
-            "[1:v]format=rgba[wm];"
+            f"[1:v]scale=iw/{ss}:ih/{ss}:flags=lanczos,format=rgba[wm];"
             "[0:v][wm]overlay="
             f"x={x}:y={y}:eof_action=pass,"
             "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
@@ -621,7 +756,7 @@ def apply_user_badge(in_path, out_path, alpha=USER_BADGE_ALPHA,
         cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
                "-filter_complex", fc, "-map", "[v]",
                *_audio_args_for(in_path),
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                "-movflags", "+faststart", "-shortest", out_path]
         subprocess.run(cmd, check=True)
 

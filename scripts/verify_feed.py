@@ -14,22 +14,27 @@ Checks (all on REAL fixtures — repo excerpts of the verified fetches):
   6. Migration: _init_tables creates feed_state + source_url/feed_key
      columns; idempotent; backup keeps the ORIGINAL snapshot.
   7. file_id design: approval fallback without storage (feed clips go
-     active raw by design); first delivery badges once (stubbed badge)
-     and stores the file_id as processed_file_id; second delivery uses
-     it instantly; badge failure -> raw-URL fallback + file_id capture,
-     and the next delivery reuses the stored raw file_id.
+     active raw by design); first delivery burns the Waveframe badge
+     once + the AVANO MEDIA outro (stubbed) and stores the file_id as
+     processed_file_id; second delivery uses it instantly; badge
+     failure -> raw-URL fallback + file_id capture, and the next
+     delivery reuses the stored raw file_id.
   8. Queue analysis uses source_url (no get_file) for feed clips.
   9. Admin panel shows the feed status lines.
  10. Hourly loop survives a failing cycle and keeps running.
- 11. Multi-channel Telegram: one cycle intakes from @SOBHbe and
-     @yaldavamusic (not just @ehsaspaak) with distinct feed_keys;
-     per-channel last_seen; legacy 'tg:<id>' keys dedup against the
-     new 'tg:ehsaspaak:<id>' form; tokenized video URLs kept whole.
+ 11. Multi-channel Telegram: one cycle intakes from @SOBHbe,
+     @yaldavamusic, @delll_nevveshteh and @dosti (not just @ehsaspaak)
+     with distinct feed_keys; per-channel last_seen; legacy
+     'tg:<id>' keys dedup against the new 'tg:ehsaspaak:<id>' form;
+     tokenized video URLs kept whole. The friendship channel is wired
+     as 'dosti' (t.me/s/refaghat serves the same page but its posts
+     carry data-post='dosti/...').
  12. Aparat seed rotation: one seed per run, round-robin across the
-     4 creators (faezehradmanesh, Multimedia2020, Clip_film2023,
-     Masafinia.m); the per-run show-call bound (8) is TOTAL, not per
-     seed; the Multimedia2020 fixture parses (50 related, 49 short);
-     a 61s clip is rejected by the 60s cap.
+     8 creators (faezehradmanesh, Multimedia2020, Clip_film2023,
+     Masafinia.m, Amirabbas.b, AparatVision, Tafrihi_Best,
+     Aparat_Media_pars); the per-run show-call bound (8) is TOTAL,
+     not per seed; the Multimedia2020 fixture parses (50 related,
+     49 short); a 61s clip is rejected by the 60s cap.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
 Run: python3 scripts/verify_feed.py ; exit 0 = all PASS.
@@ -63,7 +68,10 @@ FIXTURES = ROOT / "scripts" / "fixtures" / "feed"
 TG_HTML = FIXTURES / "tg_ehsaspaak_excerpt.html"
 SOBHBE_HTML = FIXTURES / "tg_SOBHbe_excerpt.html"
 YALDAVA_HTML = FIXTURES / "tg_yaldavamusic_excerpt.html"
+DELL_HTML = FIXTURES / "tg_delll_nevveshteh_excerpt.html"
+DOSTI_HTML = FIXTURES / "tg_dosti_excerpt.html"
 AP_JSON = FIXTURES / "aparat_show_excerpt.json"
+TAF_JSON = FIXTURES / "aparat_show_tafrihi.json"
 MM_JSON = FIXTURES / "aparat_show_multimedia2020.json"
 REF_CLIP = Path.home() / "workspace/user/media_library/video/53/53e2091f582cf40588ff9687ac70321fff63ce8795884a99481f76b44799956a.mp4"
 
@@ -392,6 +400,24 @@ async def main():
           all("?token=TOKEN" in p["url"] for p in sob_posts + yal_posts)
           and all(p["url"].startswith("https://cdn")
                   for p in sob_posts + yal_posts))
+    # --- T1c: the two REPORT2 Telegram channels (real excerpts) -------
+    dell_posts = feed.parse_tg_page(
+        DELL_HTML.read_text(encoding="utf-8"), channel="delll_nevveshteh")
+    dell_ids = [p["post_id"] for p in dell_posts]
+    check("tg parser delll_nevveshteh: 3 video posts",
+          dell_ids == [326, 328, 339], f"got {dell_ids}")
+    check("tg parser delll_nevveshteh: short post 328 parses as 3s",
+          dell_posts[1]["duration"] == 3, f"got {dell_posts[1]}")
+    dosti_posts = feed.parse_tg_page(
+        DOSTI_HTML.read_text(encoding="utf-8"), channel="dosti")
+    dosti_ids = [p["post_id"] for p in dosti_posts]
+    check("tg parser dosti: 3 video posts (friendship channel)",
+          dosti_ids == [13109, 13110, 13111], f"got {dosti_ids}")
+    check("tg parser dosti: the refaghat alias parses ZERO posts",
+          feed.parse_tg_page(
+              DOSTI_HTML.read_text(encoding="utf-8"),
+              channel="refaghat") == [],
+          "data-post carries dosti/..., so wiring 'refaghat' is dead")
     check("tg parser: channel isolation (ehsaspaak page as SOBHbe -> [])",
           feed.parse_tg_page(tg_html, channel="SOBHbe") == [])
     check("tg parser: feed_key aliases (legacy <-> new, ehsaspaak only)",
@@ -428,6 +454,24 @@ async def main():
               {"uid": "x", "title": "cool video", "duration": 28})
           and not feed._aparat_candidate(
               {"uid": "x", "title": "کلیپ عاشقانه", "duration": 5}))
+
+    # --- T2c: Aparat Tafrihi_Best (REPORT2 occasion source) ------------
+    taf_payload = json.loads(TAF_JSON.read_text(encoding="utf-8"))
+    taf_info = feed.parse_aparat_show(taf_payload)
+    check("aparat show Tafrihi_Best: uid/duration/category/can_download",
+          taf_info and taf_info["uid"] == "okm549l"
+          and taf_info["duration"] == 23
+          and taf_info["category"] == "موسیقی"
+          and taf_info["owner"] == "Tafrihi_Best"
+          and taf_info["can_download"] is True
+          and (taf_info["file_link"] or "").startswith("https://"),
+          f"got {taf_info}")
+    check("aparat show Tafrihi_Best: passes the accept gate",
+          bool(taf_info) and feed._aparat_accept(taf_info))
+    taf_rel = feed.parse_aparat_related(taf_payload)
+    check("aparat related Tafrihi_Best: 5 UIDs, first xcpt4f8 26s",
+          len(taf_rel) == 5 and taf_rel[0]["uid"] == "xcpt4f8"
+          and taf_rel[0]["duration"] == 26, f"got {len(taf_rel)}")
 
     # --- T2b/T3b: Aparat Multimedia2020 (real show JSON) ---------------
     mm_payload = json.loads(MM_JSON.read_text(encoding="utf-8"))
@@ -621,7 +665,8 @@ async def main():
     stats3 = await feed.run_feed_cycle(bootstrap=False, tg_fetcher=boom,
                                        aparat_fetcher=lambda uid: None)
     tg_err_all = ("ehsaspaak:tg_cycle_failed;SOBHbe:tg_cycle_failed;"
-                  "yaldavamusic:tg_cycle_failed")
+                  "yaldavamusic:tg_cycle_failed;delll_nevveshteh:tg_cycle_failed;"
+                  "dosti:tg_cycle_failed")
     check("cycle error: raising fetcher -> per-channel tg_cycle_failed, no crash",
           stats3.get("tg_error") == tg_err_all
           and stats3.get("error") == tg_err_all, f"got {stats3}")
@@ -640,7 +685,8 @@ async def main():
     check("cycle error: empty fetch -> per-channel tg_fetch_failed",
           stats3b.get("tg_error")
           == ("ehsaspaak:tg_fetch_failed;SOBHbe:tg_fetch_failed;"
-              "yaldavamusic:tg_fetch_failed"),
+              "yaldavamusic:tg_fetch_failed;delll_nevveshteh:tg_fetch_failed;"
+              "dosti:tg_fetch_failed"),
           f"got {stats3b}")
 
     # --- T5: single-flight ----------------------------------------------
@@ -671,20 +717,34 @@ async def main():
     yal_html = re.sub(
         r"https://cdn\d*\.telesco\.pe/file/[^\"']+\.mp4\?token=TOKEN",
         "file://" + _media("ehsas_vid3.mp4"), yal_html)
+    dell_html = DELL_HTML.read_text(encoding="utf-8")
+    dell_html = re.sub(
+        r"https://cdn\d*\.telesco\.pe/file/[^\"']+\.mp4\?token=TOKEN",
+        "file://" + _media("ehsas_vid1.mp4"), dell_html)
+    dosti_html = DOSTI_HTML.read_text(encoding="utf-8")
+    dosti_html = re.sub(
+        r"https://cdn\d*\.telesco\.pe/file/[^\"']+\.mp4\?token=TOKEN",
+        "file://" + _media("ehsas_vid3.mp4"), dosti_html)
 
     def tg_multi(channel):
         return {"ehsaspaak": html_cycle, "SOBHbe": sob_html,
-                "yaldavamusic": yal_html}.get(channel)
+                "yaldavamusic": yal_html,
+                "delll_nevveshteh": dell_html,
+                "dosti": dosti_html}.get(channel)
 
     tg_stats = await feed.run_telegram_cycle(tg_fetcher=tg_multi)
-    check("multi-channel TG: tg_new=6 (0 ehsaspaak deduped + 4 SOBHbe + 2 yaldavamusic)",
-          tg_stats.get("new") == 6
+    check("multi-channel TG: tg_new=12 (0 ehsaspaak deduped + 4 SOBHbe + 2 yaldavamusic + 3 delll + 3 dosti)",
+          tg_stats.get("new") == 12
           and tg_stats.get("per_channel")
-          == {"ehsaspaak": 0, "SOBHbe": 4, "yaldavamusic": 2}
+          == {"ehsaspaak": 0, "SOBHbe": 4, "yaldavamusic": 2,
+              "delll_nevveshteh": 3, "dosti": 3}
           and tg_stats.get("error") is None, f"got {tg_stats}")
     multi_keys = ["tg:SOBHbe:132203", "tg:SOBHbe:132209",
                   "tg:SOBHbe:132214", "tg:SOBHbe:132219",
-                  "tg:yaldavamusic:40", "tg:yaldavamusic:43"]
+                  "tg:yaldavamusic:40", "tg:yaldavamusic:43",
+                  "tg:delll_nevveshteh:326", "tg:delll_nevveshteh:328",
+                  "tg:delll_nevveshteh:339",
+                  "tg:dosti:13109", "tg:dosti:13110", "tg:dosti:13111"]
     multi_rows = [sarch.get_clip_by_unique("feed:" + k) for k in multi_keys]
     check("multi-channel TG: distinct feed_keys, all pending (no auto-accept)",
           all(r is not None and r["status"] == "pending" for r in multi_rows),
@@ -692,9 +752,13 @@ async def main():
     check("multi-channel TG: per-channel last_seen stored",
           feed.feed_get("tg_last_seen_sobhbe") == "132219"
           and feed.feed_get("tg_last_seen_yaldavamusic") == "43"
+          and feed.feed_get("tg_last_seen_delll_nevveshteh") == "339"
+          and feed.feed_get("tg_last_seen_dosti") == "13111"
           and feed.feed_get("tg_last_seen") == "117112",
           f"got sobhbe={feed.feed_get('tg_last_seen_sobhbe')!r} "
-          f"yaldavamusic={feed.feed_get('tg_last_seen_yaldavamusic')!r}")
+          f"yaldavamusic={feed.feed_get('tg_last_seen_yaldavamusic')!r} "
+          f"delll={feed.feed_get('tg_last_seen_delll_nevveshteh')!r} "
+          f"dosti={feed.feed_get('tg_last_seen_dosti')!r}")
 
     # --- T12: Aparat seed rotation + per-run call bound ------------------
     feed.feed_set("ap_seed_idx", "0")
@@ -714,23 +778,26 @@ async def main():
 
     seeds = []
     news = []
-    for _ in range(5):
+    for _ in range(9):
         r = await feed.run_aparat_cycle(bootstrap=False,
                                         aparat_fetcher=ap_rot)
         seeds.append(r.get("seed"))
         news.append(r.get("new"))
-    check("rotation: one seed per run, round-robin across 4 creators",
+    check("rotation: one seed per run, round-robin across 8 creators",
           seeds == ["faezehradmanesh", "Multimedia2020", "Clip_film2023",
-                    "Masafinia.m", "faezehradmanesh"],
+                    "Masafinia.m", "Amirabbas.b", "AparatVision",
+                    "Tafrihi_Best", "Aparat_Media_pars",
+                    "faezehradmanesh"],
           f"got {seeds}")
-    check("rotation: new counts per run [0, 5, 1, 1, 0] (seed + related)",
-          news == [0, 5, 1, 1, 0], f"got {news}")
-    check("rotation: seed index wraps (5 runs from 0 -> 1)",
+    check("rotation: new counts per run [0, 5, 1, 1, 1, 1, 1, 1, 0] (seed + related)",
+          news == [0, 5, 1, 1, 1, 1, 1, 1, 0], f"got {news}")
+    check("rotation: seed index wraps (9 runs from 0 -> 1)",
           feed.feed_get("ap_seed_idx") == "1",
           f"got {feed.feed_get('ap_seed_idx')!r}")
-    check("rotation: each new seed's own clip intaken (Clip_film2023/Masafinia.m)",
+    check("rotation: each new seed's own clip intaken (REPORT2 seeds too)",
           all((sarch.get_clip_by_unique("feed:ap:" + u) or {}).get("status")
-              == "pending" for u in ("DCBas", "xse8if0")))
+              == "pending" for u in ("DCBas", "xse8if0", "lfe35b0",
+                                     "m569u20", "okm549l", "o214420")))
 
     def ap_bound(uid):
         # show rejected by the accept gate (61s) while 49 related
@@ -748,16 +815,36 @@ async def main():
           bound["calls"] == 8 and bound["new"] == 0, f"got {bound}")
 
     # --- T7: approval fallback without storage + first delivery --------
+    # Final order 2026-11-06: deliver_feed_first burns the MAIN
+    # Waveframe badge (apply_waveframe_badge, HQ 2x supersample + CRF 18)
+    # plus the AVANO MEDIA end bumper (overlay_outro, portrait only);
+    # apply_user_badge must NOT be called here.
     import app.bot.motion_watermark as mw
-    real_badge = mw.apply_user_badge
+    real_wave = mw.apply_waveframe_badge
+    real_user = mw.apply_user_badge
+    real_outro = mw.overlay_outro
     badge_calls = []
+    user_calls = []
+    outro_calls = []
 
     def stub_badge(src, out):
         badge_calls.append((src, out))
         shutil.copyfile(src, out)
         return {"style": "stub"}
 
-    mw.apply_user_badge = stub_badge
+    def guard_user_badge(src, out):
+        user_calls.append((src, out))
+        raise AssertionError(
+            "apply_user_badge must not be called from deliver_feed_first")
+
+    def stub_outro(src, out):
+        outro_calls.append((src, out))
+        shutil.copyfile(src, out)
+        return {"applied": True}
+
+    mw.apply_waveframe_badge = stub_badge
+    mw.apply_user_badge = guard_user_badge
+    mw.overlay_outro = stub_outro
     try:
         r2router = FakeRouter()
         sarch.register_story_archive_handlers(r2router)
@@ -777,10 +864,14 @@ async def main():
         await play_h(cb, cfg, FakeState())
         row = sarch.get_clip(clip["id"])
         first_send = bot.calls[0] if bot.calls else None
-        check("first delivery: badge applied once via FSInputFile",
+        check("first delivery: Waveframe badge applied once via FSInputFile",
               len(badge_calls) == 1 and first_send is not None
               and first_send[2].startswith("FSInputFile:"),
               f"calls={bot.calls}")
+        check("first delivery: user badge NOT called (Waveframe only)",
+              user_calls == [], f"user_calls={user_calls}")
+        check("first delivery: outro applied once after the badge",
+              len(outro_calls) == 1, f"outro_calls={outro_calls}")
         check("first delivery: badged file_id stored as processed final",
               row.get("processed_file_id") == "badged-fid-1"
               and row.get("file_id") == "badged-fid-1",
@@ -800,7 +891,7 @@ async def main():
             badge_calls.append((src, out))
             raise RuntimeError("ffmpeg down")
 
-        mw.apply_user_badge = boom_badge
+        mw.apply_waveframe_badge = boom_badge
         clip2 = sarch.get_clip_by_unique("feed:tg:ehsaspaak:117099")
         sarch.set_clip_status(clip2["id"], "active")
         sarch.move_clip(clip2["id"], "love", "express")
@@ -820,8 +911,12 @@ async def main():
               bot2.calls[-1][2] == "raw-fid-1"
               and len(badge_calls) == n_badge,
               f"calls={bot2.calls[-1:]}")
+        check("badge failure: user badge still NOT called",
+              user_calls == [], f"user_calls={user_calls}")
     finally:
-        mw.apply_user_badge = real_badge
+        mw.apply_waveframe_badge = real_wave
+        mw.apply_user_badge = real_user
+        mw.overlay_outro = real_outro
 
     # --- T8: queue analysis uses source_url (no get_file) ---------------
     async def fake_identify(data):
@@ -913,28 +1008,28 @@ async def main():
     sarch._identify_audio_bytes = aa_identify
     sarch._fetch_lyrics_text = aa_lyrics
     stats_aa = await feed.run_auto_approve_pass(new_keys=aa_keys)
-    check("auto-approve: cap — at most 5 approved in one pass",
-          stats_aa.get("approved") == 5 and stats_aa.get("checked") == 5,
+    check("auto-approve: cap — at most 10 approved in one pass",
+          stats_aa.get("checked") == 10
+          and 7 <= stats_aa.get("approved", 0) <= 10,
           f"got {stats_aa}")
     aa_rows = [sarch.get_clip_by_unique("feed:" + k) for k in aa_keys]
     ap_rows = [r for r in aa_rows if r and r["status"] == "active"]
-    check("auto-approve: new intakes first (first 5 keys approved)",
-          [r["feed_key"] for r in ap_rows] == aa_keys[:5],
+    check("auto-approve: new intakes first (all 7 keys approved)",
+          [r["feed_key"] for r in ap_rows] == aa_keys,
           f"got {[r['feed_key'] for r in ap_rows]}")
     check("auto-approve: approved rows active + feed-auto + love/express",
-          len(ap_rows) == 5 and all(
+          len(ap_rows) == 7 and all(
               r["categorized_by"] == "feed-auto"
               and r["category"] == "love" and r["subcategory"] == "express"
               and (r["cat_score"] or 0) >= 3 for r in ap_rows))
-    check("auto-approve: the 2 remaining stay pending",
-          sum(1 for r in aa_rows if r and r["status"] == "pending") == 2)
-    # Second pass drains the backlog: the pre-suggested 117112 (T8) plus
-    # the 2 remaining aa clips. Already-analyzed clips without a
-    # Drain the backlog: repeated passes (cap 5 each) until the 7 aa clips
-    # and the pre-suggested 117112 are all active. The backlog holds older
-    # cycle clips, so the aa clips are NOT necessarily next — the pass
-    # works oldest-first. Already-analyzed clips without a suggestion
-    # must not clog the candidate slots.
+    check("auto-approve: no aa clip left pending",
+          sum(1 for r in aa_rows if r and r["status"] == "pending") == 0)
+    # Drain the backlog: repeated passes (cap 10 each) until the 7 aa
+    # clips and the pre-suggested 117112 are all active. The backlog
+    # holds older cycle clips, so the aa clips are NOT necessarily next
+    # — the pass works oldest-first. Already-analyzed clips without a
+    # suggestion are re-scored from stored data (cheap, no re-download)
+    # and may pass the current gate after a gate change.
     max_per_pass = 0
     for _ in range(10):
         done = all(
@@ -947,7 +1042,7 @@ async def main():
         st = await feed.run_auto_approve_pass()
         max_per_pass = max(max_per_pass, st.get("approved", 0))
     check("auto-approve: per-pass cap respected while draining",
-          max_per_pass <= 5, f"max={max_per_pass}")
+          max_per_pass <= 10, f"max={max_per_pass}")
     check("auto-approve: all 7 aa clips eventually active",
           all((sarch.get_clip_by_unique("feed:" + k) or {}).get("status") == "active"
               for k in aa_keys))
@@ -1011,7 +1106,7 @@ async def main():
     check("auto-approve: dead source stays pending, no crash",
           gone2 and gone2["status"] == "pending"
           and gone2.get("last_error") == "source_gone"
-          and stats_aa5.get("approved", 0) <= 5,
+          and stats_aa5.get("approved", 0) <= 10,
           f"got {stats_aa5} err={gone2.get('last_error') if gone2 else None}")
     # Toggle handler: sarch:autoacc flips the flag + re-renders the panel.
     autoacc_h = find_handler(r2router, "eq:data=sarch:autoacc")
@@ -1033,6 +1128,159 @@ async def main():
                  if kb is not None for b in kb_buttons(kb)]
         check("auto-approve: panel re-renders with روشن",
               any("روشن" in (t or "") for t, _c in btns2), f"btns={btns2}")
+
+    # --- T12: corporate_caption never shows a source line (2026-11-06) ---
+    cap_with_src = sarch.corporate_caption(
+        {"duration": 44, "source_username": "Clip_film2023"})
+    cap_without_src = sarch.corporate_caption({"duration": 44})
+    cap_expected = ("🎬 AVANO MEDIA\n"
+                    "✨ منتخب استوری آوانو\n\n"
+                    "⏱ مدت: 00:44\n\n"
+                    "@AvanoMediaBot")
+    check("caption: with source_username -> NO منبع line, template intact",
+          cap_with_src == cap_expected and "منبع" not in cap_with_src
+          and "Clip_film2023" not in cap_with_src,
+          f"got {cap_with_src!r}")
+    check("caption: without source -> identical output",
+          cap_without_src == cap_expected, f"got {cap_without_src!r}")
+    check("caption: duration formats MM:SS zero-padded",
+          sarch.corporate_caption({"duration": 125}).split("مدت: ")[1][:5]
+          == "02:05")
+
+    # --- T13: final order 2026-11-06 — gate, title scoring, re-score,
+    # chooser label, outro -------------------------------------------
+    # Gate stays strict: a clear winner (margin >= 2) passes, a near-tie
+    # (margin 1) and a tie (margin 0) stay queued — the margin was NOT
+    # loosened, because the near-tie case (breakup 5 vs lonely 4) is
+    # genuinely ambiguous. The drain blockers were the candidate filter,
+    # the missing title signal, and the 5/cycle cap — all fixed below.
+    c, s, sc, _r = sarch.suggest_subcategory(
+        "عشق دوستت دارم عاشقانه", "", "", "")
+    check("gate: clear winner (best>=3, margin>=2) -> suggestion",
+          (c, s) == ("love", "express") and sc >= 3,
+          f"got {(c, s, sc)}")
+    c1, s1, sc1, _r1 = sarch.suggest_subcategory(
+        "عشق دلتنگی", "عشق", "", "")
+    check("gate: near-tie (best=3, margin=1) -> no suggestion",
+          (c1, s1) == (None, None) and sc1 == 3, f"got {(c1, s1, sc1)}")
+    c0, s0, sc0, _r0 = sarch.suggest_subcategory(
+        "عشق دوستت دارم دلتنگی", "دلتنگی دلم تنگ", "", "")
+    check("gate: best=4 margin=0 -> still no suggestion",
+          (c0, s0) == (None, None) and sc0 == 4, f"got {(c0, s0, sc0)}")
+    # Title scoring: a thematic song title alone can carry the score.
+    async def _title_identify(data):
+        return ("تولدت مبارک", "خواننده")
+
+    async def _empty_lyrics(title, artist):
+        return ""
+
+    sarch._identify_audio_bytes = _title_identify
+    sarch._fetch_lyrics_text = _empty_lyrics
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-title", source_url=url_ok, title="کلیپ",
+        duration_hint=18, source_username="ehsaspaak")
+    check("title scoring setup: intake ok", ok, f"got {why}")
+    trow = sarch.get_clip_by_unique("feed:tg:aa-title")
+    await sarch.analyze_clip_for_queue(None, trow)
+    trow = sarch.get_clip(trow["id"])
+    check("title scoring: song title 'تولدت مبارک' suggests occasion/birthday",
+          (trow.get("sugg_category"), trow.get("sugg_subcategory"))
+          == ("occasion", "birthday"),
+          f"got {trow.get('sugg_category')}/{trow.get('sugg_subcategory')}")
+    # Re-score from stored data (old-gate state, no re-download).
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-rescore", source_url=url_ok, title="کلیپ",
+        duration_hint=18, source_username="ehsaspaak")
+    check("rescore setup: intake ok", ok, f"got {why}")
+    rrow = sarch.get_clip_by_unique("feed:tg:aa-rescore")
+    sarch.save_suggestion(rrow["id"], title="تولدت مبارک", artist="خواننده",
+                          lyrics_excerpt="", sugg_category="",
+                          sugg_subcategory="", score=2,
+                          reasons="کپشن: تولد", error="not_identified")
+    check("rescore: old-gate clip gains a suggestion from stored data",
+          sarch.rescore_clip_from_stored(rrow["id"]) is True)
+    rrow = sarch.get_clip(rrow["id"])
+    check("rescore: suggestion is occasion/birthday, error cleared",
+          (rrow.get("sugg_category"), rrow.get("sugg_subcategory"))
+          == ("occasion", "birthday") and rrow.get("last_error") == "",
+          f"got {rrow.get('sugg_category')}/{rrow.get('sugg_subcategory')} "
+          f"err={rrow.get('last_error')!r}")
+    # Dead source is never re-scored into an approval.
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-rescore-gone", source_url=url_ok,
+        title="کلیپ عاشقانه با متن", duration_hint=18,
+        source_username="ehsaspaak")
+    check("rescore-gone setup: intake ok", ok, f"got {why}")
+    grow = sarch.get_clip_by_unique("feed:tg:aa-rescore-gone")
+    sarch.save_suggestion(grow["id"], title="", artist="",
+                          lyrics_excerpt="", sugg_category="",
+                          sugg_subcategory="", score=0, reasons="",
+                          error="source_gone")
+    check("rescore: source_gone clip stays without suggestion",
+          sarch.rescore_clip_from_stored(grow["id"]) is False)
+    grow = sarch.get_clip(grow["id"])
+    check("rescore: source_gone clip still has no suggestion",
+          not grow.get("sugg_category") and not grow.get("sugg_subcategory"))
+    # Chooser label: «استوک خارجی» is gone.
+    kb = sarch.iranian_chooser_kb()
+    btn_texts = [t for t, _c in kb_buttons(kb)]
+    check("chooser: international button is «کلیپ‌های بین‌المللی»",
+          "🌍 کلیپ‌های بین‌المللی" in btn_texts, f"got {btn_texts}")
+    check("chooser: no «استوک خارجی» anywhere",
+          not any("استوک" in t for t in btn_texts))
+    # Outro: real overlay_outro on generated fixtures.
+    def _frame_mean(path, t):
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", str(t), "-i", path,
+             "-frames:v", "1", "-vf", "scale=8:8,format=gray",
+             "-f", "rawvideo", "-"], capture_output=True)
+        px = r.stdout
+        return sum(px) / len(px) if px else -1
+
+    def _has_audio(path):
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            capture_output=True, text=True)
+        return bool(r.stdout.strip())
+
+    p_src = os.path.join(tmpd, "portrait.mp4")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=360x640:rate=15:duration=12",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", p_src], check=True)
+    p_out = os.path.join(tmpd, "portrait_out.mp4")
+    res_o = mw.overlay_outro(p_src, p_out)
+    check("outro: portrait clip gets the bumper applied",
+          res_o.get("applied") is True, f"got {res_o}")
+    check("outro: duration unchanged (±0.3s)",
+          abs(res_o.get("duration", 0) - 12) < 0.3, f"got {res_o}")
+    check("outro: audio preserved", _has_audio(p_out))
+    m_in_last = _frame_mean(p_src, 11)
+    m_out_last = _frame_mean(p_out, 11)
+    m_in_mid = _frame_mean(p_src, 8)
+    m_out_mid = _frame_mean(p_out, 8)
+    check("outro: last 2.5s show the dark bumper, mid-clip unchanged",
+          m_out_last < 50 and m_in_last > 80
+          and abs(m_out_mid - m_in_mid) < 20,
+          f"got last in={m_in_last:.0f} out={m_out_last:.0f} "
+          f"mid in={m_in_mid:.0f} out={m_out_mid:.0f}")
+    l_src = os.path.join(tmpd, "landscape.mp4")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=640x360:rate=15:duration=12",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", l_src], check=True)
+    l_out = os.path.join(tmpd, "landscape_out.mp4")
+    res_l = mw.overlay_outro(l_src, l_out)
+    check("outro: landscape clip is copied unchanged",
+          res_l.get("applied") is False
+          and res_l.get("reason") == "not_portrait"
+          and open(l_src, "rb").read() == open(l_out, "rb").read(),
+          f"got {res_l}")
 
     shutil.rmtree(tmpd, ignore_errors=True)
     fails = [r for r in RESULTS if not r[1]]

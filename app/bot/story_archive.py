@@ -278,7 +278,13 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     decides by watching it. A confident suggestion is the gate for the
     feed's auto-approve pass (clip_feed.run_auto_approve_pass, feed
     clips only, categorized_by='feed-auto'); channel/manual clips are
-    never auto-categorized.
+    never auto-categorized. The margin stays >= 2 on purpose: a
+    near-tie (e.g. breakup 5 vs lonely 4) is genuinely ambiguous and
+    must stay queued — loosening it to >= 1 was tried and reverted
+    2026-11-06 because it approved that near-tie. The backlog drain
+    blockers were elsewhere: the pass excluded already-analyzed clips,
+    the song title was never scored, and the per-cycle cap was 5 —
+    all three are fixed separately (re-score, title scoring, cap 10).
     """
     scored = []
     for (cat, sub), kws in SUBCAT_KEYWORDS.items():
@@ -667,6 +673,47 @@ def save_suggestion(clip_id: int, *, title: str = "", artist: str = "",
         return False
 
 
+def rescore_clip_from_stored(clip_id: int) -> bool:
+    """Re-score an already-analyzed pending clip from its STORED data.
+
+    Clips analyzed under the old gate (margin >= 2) or before the song
+    title was scored may now pass the current gate. Re-running the full
+    analysis would re-download and re-identify the audio — instead this
+    re-runs suggest_subcategory on the stored title + lyrics excerpt +
+    caption (a prefix of the originally scored text, plus the title,
+    so it can only under-score the lyrics part). If a suggestion now
+    exists it is saved (clearing the stale error); otherwise the stored
+    state is left untouched. Returns True when a suggestion exists
+    afterwards. Never raises.
+    """
+    try:
+        clip = get_clip(clip_id)
+        if not clip or clip.get("status") != "pending":
+            return False
+        if clip.get("sugg_category") and clip.get("sugg_subcategory"):
+            return True
+        # A dead source is never re-scored into an approval: the clip
+        # could never be delivered, however thematic its caption is.
+        if (clip.get("last_error") or "") == "source_gone":
+            return False
+        scored = ((clip.get("identified_title") or "") + " " +
+                  (clip.get("lyrics_excerpt") or "")).strip()
+        cat, sub, score, reasons = suggest_subcategory(
+            scored, clip.get("orig_caption") or "",
+            clip.get("category") or "", clip.get("subcategory") or "")
+        if not cat:
+            return False
+        return bool(save_suggestion(
+            clip_id, title=clip.get("identified_title") or "",
+            artist=clip.get("identified_artist") or "",
+            lyrics_excerpt=clip.get("lyrics_excerpt") or "",
+            sugg_category=cat, sugg_subcategory=sub, score=score,
+            reasons="؛ ".join(reasons), error=""))
+    except Exception as e:
+        _log.warning("rescore clip %s failed: %s", clip_id, e)
+        return False
+
+
 def set_clip_error(clip_id: int, error: str) -> bool:
     """Record a processing/analysis error on a clip (shown on its card)."""
     conn = _get_conn()
@@ -822,8 +869,12 @@ async def analyze_clip_for_queue(bot, clip: dict) -> None:
             data = fh.read()
         title, artist = await _identify_audio_bytes(data)
         lyrics = await _fetch_lyrics_text(title, artist) if title else ""
+        # The song TITLE is scored too (at lyric weight): titles are
+        # highly thematic ("تولدت مبارک", "جدایی") and caption-only
+        # clips otherwise never reach the confidence gate.
+        scored = ((title or "") + " " + (lyrics or "")).strip()
         cat, sub, score, reasons = suggest_subcategory(
-            lyrics, clip.get("orig_caption") or "",
+            scored, clip.get("orig_caption") or "",
             clip.get("category") or "", clip.get("subcategory") or "")
         save_suggestion(
             clip["id"], title=title, artist=artist,
@@ -902,11 +953,12 @@ def archive_stats() -> dict:
 def corporate_caption(clip: dict) -> str:
     m, s = divmod(max(0, int(clip.get("duration") or 0)), 60)
     dur = f"{m:02d}:{s:02d}"
-    src = clip.get("source_username") or ""
-    src_line = f"\n📎 منبع: @{src}" if src else ""
+    # NOTE (2026-11-06, real-test fix): the source line is deliberately
+    # NOT shown here — an unverified source ID must never appear in a
+    # public caption. source_username stays in the DB (internal only).
     return (f"🎬 AVANO MEDIA\n"
             f"✨ منتخب استوری آوانو\n\n"
-            f"⏱ مدت: {dur}{src_line}\n\n"
+            f"⏱ مدت: {dur}\n\n"
             f"@AvanoMediaBot")
 
 # ---------------------------------------------------------------------------
@@ -925,7 +977,7 @@ def iranian_chooser_kb():
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 کلیپ‌های ایرانی", callback_data="sarch:home")],
-        [InlineKeyboardButton(text="🌍 استوک خارجی", callback_data="story:foreign")],
+        [InlineKeyboardButton(text="🌍 کلیپ‌های بین‌المللی", callback_data="story:foreign")],
     ])
 
 
@@ -1597,7 +1649,8 @@ def register_story_archive_handlers(router) -> None:
     async def deliver_feed_first(bot, chat_id: int, clip: dict) -> str:
         """First delivery of a feed clip (web source, no stored final).
 
-        Download from source_url -> apply the MAIN user badge once ->
+        Download from source_url -> apply the Waveframe badge once +
+        AVANO MEDIA end bumper on the final 2.5s (portrait clips) ->
         send -> store the resulting file_id as the processed final, so
         later deliveries are instant file_id sends. On badge failure,
         fall back to sending the raw public URL and capture its file_id.
@@ -1631,13 +1684,28 @@ def register_story_archive_handlers(router) -> None:
                     raise RuntimeError(f"feed download failed: {_e}")
 
                 def _run():
-                    from .motion_watermark import apply_user_badge
-                    return apply_user_badge(src, out)
+                    # Final order 2026-11-06: the MAIN watermark is the
+                    # Waveframe badge (HQ, 28% opacity); the AVANO MEDIA
+                    # end bumper is overlaid on the final 2.5s for
+                    # portrait clips (overlay_outro copies the file
+                    # unchanged otherwise). An outro failure must not
+                    # lose the badged file — fall back to it.
+                    from .motion_watermark import (
+                        apply_waveframe_badge, overlay_outro)
+                    apply_waveframe_badge(src, out)
+                    final = os.path.join(tmpd, "final.mp4")
+                    try:
+                        overlay_outro(out, final)
+                        return final
+                    except Exception as e:
+                        _log.warning("outro failed (%s); sending badged "
+                                     "file without it", e)
+                        return out
 
-                await loop.run_in_executor(None, _run)
+                _final = await loop.run_in_executor(None, _run)
                 from aiogram.types import FSInputFile
                 msg = await bot.send_video(
-                    chat_id, FSInputFile(out), caption=corporate_caption(clip))
+                    chat_id, FSInputFile(_final), caption=corporate_caption(clip))
                 fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
                 if fid:
                     save_processed(clip["id"], fid)
@@ -1670,9 +1738,10 @@ def register_story_archive_handlers(router) -> None:
         'badge on ALL forwards' order): a direct Telegram forward is
         NEVER processed or watermarked — raw forward_message, original
         source header preserved. Resend-mode clips prefer the stored
-        FINAL file (user badge, applied once at first delivery for feed
-        clips); legacy clips without a final fall back to the on-delivery
-        Waveframe badge when permitted, else plain resend.
+        FINAL file (Waveframe badge + AVANO MEDIA outro, applied once at
+        first delivery for feed clips); legacy clips without a final fall
+        back to the on-delivery Waveframe badge when permitted, else
+        plain resend.
         """
         try:
             if clip.get("mode") == "forward":
