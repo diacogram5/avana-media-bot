@@ -113,6 +113,17 @@ APARAT_SEEDS = (
     # Single-seed (related=0, deliberate): the ONLY verified anniversary
     # clip found; it contributes one clip, then stays a duplicate.
     ("Aparat_Media_pars", "o214420"),
+    # REPORT3 (2026-11-06, all show-verified live; see REPORT3.md):
+    ("Kartoonchi", "mtnx5t2"),      # کارتونچی — کنایه (تیکه‌دار)
+    ("nasi20", "JcnT6"),            # موزیک ویدئو — کنایه + غمگین
+    ("vidoma", "cxoia5d"),          # ویدوما — تبریک روز مادر
+    ("Sargarmi_kids", "ryg56w3"),   # سرگرمی کودک — تبریک روز مادر
+    ("Film_Tvs", "mwrma4b"),        # یوتیوب گرام — تبریک روز پدر
+    # Second Masafinia.m seed: biases this creator's crawl toward
+    # موفقیت/انگیزشی (the first seed's graph is occasion-biased).
+    ("Masafinia.m", "d27o7qv"),
+    # Single-seed (related=0, deliberate): celebratory مادر clip.
+    ("toop_media", "grkx541"),
 )
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run

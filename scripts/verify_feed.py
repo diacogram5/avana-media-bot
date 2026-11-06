@@ -30,11 +30,13 @@ Checks (all on REAL fixtures — repo excerpts of the verified fetches):
      as 'dosti' (t.me/s/refaghat serves the same page but its posts
      carry data-post='dosti/...').
  12. Aparat seed rotation: one seed per run, round-robin across the
-     8 creators (faezehradmanesh, Multimedia2020, Clip_film2023,
-     Masafinia.m, Amirabbas.b, AparatVision, Tafrihi_Best,
-     Aparat_Media_pars); the per-run show-call bound (8) is TOTAL,
-     not per seed; the Multimedia2020 fixture parses (50 related,
-     49 short); a 61s clip is rejected by the 60s cap.
+     15 seeds / 14 creators (faezehradmanesh, Multimedia2020,
+     Clip_film2023, Masafinia.m x2, Amirabbas.b, AparatVision,
+     Tafrihi_Best, Aparat_Media_pars, Kartoonchi, nasi20, vidoma,
+     Sargarmi_kids, Film_Tvs, toop_media); the per-run show-call
+     bound (8) is TOTAL, not per seed; the Multimedia2020 fixture
+     parses (50 related, 49 short); a 61s clip is rejected by the
+     60s cap.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
 Run: python3 scripts/verify_feed.py ; exit 0 = all PASS.
@@ -72,6 +74,7 @@ DELL_HTML = FIXTURES / "tg_delll_nevveshteh_excerpt.html"
 DOSTI_HTML = FIXTURES / "tg_dosti_excerpt.html"
 AP_JSON = FIXTURES / "aparat_show_excerpt.json"
 TAF_JSON = FIXTURES / "aparat_show_tafrihi.json"
+KAR_JSON = FIXTURES / "aparat_show_kartoonchi.json"
 MM_JSON = FIXTURES / "aparat_show_multimedia2020.json"
 REF_CLIP = Path.home() / "workspace/user/media_library/video/53/53e2091f582cf40588ff9687ac70321fff63ce8795884a99481f76b44799956a.mp4"
 
@@ -473,6 +476,24 @@ async def main():
           len(taf_rel) == 5 and taf_rel[0]["uid"] == "xcpt4f8"
           and taf_rel[0]["duration"] == 26, f"got {len(taf_rel)}")
 
+    # --- T2d: Aparat Kartoonchi (REPORT3 کنایه source) ------------------
+    kar_payload = json.loads(KAR_JSON.read_text(encoding="utf-8"))
+    kar_info = feed.parse_aparat_show(kar_payload)
+    check("aparat show Kartoonchi: uid/duration/category/can_download",
+          kar_info and kar_info["uid"] == "mtnx5t2"
+          and kar_info["duration"] == 12
+          and kar_info["category"] == "موسیقی"
+          and kar_info["owner"] == "Kartoonchi"
+          and kar_info["can_download"] is True
+          and (kar_info["file_link"] or "").startswith("https://"),
+          f"got {kar_info}")
+    check("aparat show Kartoonchi: passes the accept gate",
+          bool(kar_info) and feed._aparat_accept(kar_info))
+    kar_rel = feed.parse_aparat_related(kar_payload)
+    check("aparat related Kartoonchi: 5 UIDs, first kue01r8 6s",
+          len(kar_rel) == 5 and kar_rel[0]["uid"] == "kue01r8"
+          and kar_rel[0]["duration"] == 6, f"got {len(kar_rel)}")
+
     # --- T2b/T3b: Aparat Multimedia2020 (real show JSON) ---------------
     mm_payload = json.loads(MM_JSON.read_text(encoding="utf-8"))
     mm_info = feed.parse_aparat_show(mm_payload)
@@ -778,26 +799,32 @@ async def main():
 
     seeds = []
     news = []
-    for _ in range(9):
+    for _ in range(16):
         r = await feed.run_aparat_cycle(bootstrap=False,
                                         aparat_fetcher=ap_rot)
         seeds.append(r.get("seed"))
         news.append(r.get("new"))
-    check("rotation: one seed per run, round-robin across 8 creators",
+    check("rotation: one seed per run, round-robin across 15 seeds",
           seeds == ["faezehradmanesh", "Multimedia2020", "Clip_film2023",
                     "Masafinia.m", "Amirabbas.b", "AparatVision",
                     "Tafrihi_Best", "Aparat_Media_pars",
+                    "Kartoonchi", "nasi20", "vidoma", "Sargarmi_kids",
+                    "Film_Tvs", "Masafinia.m", "toop_media",
                     "faezehradmanesh"],
           f"got {seeds}")
-    check("rotation: new counts per run [0, 5, 1, 1, 1, 1, 1, 1, 0] (seed + related)",
-          news == [0, 5, 1, 1, 1, 1, 1, 1, 0], f"got {news}")
-    check("rotation: seed index wraps (9 runs from 0 -> 1)",
+    check("rotation: new counts per run [0, 5, 1x13, 0] (seed + related)",
+          news == [0, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+          f"got {news}")
+    check("rotation: seed index wraps (16 runs from 0 -> 1)",
           feed.feed_get("ap_seed_idx") == "1",
           f"got {feed.feed_get('ap_seed_idx')!r}")
-    check("rotation: each new seed's own clip intaken (REPORT2 seeds too)",
+    check("rotation: each new seed's own clip intaken (REPORT2 + REPORT3 seeds)",
           all((sarch.get_clip_by_unique("feed:ap:" + u) or {}).get("status")
               == "pending" for u in ("DCBas", "xse8if0", "lfe35b0",
-                                     "m569u20", "okm549l", "o214420")))
+                                     "m569u20", "okm549l", "o214420",
+                                     "mtnx5t2", "JcnT6", "cxoia5d",
+                                     "ryg56w3", "mwrma4b", "d27o7qv",
+                                     "grkx541")))
 
     def ap_bound(uid):
         # show rejected by the accept gate (61s) while 49 related
