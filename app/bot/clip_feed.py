@@ -1,13 +1,19 @@
 """Hourly clip feed for the Iranian story-clip archive.
 
-Sources (verified 2026-11-05, real fetches — do NOT re-verify from scratch):
-  1. Telegram @ehsaspaak («کلیپ عاشقانه آهنگ متن», 43.6K subs): the public
-     page https://t.me/s/ehsaspaak (browser UA, no login) lists video posts
-     with public CDN MP4 links (cdn*.telesco.pe). ~4-5 new videos/day.
-     WARNING: the channel also posts text poems and gambling/betting ads —
-     text posts have no <video> (auto-skipped) and ad posts are filtered
-     by a keyword blocklist; anything left still goes to the moderation
-     queue (never auto-accepted).
+Sources (verified 2026-11-05/06, real fetches — do NOT re-verify from scratch):
+  1. Telegram lyric-clip channels (public t.me/s pages, browser UA,
+     no login) — each page lists video posts with public CDN MP4 links
+     (cdn*.telesco.pe, TOKENIZED: the full src incl. ?token= is
+     required; a bare .mp4 404s):
+       @ehsaspaak (43.6K subs, ~4-5 videos/day — also posts text poems
+         and gambling/betting ads: text posts have no <video> and ad
+         posts are filtered by a keyword blocklist);
+       @SOBHbe (58.3K subs, very active — MIXED morning greetings +
+         memorial/Thursday-remembrance clips, 0 betting hits);
+       @yaldavamusic (2.78K subs, ~0.9/day, singer's own songs,
+         exact lyric-clip format).
+     Anything left still goes to the moderation queue (never
+     auto-accepted). One page per channel per run.
   2. Aparat public v1 API (no key, no login):
      GET https://www.aparat.com/api/fa/v1/video/video/show/videohash/{uid}
      returns JSON:API with title, duration, owner_username, category,
@@ -15,8 +21,12 @@ Sources (verified 2026-11-05, real fetches — do NOT re-verify from scratch):
      ~50 related-video UIDs (included[].type == 'Video') — that graph is
      the bootstrap stock. NOTE: no verified endpoint lists a channel's
      LATEST uploads, so there is no Aparat "latest" call; later runs
-     re-walk the related graph of the seed (bounded) and rely on exact
-     dedup. yt-dlp's Aparat extractor is BROKEN — never use it here.
+     re-walk the related graph of ONE seed per run (round-robin) and
+     rely on exact dedup. The related graph is relevance-ordered, NOT
+     recency-ordered — no freshness claims. yt-dlp's Aparat extractor
+     is BROKEN — never use it here.
+     Seeds (verified 2026-11-06): faezehradmanesh (40,949 vids),
+     Multimedia2020 (37,863), Clip_film2023 (190), Masafinia.m (2,819).
 
 Design:
 - Intake downloads ONE file at a time (<=20MB), ffprobe-confirms an
@@ -70,16 +80,23 @@ _log = get_logger("avana.clip_feed")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TG_CHANNEL = "ehsaspaak"
-TG_PAGE_URL = f"https://t.me/s/{TG_CHANNEL}"
+TG_CHANNELS = ("ehsaspaak", "SOBHbe", "yaldavamusic")
 TG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
          "AppleWebKit/537.36 (KHTML, like Gecko) "
          "Chrome/120.0.0.0 Safari/537.36")
-TG_MAX_PER_RUN = 10            # max Telegram clips intaken per cycle
+TG_MAX_PER_RUN = 10            # max Telegram clips intaken per channel/cycle
 
 APARAT_SHOW_URL = ("https://www.aparat.com/api/fa/v1/video/video/"
                    "show/videohash/{uid}")
-APARAT_SEED_UIDS = ["jtk01l2"]  # verified seed (owner @faezehradmanesh)
+# (owner_username, verified seed video UID). ONE seed per run, round-robin
+# via feed_state key "ap_seed_idx" — the per-run show-call bound below
+# is TOTAL, never per seed.
+APARAT_SEEDS = (
+    ("faezehradmanesh", "jtk01l2"),
+    ("Multimedia2020", "t79ms8g"),
+    ("Clip_film2023", "DCBas"),
+    ("Masafinia.m", "xse8if0"),
+)
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run
 AP_RUN_SHOW_CALLS = 8           # max Aparat show calls on later runs
@@ -138,8 +155,6 @@ def parse_duration(text: str) -> int | None:
     return total if total > 0 else None
 
 
-_POST_RE = re.compile(
-    r'<div class="tgme_widget_message[^>]*?data-post="ehsaspaak/(\d+)"')
 _VIDEO_RE = re.compile(r'<video[^>]+src="((?:https?|file)://[^"]+\.mp4[^"]*)"')
 _DUR_RE = re.compile(
     r'<time class="message_video_duration[^"]*">([^<]+)</time>')
@@ -154,18 +169,25 @@ def _clean_post_text(raw: str) -> str:
     return re.sub(r"\s+", " ", txt).strip()
 
 
-def parse_tg_page(html: str) -> list[dict]:
-    """Parse a t.me/s/ehsaspaak page.
+def parse_tg_page(html: str, channel: str = "ehsaspaak") -> list[dict]:
+    """Parse a t.me/s/<channel> page.
 
     Returns one dict per post that carries a DIRECT <video src=...mp4>
     (posts without a direct URL — text posts and 'not supported'
     placeholders — are skipped). Betting-ad posts are filtered out.
-    Each dict: {post_id, url, duration (int|None), text}.
+    The video URL is kept WHOLE (cdn*.telesco.pe links are tokenized:
+    the ?token= part is required; a bare .mp4 404s).
+    Each dict: {channel, post_id, url, duration (int|None), text}.
+    The channel match is case-insensitive: data-post attributes carry
+    the lowercase username (e.g. 'sobhbe' for @SOBHbe).
     """
     out = []
     if not html:
         return out
-    marks = list(_POST_RE.finditer(html))
+    post_re = re.compile(
+        r'<div class="tgme_widget_message[^>]*?data-post="'
+        + re.escape(channel) + r'/(\d+)"', re.IGNORECASE)
+    marks = list(post_re.finditer(html))
     for i, m in enumerate(marks):
         start = m.start()
         end = marks[i + 1].start() if i + 1 < len(marks) else len(html)
@@ -173,16 +195,15 @@ def parse_tg_page(html: str) -> list[dict]:
         vm = _VIDEO_RE.search(block)
         if not vm:
             continue  # no direct video URL in this post
-        tm = re.search(r"ehsaspaak/(\d+)", m.group(0))
-        post_id = int(tm.group(1)) if tm else int(m.group(1))
+        post_id = int(m.group(1))
         dm = _DUR_RE.search(block)
         duration = parse_duration(dm.group(1)) if dm else None
         tx = _TEXT_RE.search(block)
         text = _clean_post_text(tx.group(1)) if tx else ""
         if _is_ad_text(text):
             continue  # gambling/betting ad with a video: never intaken
-        out.append({"post_id": post_id, "url": vm.group(1),
-                    "duration": duration, "text": text})
+        out.append({"channel": channel, "post_id": post_id,
+                    "url": vm.group(1), "duration": duration, "text": text})
     # dedup by post_id (a video tag can repeat inside one post block)
     seen = set()
     uniq = []
@@ -288,8 +309,8 @@ def _http_get(url: str, timeout: int = HTTP_TIMEOUT_SEC) -> bytes | None:
         return None
 
 
-def _fetch_tg_page() -> str | None:
-    data = _http_get(TG_PAGE_URL)
+def _fetch_tg_page(channel: str = "ehsaspaak") -> str | None:
+    data = _http_get(f"https://t.me/s/{channel}")
     if not data:
         return None
     try:
@@ -432,29 +453,71 @@ def feed_key_seen(feed_key: str) -> bool:
         return False
 
 
-def refresh_pending_tg_urls(posts: list[dict]) -> int:
+def _tg_feed_key_aliases(feed_key: str) -> list[str]:
+    """Equivalent feed_keys for the same Telegram clip.
+
+    Legacy (pre-multi-channel) keys were 'tg:<post_id>' (ehsaspaak
+    only); new keys are 'tg:<channel>:<post_id>'. Both forms refer to
+    the same clip for ehsaspaak, so dedup must check both — otherwise
+    the clips intaken before the multi-channel change would be
+    re-intaken under their new keys. Other channels have no legacy
+    form, so only ehsaspaak aliases.
+    """
+    if not feed_key or not feed_key.startswith("tg:"):
+        return [feed_key]
+    parts = feed_key[3:].split(":")
+    if len(parts) == 1 and parts[0].isdigit():
+        return [feed_key, f"tg:ehsaspaak:{parts[0]}"]
+    if (len(parts) == 2 and parts[0].lower() == "ehsaspaak"
+            and parts[1].isdigit()):
+        return [feed_key, f"tg:{parts[1]}"]
+    return [feed_key]
+
+
+def _parse_tg_feed_key(feed_key: str) -> tuple[str | None, int | None]:
+    """(channel, post_id) for a TG feed_key; legacy keys -> ehsaspaak."""
+    if not feed_key or not feed_key.startswith("tg:"):
+        return (None, None)
+    parts = feed_key[3:].split(":")
+    try:
+        if len(parts) == 1:
+            return ("ehsaspaak", int(parts[0]))
+        if len(parts) == 2:
+            return (parts[0], int(parts[1]))
+    except (TypeError, ValueError):
+        pass
+    return (None, None)
+
+
+def refresh_pending_tg_urls(posts: list[dict],
+                            channel: str | None = None) -> int:
     """Refresh source_url for Telegram feed clips still on the page
     (their CDN tokens can go stale) and not yet finally processed.
     Zero extra HTTP — uses the already-fetched page. Returns how many
-    rows were updated."""
+    rows were updated. Matches rows by (channel, post_id); legacy
+    'tg:<post_id>' rows belong to ehsaspaak.
+    """
     if not posts:
         return 0
     conn = _sarch._get_conn()
     if not conn:
         return 0
     try:
-        fresh = {p["post_id"]: p["url"] for p in posts if p.get("url")}
+        fresh: dict[tuple[str, int], str] = {}
+        for p in posts:
+            if p.get("url") and p.get("post_id") is not None:
+                ch = (p.get("channel") or channel or "ehsaspaak").lower()
+                fresh[(ch, int(p["post_id"]))] = p["url"]
         cur = conn.execute(
             "SELECT id, feed_key, source_url FROM story_archive"
             " WHERE status IN ('pending','active') AND feed_key LIKE 'tg:%'"
             " AND (processed_file_id IS NULL OR processed_file_id='')")
         n = 0
         for clip_id, feed_key, old_url in cur.fetchall():
-            try:
-                pid = int((feed_key or "")[3:])
-            except (TypeError, ValueError):
+            ch, pid = _parse_tg_feed_key(feed_key)
+            if pid is None or ch is None:
                 continue
-            new_url = fresh.get(pid)
+            new_url = fresh.get((ch.lower(), pid))
             if new_url and new_url != old_url:
                 conn.execute(
                     "UPDATE story_archive SET source_url=? WHERE id=?",
@@ -520,7 +583,8 @@ async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
 
     if not feed_key or not source_url:
         return (False, "bad_input")
-    if _sarch.is_duplicate("feed:" + feed_key) or feed_key_seen(feed_key):
+    if any(_sarch.is_duplicate("feed:" + k) or feed_key_seen(k)
+           for k in _tg_feed_key_aliases(feed_key)):
         return (False, "duplicate")
     tmpd = tempfile.mkdtemp(prefix="feed_in_")
     try:
@@ -565,61 +629,90 @@ async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
 # Source cycles (async wrappers; sync I/O stays in the executor)
 # ---------------------------------------------------------------------------
 async def run_telegram_cycle(*, tg_fetcher=None) -> dict:
-    """One Telegram check: new video posts since last_seen -> intake.
+    """One Telegram check across all TG_CHANNELS: new video posts since
+    each channel's own last_seen -> intake.
 
-    Never raises. Returns {new, skipped, error}.
+    tg_fetcher(channel) -> html | None (default: _fetch_tg_page).
+    One page per channel per run; a failing channel is recorded and
+    the others still run. Never raises.
+    Returns {new, skipped, per_channel, error}.
     """
-    out = {"new": 0, "skipped": 0, "error": None}
-    try:
-        loop = asyncio.get_running_loop()
-        fetch = tg_fetcher or _fetch_tg_page
-        html = await loop.run_in_executor(None, fetch)
-        if not html:
-            out["error"] = "tg_fetch_failed"
-            return out
-        posts = parse_tg_page(html)
-        refresh_pending_tg_urls(posts)
+    out: dict = {"new": 0, "skipped": 0, "per_channel": {}, "error": None}
+    loop = asyncio.get_running_loop()
+    fetch = tg_fetcher or _fetch_tg_page
+    errors: list[str] = []
+    for channel in TG_CHANNELS:
         try:
-            last_seen = int(feed_get("tg_last_seen", "0") or 0)
-        except (TypeError, ValueError):
-            last_seen = 0
-        new_posts = [p for p in posts if p["post_id"] > last_seen]
-        for p in new_posts[:TG_MAX_PER_RUN]:
-            ok, why = await intake_feed_item(
-                feed_key=f"tg:{p['post_id']}", source_url=p["url"],
-                title=p.get("text") or "", duration_hint=p.get("duration"),
-                source_username=TG_CHANNEL)
-            if ok:
-                out["new"] += 1
-            else:
-                out["skipped"] += 1
-                _log.info("clip_feed tg post %s skipped: %s", p["post_id"], why)
-        if posts:
-            top = max(p["post_id"] for p in posts)
-            if top > last_seen:
-                feed_set("tg_last_seen", str(top))
-        return out
-    except Exception as e:
-        _log.warning("clip_feed telegram cycle failed: %s", e)
-        out["error"] = "tg_cycle_failed"
-        return out
+            html = await loop.run_in_executor(None, fetch, channel)
+            if not html:
+                errors.append(f"{channel}:tg_fetch_failed")
+                continue
+            posts = parse_tg_page(html, channel=channel)
+            refresh_pending_tg_urls(posts, channel=channel)
+            last_key = f"tg_last_seen_{channel.lower()}"
+            try:
+                last_seen = int(feed_get(last_key, "0") or 0)
+            except (TypeError, ValueError):
+                last_seen = 0
+            new_posts = [p for p in posts if p["post_id"] > last_seen]
+            ch_new = 0
+            for p in new_posts[:TG_MAX_PER_RUN]:
+                ok, why = await intake_feed_item(
+                    feed_key=f"tg:{channel}:{p['post_id']}",
+                    source_url=p["url"],
+                    title=p.get("text") or "",
+                    duration_hint=p.get("duration"),
+                    source_username=channel)
+                if ok:
+                    out["new"] += 1
+                    ch_new += 1
+                else:
+                    out["skipped"] += 1
+                    _log.info("clip_feed tg %s post %s skipped: %s",
+                              channel, p["post_id"], why)
+            out["per_channel"][channel] = ch_new
+            if posts:
+                top = max(p["post_id"] for p in posts)
+                if top > last_seen:
+                    feed_set(last_key, str(top))
+                    if channel.lower() == "ehsaspaak":
+                        # legacy key kept for the admin-panel status
+                        feed_set("tg_last_seen", str(top))
+        except Exception as e:
+            _log.warning("clip_feed telegram cycle failed (%s): %s",
+                         channel, e)
+            errors.append(f"{channel}:tg_cycle_failed")
+    if errors:
+        out["error"] = ";".join(errors)
+    return out
 
 
 async def run_aparat_cycle(*, bootstrap: bool = False,
                            aparat_fetcher=None) -> dict:
-    """One Aparat check: walk the related-UID graph from the seed.
+    """One Aparat check: walk the related-UID graph from ONE seed.
 
-    Bootstrap (first run) does a bounded BFS for immediate stock;
-    later runs re-walk the seed's current related list (bounded).
-    Never raises. Returns {new, skipped, calls, error}.
+    The seed rotates round-robin (feed_state "ap_seed_idx") so a run
+    stays bounded — the show-call bound below is TOTAL per run, never
+    per seed. Bootstrap (first run) does a bounded BFS for immediate
+    stock; later runs re-walk the current seed's related list (bounded).
+    Never raises. Returns {new, skipped, calls, seed, error}.
     """
-    out = {"new": 0, "skipped": 0, "calls": 0, "error": None}
+    out = {"new": 0, "skipped": 0, "calls": 0, "seed": None, "error": None}
     try:
         loop = asyncio.get_running_loop()
         fetch = aparat_fetcher or _fetch_aparat_show
         max_calls = AP_BOOTSTRAP_SHOW_CALLS if bootstrap else AP_RUN_SHOW_CALLS
         max_new = AP_BOOTSTRAP_NEW if bootstrap else AP_RUN_NEW
-        queue = list(APARAT_SEED_UIDS)
+        try:
+            seed_idx = int(feed_get("ap_seed_idx", "0") or 0)
+        except (TypeError, ValueError):
+            seed_idx = 0
+        seed_idx %= len(APARAT_SEEDS)
+        seed_owner, seed_uid = APARAT_SEEDS[seed_idx]
+        out["seed"] = seed_owner
+        feed_set("ap_seed_idx", str((seed_idx + 1) % len(APARAT_SEEDS)))
+        _log.info("clip_feed aparat cycle seed=%s (%s)", seed_owner, seed_uid)
+        queue = [seed_uid]
         seen_uids: set[str] = set()
         while queue and out["calls"] < max_calls and out["new"] < max_new:
             uid = queue.pop(0)
@@ -684,10 +777,14 @@ async def run_feed_cycle(*, bootstrap: bool = False,
             tg = await run_telegram_cycle(tg_fetcher=tg_fetcher)
             stats["tg_new"] = tg.get("new", 0)
             stats["tg_error"] = tg.get("error")
+            if tg.get("per_channel"):
+                _log.info("clip_feed tg per-channel: %s",
+                          tg.get("per_channel"))
             ap = await run_aparat_cycle(bootstrap=bootstrap,
                                         aparat_fetcher=aparat_fetcher)
             stats["ap_new"] = ap.get("new", 0)
             stats["ap_error"] = ap.get("error")
+            stats["ap_seed"] = ap.get("seed")
             errs = [e for e in (tg.get("error"), ap.get("error")) if e]
             stats["error"] = ";".join(errs) if errs else None
         except Exception as e:

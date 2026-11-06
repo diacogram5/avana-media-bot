@@ -21,6 +21,15 @@ Checks (all on REAL fixtures — repo excerpts of the verified fetches):
   8. Queue analysis uses source_url (no get_file) for feed clips.
   9. Admin panel shows the feed status lines.
  10. Hourly loop survives a failing cycle and keeps running.
+ 11. Multi-channel Telegram: one cycle intakes from @SOBHbe and
+     @yaldavamusic (not just @ehsaspaak) with distinct feed_keys;
+     per-channel last_seen; legacy 'tg:<id>' keys dedup against the
+     new 'tg:ehsaspaak:<id>' form; tokenized video URLs kept whole.
+ 12. Aparat seed rotation: one seed per run, round-robin across the
+     4 creators (faezehradmanesh, Multimedia2020, Clip_film2023,
+     Masafinia.m); the per-run show-call bound (8) is TOTAL, not per
+     seed; the Multimedia2020 fixture parses (50 related, 49 short);
+     a 61s clip is rejected by the 60s cap.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
 Run: python3 scripts/verify_feed.py ; exit 0 = all PASS.
@@ -52,7 +61,10 @@ os.environ.pop("SARCH_STORAGE_CHAT_ID", None)
 
 FIXTURES = ROOT / "scripts" / "fixtures" / "feed"
 TG_HTML = FIXTURES / "tg_ehsaspaak_excerpt.html"
+SOBHBE_HTML = FIXTURES / "tg_SOBHbe_excerpt.html"
+YALDAVA_HTML = FIXTURES / "tg_yaldavamusic_excerpt.html"
 AP_JSON = FIXTURES / "aparat_show_excerpt.json"
+MM_JSON = FIXTURES / "aparat_show_multimedia2020.json"
 REF_CLIP = Path.home() / "workspace/user/media_library/video/53/53e2091f582cf40588ff9687ac70321fff63ce8795884a99481f76b44799956a.mp4"
 
 TARDID_LYRICS = ("دل بستم به سختی به دلت رسیدم از خودم به امن ساحلت "
@@ -359,6 +371,40 @@ async def main():
           and feed.parse_duration("1:05:30") == 3930
           and feed.parse_duration("xx") is None)
 
+    # --- T1b: the two new Telegram channels (real excerpts) ----------
+    sob_posts = feed.parse_tg_page(
+        SOBHBE_HTML.read_text(encoding="utf-8"), channel="SOBHbe")
+    sob_ids = [p["post_id"] for p in sob_posts]
+    check("tg parser SOBHbe: 4 video posts (text posts skipped)",
+          sob_ids == [132203, 132209, 132214, 132219], f"got {sob_ids}")
+    check("tg parser SOBHbe: memorial clip 132203 accepted (13s)",
+          sob_posts[0]["duration"] == 13
+          and "پنجشنبه" in sob_posts[0]["text"],
+          f"got {sob_posts[0]}")
+    check("tg parser: channel match is case-insensitive (data-post is lowercase)",
+          all(p["channel"] == "SOBHbe" for p in sob_posts))
+    yal_posts = feed.parse_tg_page(
+        YALDAVA_HTML.read_text(encoding="utf-8"), channel="yaldavamusic")
+    yal_ids = [p["post_id"] for p in yal_posts]
+    check("tg parser yaldavamusic: 2 video posts (audio/link posts skipped)",
+          yal_ids == [40, 43], f"got {yal_ids}")
+    check("tg parser: tokenized video URL kept whole (no bare .mp4)",
+          all("?token=TOKEN" in p["url"] for p in sob_posts + yal_posts)
+          and all(p["url"].startswith("https://cdn")
+                  for p in sob_posts + yal_posts))
+    check("tg parser: channel isolation (ehsaspaak page as SOBHbe -> [])",
+          feed.parse_tg_page(tg_html, channel="SOBHbe") == [])
+    check("tg parser: feed_key aliases (legacy <-> new, ehsaspaak only)",
+          feed._tg_feed_key_aliases("tg:117099")
+          == ["tg:117099", "tg:ehsaspaak:117099"]
+          and feed._tg_feed_key_aliases("tg:ehsaspaak:117099")
+          == ["tg:ehsaspaak:117099", "tg:117099"]
+          and feed._tg_feed_key_aliases("tg:SOBHbe:132203")
+          == ["tg:SOBHbe:132203"]
+          and feed._parse_tg_feed_key("tg:117099") == ("ehsaspaak", 117099)
+          and feed._parse_tg_feed_key("tg:SOBHbe:132203")
+          == ("SOBHbe", 132203))
+
     # --- T2/T3: Aparat parsers on the real excerpt --------------------
     ap_payload = json.loads(AP_JSON.read_text(encoding="utf-8"))
     info = feed.parse_aparat_show(ap_payload)
@@ -382,6 +428,36 @@ async def main():
               {"uid": "x", "title": "cool video", "duration": 28})
           and not feed._aparat_candidate(
               {"uid": "x", "title": "کلیپ عاشقانه", "duration": 5}))
+
+    # --- T2b/T3b: Aparat Multimedia2020 (real show JSON) ---------------
+    mm_payload = json.loads(MM_JSON.read_text(encoding="utf-8"))
+    mm_info = feed.parse_aparat_show(mm_payload)
+    check("aparat show Multimedia2020: uid/duration/category/can_download",
+          mm_info and mm_info["uid"] == "t79ms8g"
+          and mm_info["duration"] == 15
+          and mm_info["category"] == "موسیقی"
+          and mm_info["owner"] == "Multimedia2020"
+          and mm_info["can_download"] is True
+          and (mm_info["file_link"] or "").startswith("https://"),
+          f"got {mm_info}")
+    check("aparat show Multimedia2020: passes the accept gate",
+          bool(mm_info) and feed._aparat_accept(mm_info))
+    mm_rel = feed.parse_aparat_related(mm_payload)
+    mm_short = sum(1 for r in mm_rel
+                   if r.get("duration") is not None
+                   and 10 <= r["duration"] <= 60)
+    check("aparat related Multimedia2020: 50 UIDs, 49 short (10-60s)",
+          len(mm_rel) == 50 and mm_short == 49,
+          f"got {len(mm_rel)} related, {mm_short} short")
+    check("aparat accept: 61s and 9s clips rejected by the duration cap",
+          not feed._aparat_accept(
+              {"uid": "x", "title": "کلیپ استوری فصل پاییز",
+               "duration": 61, "category": "موسیقی", "category_en": "music",
+               "can_download": True, "file_link": "https://x.mp4"})
+          and not feed._aparat_accept(
+              {"uid": "x", "title": "کلیپ عاشقانه",
+               "duration": 9, "category": "موسیقی", "category_en": "music",
+               "can_download": True, "file_link": "https://x.mp4"}))
 
     # --- DB harness: pre-feed schema, then migrate --------------------
     conn = sqlite3.connect(":memory:")
@@ -420,22 +496,30 @@ async def main():
     # --- T2: intake filters --------------------------------------------
     url_ok = "file://" + base
     ok, why = await feed.intake_feed_item(
-        feed_key="tg:9001", source_url=url_ok, title="کلیپ عاشقانه",
+        feed_key="tg:ehsaspaak:9001", source_url=url_ok, title="کلیپ عاشقانه",
         duration_hint=18, source_username="ehsaspaak")
-    row = sarch.get_clip_by_unique("feed:tg:9001")
+    row = sarch.get_clip_by_unique("feed:tg:ehsaspaak:9001")
     check("intake: valid clip accepted as pending, categorized_by='feed'",
           ok and why == "ok" and row is not None
           and row["status"] == "pending"
           and row["categorized_by"] == "feed"
           and row["mode"] == "resend"
           and row["file_id"] == "" and row["source_url"] == url_ok
-          and row["feed_key"] == "tg:9001",
+          and row["feed_key"] == "tg:ehsaspaak:9001",
           f"got ok={ok} why={why} row={bool(row)}")
     ok, why = await feed.intake_feed_item(
-        feed_key="tg:9001", source_url=url_ok, title="کلیپ عاشقانه",
+        feed_key="tg:ehsaspaak:9001", source_url=url_ok, title="کلیپ عاشقانه",
         duration_hint=18, source_username="ehsaspaak")
     check("intake: same feed_key twice -> duplicate",
           (not ok) and why == "duplicate", f"got {why}")
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:9001", source_url=url_ok, title="کلیپ عاشقانه",
+        duration_hint=18, source_username="ehsaspaak")
+    check("intake: legacy key tg:<id> dedups against tg:ehsaspaak:<id>",
+          (not ok) and why == "duplicate", f"got {why}")
+    check("intake: same post_id on another channel is a distinct key",
+          not sarch.is_duplicate("feed:tg:SOBHbe:9001")
+          and not feed.feed_key_seen("tg:SOBHbe:9001"))
     ok, why = await feed.intake_feed_item(
         feed_key="tg:9002", source_url="file://" + short_clip,
         title="short", duration_hint=5)
@@ -469,8 +553,10 @@ async def main():
         r"https://cdn4\.telesco\.pe/file/aff5c09e37\.mp4\?token=TOKEN",
         "file://" + _media("ehsas_vid3.mp4"), html_cycle)
 
-    def tg_fetcher():
-        return html_cycle
+    def tg_fetcher(channel):
+        # bootstrap test: only ehsaspaak has video posts this run; the
+        # other channels' pages are empty (valid, no error).
+        return {"ehsaspaak": html_cycle}.get(channel, "<html></html>")
 
     ap_base = json.loads(AP_JSON.read_text(encoding="utf-8"))
 
@@ -505,45 +591,52 @@ async def main():
     stats2 = await feed.run_feed_cycle(bootstrap=False,
                                        tg_fetcher=tg_fetcher,
                                        aparat_fetcher=ap_fetcher)
-    check("cycle incremental: tg_new=0 ap_new=0 (dedup holds)",
-          stats2.get("tg_new") == 0 and stats2.get("ap_new") == 0,
+    check("cycle incremental: tg_new=0 (dedup holds), ap_new=1 (rotated seed)",
+          stats2.get("tg_new") == 0 and stats2.get("ap_new") == 1,
           f"got {stats2}")
-    check("cycle incremental: last_new reset to 0",
-          feed.get_feed_status()["last_new"] == 0)
+    check("cycle incremental: last_new=1 (the rotated seed only)",
+          feed.get_feed_status()["last_new"] == 1)
+    check("cycle incremental: rotated seed t79ms8g intaken as pending",
+          (sarch.get_clip_by_unique("feed:ap:t79ms8g") or {}).get("status")
+          == "pending")
 
     # --- T6 (job errors): raising fetcher -> error, no crash, no intake
     before = len(sarch.pending_clips(50))
 
-    def boom():
+    def boom(channel):
         raise RuntimeError("network down")
 
     stats3 = await feed.run_feed_cycle(bootstrap=False, tg_fetcher=boom,
                                        aparat_fetcher=lambda uid: None)
-    check("cycle error: raising fetcher -> tg_cycle_failed, no crash",
-          stats3.get("tg_error") == "tg_cycle_failed"
-          and stats3.get("error") == "tg_cycle_failed", f"got {stats3}")
+    tg_err_all = ("ehsaspaak:tg_cycle_failed;SOBHbe:tg_cycle_failed;"
+                  "yaldavamusic:tg_cycle_failed")
+    check("cycle error: raising fetcher -> per-channel tg_cycle_failed, no crash",
+          stats3.get("tg_error") == tg_err_all
+          and stats3.get("error") == tg_err_all, f"got {stats3}")
     check("cycle error: no partial intake",
           len(sarch.pending_clips(50)) == before)
     check("cycle error: last_error stored in feed_state",
-          feed.get_feed_status()["last_error"] == "tg_cycle_failed",
+          feed.get_feed_status()["last_error"] == tg_err_all,
           f"got {feed.get_feed_status()['last_error']!r}")
 
-    def none_fetcher():
+    def none_fetcher(channel):
         return None
 
     stats3b = await feed.run_feed_cycle(bootstrap=False,
                                         tg_fetcher=none_fetcher,
                                         aparat_fetcher=lambda uid: None)
-    check("cycle error: empty fetch -> tg_fetch_failed",
-          stats3b.get("tg_error") == "tg_fetch_failed",
+    check("cycle error: empty fetch -> per-channel tg_fetch_failed",
+          stats3b.get("tg_error")
+          == ("ehsaspaak:tg_fetch_failed;SOBHbe:tg_fetch_failed;"
+              "yaldavamusic:tg_fetch_failed"),
           f"got {stats3b}")
 
     # --- T5: single-flight ----------------------------------------------
-    async def slow_tg():
+    async def slow_tg(channel):
         await asyncio.sleep(0)
         return html_cycle
 
-    def slow_tg_sync():
+    def slow_tg_sync(channel):
         import time as _t
         _t.sleep(0.3)
         return html_cycle
@@ -556,6 +649,91 @@ async def main():
     check("single-flight: one of two concurrent cycles is skipped",
           (r1.get("skipped") is True) != (r2.get("skipped") is True),
           f"got skipped={r1.get('skipped')}/{r2.get('skipped')}")
+
+    # --- T11: multi-channel Telegram cycle ------------------------------
+    sob_html = SOBHBE_HTML.read_text(encoding="utf-8")
+    sob_html = re.sub(
+        r"https://cdn\d*\.telesco\.pe/file/[^\"']+\.mp4\?token=TOKEN",
+        "file://" + _media("ehsas_vid1.mp4"), sob_html)
+    yal_html = YALDAVA_HTML.read_text(encoding="utf-8")
+    yal_html = re.sub(
+        r"https://cdn\d*\.telesco\.pe/file/[^\"']+\.mp4\?token=TOKEN",
+        "file://" + _media("ehsas_vid3.mp4"), yal_html)
+
+    def tg_multi(channel):
+        return {"ehsaspaak": html_cycle, "SOBHbe": sob_html,
+                "yaldavamusic": yal_html}.get(channel)
+
+    tg_stats = await feed.run_telegram_cycle(tg_fetcher=tg_multi)
+    check("multi-channel TG: tg_new=6 (0 ehsaspaak deduped + 4 SOBHbe + 2 yaldavamusic)",
+          tg_stats.get("new") == 6
+          and tg_stats.get("per_channel")
+          == {"ehsaspaak": 0, "SOBHbe": 4, "yaldavamusic": 2}
+          and tg_stats.get("error") is None, f"got {tg_stats}")
+    multi_keys = ["tg:SOBHbe:132203", "tg:SOBHbe:132209",
+                  "tg:SOBHbe:132214", "tg:SOBHbe:132219",
+                  "tg:yaldavamusic:40", "tg:yaldavamusic:43"]
+    multi_rows = [sarch.get_clip_by_unique("feed:" + k) for k in multi_keys]
+    check("multi-channel TG: distinct feed_keys, all pending (no auto-accept)",
+          all(r is not None and r["status"] == "pending" for r in multi_rows),
+          f"got {[bool(r) for r in multi_rows]}")
+    check("multi-channel TG: per-channel last_seen stored",
+          feed.feed_get("tg_last_seen_sobhbe") == "132219"
+          and feed.feed_get("tg_last_seen_yaldavamusic") == "43"
+          and feed.feed_get("tg_last_seen") == "117112",
+          f"got sobhbe={feed.feed_get('tg_last_seen_sobhbe')!r} "
+          f"yaldavamusic={feed.feed_get('tg_last_seen_yaldavamusic')!r}")
+
+    # --- T12: Aparat seed rotation + per-run call bound ------------------
+    feed.feed_set("ap_seed_idx", "0")
+    mm_payload = json.loads(MM_JSON.read_text(encoding="utf-8"))
+
+    def ap_rot(uid):
+        if uid == "t79ms8g":
+            p = copy.deepcopy(mm_payload)
+            p["data"]["attributes"]["file_link"] = (
+                "file://" + _media("aparat_clip.mp4"))
+            return p
+        p = copy.deepcopy(ap_base)
+        p["data"]["attributes"]["uid"] = uid
+        p["data"]["attributes"]["file_link"] = (
+            "file://" + _media("aparat_clip.mp4"))
+        return p
+
+    seeds = []
+    news = []
+    for _ in range(5):
+        r = await feed.run_aparat_cycle(bootstrap=False,
+                                        aparat_fetcher=ap_rot)
+        seeds.append(r.get("seed"))
+        news.append(r.get("new"))
+    check("rotation: one seed per run, round-robin across 4 creators",
+          seeds == ["faezehradmanesh", "Multimedia2020", "Clip_film2023",
+                    "Masafinia.m", "faezehradmanesh"],
+          f"got {seeds}")
+    check("rotation: new counts per run [0, 5, 1, 1, 0] (seed + related)",
+          news == [0, 5, 1, 1, 0], f"got {news}")
+    check("rotation: seed index wraps (5 runs from 0 -> 1)",
+          feed.feed_get("ap_seed_idx") == "1",
+          f"got {feed.feed_get('ap_seed_idx')!r}")
+    check("rotation: each new seed's own clip intaken (Clip_film2023/Masafinia.m)",
+          all((sarch.get_clip_by_unique("feed:ap:" + u) or {}).get("status")
+              == "pending" for u in ("DCBas", "xse8if0")))
+
+    def ap_bound(uid):
+        # show rejected by the accept gate (61s) while 49 related
+        # candidates keep flowing: the loop must stop on the CALL bound.
+        p = copy.deepcopy(mm_payload)
+        p["data"]["attributes"]["duration"] = 61
+        p["data"]["attributes"]["uid"] = uid
+        p["data"]["attributes"]["file_link"] = (
+            "file://" + _media("aparat_clip.mp4"))
+        return p
+
+    bound = await feed.run_aparat_cycle(bootstrap=False,
+                                        aparat_fetcher=ap_bound)
+    check("rotation bound: 50 candidates, 0 new -> exactly 8 show calls",
+          bound["calls"] == 8 and bound["new"] == 0, f"got {bound}")
 
     # --- T7: approval fallback without storage + first delivery --------
     import app.bot.motion_watermark as mw
@@ -574,7 +752,7 @@ async def main():
         play_h = find_handler(r2router, "startswith:data:sarch:play:")
         check("sarch:play handler registered", play_h is not None)
 
-        clip = sarch.get_clip_by_unique("feed:tg:9001")
+        clip = sarch.get_clip_by_unique("feed:tg:ehsaspaak:9001")
         bot = DeliveryBot()
         # Phase 1 base: approval is the direct qok path (approve_clip);
         # the badge is applied once at first delivery, not at approval.
@@ -611,7 +789,7 @@ async def main():
             raise RuntimeError("ffmpeg down")
 
         mw.apply_user_badge = boom_badge
-        clip2 = sarch.get_clip_by_unique("feed:tg:117099")
+        clip2 = sarch.get_clip_by_unique("feed:tg:ehsaspaak:117099")
         sarch.set_clip_status(clip2["id"], "active")
         sarch.move_clip(clip2["id"], "love", "express")
         bot2 = DeliveryBot()
@@ -644,7 +822,7 @@ async def main():
 
     sarch._identify_audio_bytes = fake_identify
     sarch._fetch_lyrics_text = fake_lyrics
-    feed_clip = sarch.get_clip_by_unique("feed:tg:117112")
+    feed_clip = sarch.get_clip_by_unique("feed:tg:ehsaspaak:117112")
     strict = StrictBot()
     await sarch.analyze_clip_for_queue(strict, feed_clip)
     row = sarch.get_clip(feed_clip["id"])
@@ -695,11 +873,11 @@ async def main():
     # --- T: refresh pending Telegram URLs --------------------------------
     conn.execute(
         "UPDATE story_archive SET source_url='https://old.invalid/x.mp4'"
-        " WHERE feed_key='tg:117112'")
+        " WHERE feed_key='tg:ehsaspaak:117112'")
     conn.commit()
     fresh = feed.parse_tg_page(html_cycle)
     n_ref = feed.refresh_pending_tg_urls(fresh)
-    row = sarch.get_clip_by_unique("feed:tg:117112")
+    row = sarch.get_clip_by_unique("feed:tg:ehsaspaak:117112")
     check("refresh: stale pending TG url replaced from the fresh page",
           n_ref >= 1 and row["source_url"].startswith("file://"),
           f"n={n_ref} url={row['source_url'][:40]!r}")
