@@ -378,6 +378,18 @@ async def main():
         "", "دلم برات تنگ شده", "love", "longing")
     check("suggest: weak caption (score 2) -> no suggestion",
           cat is None and score == 2, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "", "کلیپ تیکه دار سنگین", "", "")
+    check("suggest: «تیکه» caption is a sarcasm signal (score 1, still no suggestion)",
+          cat is None and score == 1, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "دوستت دارم عاشقتم", "کلیپ تیکه دار", "", "")
+    check("suggest: caption sarcasm vs lyrics love -> no suggestion (text/music disagree)",
+          cat is None, f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "دوستت دارم عاشقتم", "کلیپ عاشقانه", "", "")
+    check("suggest: caption love + lyrics love agree -> love/express",
+          (cat, sub) == ("love", "express"), f"got {(cat, sub, score)}")
 
     # --- T5: approve_clip applies the stored suggestion ---------------
     sarch.save_suggestion(3, title="تردید", artist="سامان جلیلی",

@@ -217,7 +217,7 @@ SUBCAT_KEYWORDS: dict[tuple[str, str], list[str]] = {
     ("deep", "pride"): ["غرور", "مغرور"],
     ("deep", "silence"): ["سکوت", "ساکت"],
     ("deep", "indifferent"): ["بی‌تفاوت", "بی تفاوت", "برام مهم نیست"],
-    ("deep", "sarcasm"): ["کنایه", "طعنه"],
+    ("deep", "sarcasm"): ["کنایه", "طعنه", "تیکه"],
     ("happy", "hope"): ["امید", "امیدوار", "فردا"],
     ("happy", "success"): ["موفقیت", "پیروزی", "موفق"],
     ("happy", "friendship"): ["رفاقت", "رفیق"],
@@ -285,8 +285,21 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     blockers were elsewhere: the pass excluded already-analyzed clips,
     the song title was never scored, and the per-cycle cap was 5 —
     all three are fixed separately (re-score, title scoring, cap 10).
+
+    Text/music disagreement guard (2026-11-06): for text-overlay clips
+    the on-video text — proxied here by the caption/title — IS the
+    theme, while the background song is incidental; scoring the song's
+    lyrics at x2 can otherwise approve a clip under its background
+    music's category (e.g. a تیکه‌دار clip with a romantic song
+    approved as love/express). So when the caption has a CLEAR single
+    best subcategory (strictly leading on caption hits alone) that
+    differs from the total-score winner, the clip is genuinely
+    ambiguous and NO suggestion is returned — it stays queued for a
+    human to watch. Agreement (or no caption signal) leaves the
+    normal gate untouched.
     """
     scored = []
+    cap_scored = []
     for (cat, sub), kws in SUBCAT_KEYWORDS.items():
         lh, lhits = _score_keywords(lyrics_text or "", kws)
         ch, chits = _score_keywords(caption or "", kws)
@@ -300,10 +313,17 @@ def suggest_subcategory(lyrics_text: str, caption: str,
         if prior:
             reasons.append("دسته کانال")
         scored.append((score, cat, sub, reasons))
+        cap_scored.append((ch, cat, sub))
     scored.sort(key=lambda t: t[0], reverse=True)
     best = scored[0]
     second = scored[1][0] if len(scored) > 1 else 0
     if best[0] >= 3 and best[0] - second >= 2:
+        cap_scored.sort(key=lambda t: t[0], reverse=True)
+        cap_best, cap_second = cap_scored[0], cap_scored[1][0]
+        if (cap_best[0] >= 1 and cap_best[0] > cap_second
+                and (cap_best[1], cap_best[2]) != (best[1], best[2])):
+            return None, None, best[0], best[3] + [
+                "متن کلیپ با آهنگ هم‌خوانی ندارد"]
         return best[1], best[2], best[0], best[3]
     return None, None, best[0], best[3]
 
