@@ -29,14 +29,15 @@ Checks (all on REAL fixtures — repo excerpts of the verified fetches):
      tokenized video URLs kept whole. The friendship channel is wired
      as 'dosti' (t.me/s/refaghat serves the same page but its posts
      carry data-post='dosti/...').
- 12. Aparat seed rotation: one seed per run, round-robin across the
-     15 seeds / 14 creators (faezehradmanesh, Multimedia2020,
+ 12. Aparat seed rotation: THREE seeds per run (since 2026-11-06 —
+     one seed per run took ~15h to cover 15 seeds), round-robin
+     across the 15 seeds / 14 creators (faezehradmanesh, Multimedia2020,
      Clip_film2023, Masafinia.m x2, Amirabbas.b, AparatVision,
      Tafrihi_Best, Aparat_Media_pars, Kartoonchi, nasi20, vidoma,
-     Sargarmi_kids, Film_Tvs, toop_media); the per-run show-call
-     bound (8) is TOTAL, not per seed; the Multimedia2020 fixture
-     parses (50 related, 49 short); a 61s clip is rejected by the
-     60s cap.
+     Sargarmi_kids, Film_Tvs, toop_media); 5 runs cover all seeds, the
+     6th wraps; the per-run show-call bound (24) is TOTAL, not per
+     seed; the Multimedia2020 fixture parses (50 related, 49 short);
+     a 61s clip is rejected by the 60s cap.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
 Run: python3 scripts/verify_feed.py ; exit 0 = all PASS.
@@ -664,15 +665,16 @@ async def main():
           and st["pending_feed"] == 9, f"got {st}")
     check("feed status: tg_last_seen advanced to the newest post",
           st["last_seen_tg"] == 117112, f"got {st['last_seen_tg']}")
-    # incremental re-run: everything deduped, nothing new
+    # incremental re-run: everything deduped, nothing new — except the
+    # next THREE rotated seeds (3 seeds/run since 2026-11-06).
     stats2 = await feed.run_feed_cycle(bootstrap=False,
                                        tg_fetcher=tg_fetcher,
                                        aparat_fetcher=ap_fetcher)
-    check("cycle incremental: tg_new=0 (dedup holds), ap_new=1 (rotated seed)",
-          stats2.get("tg_new") == 0 and stats2.get("ap_new") == 1,
+    check("cycle incremental: tg_new=0 (dedup holds), ap_new=3 (3 rotated seeds)",
+          stats2.get("tg_new") == 0 and stats2.get("ap_new") == 3,
           f"got {stats2}")
-    check("cycle incremental: last_new=1 (the rotated seed only)",
-          feed.get_feed_status()["last_new"] == 1)
+    check("cycle incremental: last_new=3 (the 3 rotated seeds)",
+          feed.get_feed_status()["last_new"] == 3)
     check("cycle incremental: rotated seed t79ms8g intaken as pending",
           (sarch.get_clip_by_unique("feed:ap:t79ms8g") or {}).get("status")
           == "pending")
@@ -799,24 +801,30 @@ async def main():
 
     seeds = []
     news = []
-    for _ in range(16):
+    for _ in range(6):
         r = await feed.run_aparat_cycle(bootstrap=False,
                                         aparat_fetcher=ap_rot)
-        seeds.append(r.get("seed"))
+        seeds.append(r.get("seeds"))
         news.append(r.get("new"))
-    check("rotation: one seed per run, round-robin across 15 seeds",
-          seeds == ["faezehradmanesh", "Multimedia2020", "Clip_film2023",
-                    "Masafinia.m", "Amirabbas.b", "AparatVision",
-                    "Tafrihi_Best", "Aparat_Media_pars",
-                    "Kartoonchi", "nasi20", "vidoma", "Sargarmi_kids",
-                    "Film_Tvs", "Masafinia.m", "toop_media",
-                    "faezehradmanesh"],
+    check("rotation: THREE seeds per run, round-robin across 15 seeds",
+          seeds == [["faezehradmanesh", "Multimedia2020", "Clip_film2023"],
+                    ["Masafinia.m", "Amirabbas.b", "AparatVision"],
+                    ["Tafrihi_Best", "Aparat_Media_pars", "Kartoonchi"],
+                    ["nasi20", "vidoma", "Sargarmi_kids"],
+                    ["Film_Tvs", "Masafinia.m", "toop_media"],
+                    ["faezehradmanesh", "Multimedia2020", "Clip_film2023"]],
           f"got {seeds}")
-    check("rotation: new counts per run [0, 5, 1x13, 0] (seed + related)",
-          news == [0, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-          f"got {news}")
-    check("rotation: seed index wraps (16 runs from 0 -> 1)",
-          feed.feed_get("ap_seed_idx") == "1",
+    # Run 1 floods to the 15-new cap from the Multimedia2020 graph
+    # (13 related; the 3 seeds are already intaken by the incremental
+    # cycle test above). Run 2 takes only 2 fresh seeds — xse8if0 was
+    # intaken by that same incremental cycle. Runs 3-5 take their 3
+    # fresh seeds each. Run 6 wraps: the MM graph still has unfetched
+    # related, but the 24-call bound stops it at 1 new (15 MM dup +
+    # 1 fresh in 24 calls).
+    check("rotation: new counts per run [15, 2, 3, 3, 3, 1]",
+          news == [15, 2, 3, 3, 3, 1], f"got {news}")
+    check("rotation: seed index wraps (6 runs of 3 from 0 -> 3)",
+          feed.feed_get("ap_seed_idx") == "3",
           f"got {feed.feed_get('ap_seed_idx')!r}")
     check("rotation: each new seed's own clip intaken (REPORT2 + REPORT3 seeds)",
           all((sarch.get_clip_by_unique("feed:ap:" + u) or {}).get("status")
@@ -838,8 +846,8 @@ async def main():
 
     bound = await feed.run_aparat_cycle(bootstrap=False,
                                         aparat_fetcher=ap_bound)
-    check("rotation bound: 50 candidates, 0 new -> exactly 8 show calls",
-          bound["calls"] == 8 and bound["new"] == 0, f"got {bound}")
+    check("rotation bound: 50 candidates, 0 new -> exactly 24 show calls",
+          bound["calls"] == 24 and bound["new"] == 0, f"got {bound}")
 
     # --- T7: approval fallback without storage + first delivery --------
     # Final order 2026-11-06: deliver_feed_first burns the MAIN
@@ -1035,9 +1043,9 @@ async def main():
     sarch._identify_audio_bytes = aa_identify
     sarch._fetch_lyrics_text = aa_lyrics
     stats_aa = await feed.run_auto_approve_pass(new_keys=aa_keys)
-    check("auto-approve: cap — at most 10 approved in one pass",
-          stats_aa.get("checked") == 10
-          and 7 <= stats_aa.get("approved", 0) <= 10,
+    check("auto-approve: cap — at most 20 approved in one pass",
+          stats_aa.get("checked") == 20
+          and 7 <= stats_aa.get("approved", 0) <= 20,
           f"got {stats_aa}")
     aa_rows = [sarch.get_clip_by_unique("feed:" + k) for k in aa_keys]
     ap_rows = [r for r in aa_rows if r and r["status"] == "active"]
@@ -1051,7 +1059,7 @@ async def main():
               and (r["cat_score"] or 0) >= 3 for r in ap_rows))
     check("auto-approve: no aa clip left pending",
           sum(1 for r in aa_rows if r and r["status"] == "pending") == 0)
-    # Drain the backlog: repeated passes (cap 10 each) until the 7 aa
+    # Drain the backlog: repeated passes (cap 20 each) until the 7 aa
     # clips and the pre-suggested 117112 are all active. The backlog
     # holds older cycle clips, so the aa clips are NOT necessarily next
     # — the pass works oldest-first. Already-analyzed clips without a
@@ -1069,7 +1077,7 @@ async def main():
         st = await feed.run_auto_approve_pass()
         max_per_pass = max(max_per_pass, st.get("approved", 0))
     check("auto-approve: per-pass cap respected while draining",
-          max_per_pass <= 10, f"max={max_per_pass}")
+          max_per_pass <= 20, f"max={max_per_pass}")
     check("auto-approve: all 7 aa clips eventually active",
           all((sarch.get_clip_by_unique("feed:" + k) or {}).get("status") == "active"
               for k in aa_keys))

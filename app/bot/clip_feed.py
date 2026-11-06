@@ -21,7 +21,7 @@ Sources (verified 2026-11-05/06, real fetches — do NOT re-verify from scratch)
      ~50 related-video UIDs (included[].type == 'Video') — that graph is
      the bootstrap stock. NOTE: no verified endpoint lists a channel's
      LATEST uploads, so there is no Aparat "latest" call; later runs
-     re-walk the related graph of ONE seed per run (round-robin) and
+     re-walk the related graph of up to AP_SEEDS_PER_RUN seeds per run (round-robin) and
      rely on exact dedup. The related graph is relevance-ordered, NOT
      recency-ordered — no freshness claims. yt-dlp's Aparat extractor
      is BROKEN — never use it here.
@@ -98,7 +98,8 @@ TG_MAX_PER_RUN = 10            # max Telegram clips intaken per channel/cycle
 
 APARAT_SHOW_URL = ("https://www.aparat.com/api/fa/v1/video/video/"
                    "show/videohash/{uid}")
-# (owner_username, verified seed video UID). ONE seed per run, round-robin
+# (owner_username, verified seed video UID). Up to AP_SEEDS_PER_RUN seeds
+# per run, round-robin (3/run since 2026-11-06: 1/run was too slow).
 # via feed_state key "ap_seed_idx" — the per-run show-call bound below
 # is TOTAL, never per seed.
 APARAT_SEEDS = (
@@ -127,12 +128,19 @@ APARAT_SEEDS = (
 )
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run
-AP_RUN_SHOW_CALLS = 8           # max Aparat show calls on later runs
-AP_RUN_NEW = 5                  # max Aparat clips accepted on later runs
+AP_SEEDS_PER_RUN = 3            # Aparat seeds walked per later run (2026-11-06:
+                                # 1 seed/run took ~15h to cover 15 seeds — too
+                                # slow for the user; 3/run covers all in 5 runs)
+AP_RUN_SHOW_CALLS = 24          # max Aparat show calls on later runs (3 x 8)
+AP_RUN_NEW = 15                 # max Aparat clips accepted on later runs (3 x 5)
 
 # Auto-approve pass (user order 2026-11-06): at most this many feed
 # clips per cycle; feed_state key 'auto_accept' ("1" = on, default).
-AUTO_APPROVE_PER_CYCLE = 10
+# Raised 10 -> 20 on 2026-11-06 (user: categories must go live ASAP):
+# the pending backlog (~50 clips) was draining at 10/cycle while each
+# cycle intakes up to ~25 new ones. Already-analyzed clips re-score
+# cheaply (no re-download), so the extra 10 are mostly cheap.
+AUTO_APPROVE_PER_CYCLE = 20
 AUTO_ACCEPT_KEY = "auto_accept"
 
 MIN_DURATION_SEC = 10
@@ -727,16 +735,19 @@ async def run_telegram_cycle(*, tg_fetcher=None) -> dict:
 
 async def run_aparat_cycle(*, bootstrap: bool = False,
                            aparat_fetcher=None) -> dict:
-    """One Aparat check: walk the related-UID graph from ONE seed.
+    """One Aparat check: walk the related-UID graphs of the run's seeds.
 
-    The seed rotates round-robin (feed_state "ap_seed_idx") so a run
-    stays bounded — the show-call bound below is TOTAL per run, never
-    per seed. Bootstrap (first run) does a bounded BFS for immediate
-    stock; later runs re-walk the current seed's related list (bounded).
-    Never raises. Returns {new, skipped, calls, seed, new_keys, error}.
+    Seeds rotate round-robin (feed_state "ap_seed_idx") so a run stays
+    bounded — the show-call bound below is TOTAL per run, never per
+    seed. Bootstrap (first run) walks ONE seed with a deep BFS for
+    immediate stock; later runs walk AP_SEEDS_PER_RUN seeds (3 since
+    2026-11-06 — one seed per run took ~15h to cover 15 seeds, too
+    slow for the user). Never raises. Returns {new, skipped, calls,
+    seed, seeds, new_keys, error} ("seed" = first seed, kept for
+    existing log readers; "seeds" = all owners walked this run).
     """
-    out = {"new": 0, "skipped": 0, "calls": 0, "seed": None, "new_keys": [],
-           "error": None}
+    out = {"new": 0, "skipped": 0, "calls": 0, "seed": None, "seeds": [],
+           "new_keys": [], "error": None}
     try:
         loop = asyncio.get_running_loop()
         fetch = aparat_fetcher or _fetch_aparat_show
@@ -747,11 +758,19 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
         except (TypeError, ValueError):
             seed_idx = 0
         seed_idx %= len(APARAT_SEEDS)
-        seed_owner, seed_uid = APARAT_SEEDS[seed_idx]
-        out["seed"] = seed_owner
-        feed_set("ap_seed_idx", str((seed_idx + 1) % len(APARAT_SEEDS)))
-        _log.info("clip_feed aparat cycle seed=%s (%s)", seed_owner, seed_uid)
-        queue = [seed_uid]
+        if bootstrap:
+            run_seeds = [APARAT_SEEDS[seed_idx]]
+        else:
+            run_seeds = [APARAT_SEEDS[(seed_idx + i) % len(APARAT_SEEDS)]
+                         for i in range(AP_SEEDS_PER_RUN)]
+        out["seed"] = run_seeds[0][0]
+        out["seeds"] = [owner for owner, _ in run_seeds]
+        feed_set("ap_seed_idx",
+                 str((seed_idx + len(run_seeds)) % len(APARAT_SEEDS)))
+        for seed_owner, seed_uid in run_seeds:
+            _log.info("clip_feed aparat cycle seed=%s (%s)",
+                      seed_owner, seed_uid)
+        queue = [uid for _, uid in run_seeds]
         seen_uids: set[str] = set()
         while queue and out["calls"] < max_calls and out["new"] < max_new:
             uid = queue.pop(0)
@@ -931,6 +950,7 @@ async def run_feed_cycle(*, bootstrap: bool = False,
             stats["ap_new"] = ap.get("new", 0)
             stats["ap_error"] = ap.get("error")
             stats["ap_seed"] = ap.get("seed")
+            stats["ap_seeds"] = ap.get("seeds")
             errs = [e for e in (tg.get("error"), ap.get("error")) if e]
             stats["error"] = ";".join(errs) if errs else None
             aa = await run_auto_approve_pass(
