@@ -31,9 +31,13 @@ Sources (verified 2026-11-05/06, real fetches — do NOT re-verify from scratch)
 Design:
 - Intake downloads ONE file at a time (<=20MB), ffprobe-confirms an
   audio stream and a 10-60s duration, then inserts status='pending'
-  with categorized_by='feed'. NEVER auto-accept: every clip goes to the
-  existing moderation queue; queue-time analysis (Shazam + lyrics +
-  suggestion) is unchanged.
+  with categorized_by='feed'. Intake itself never auto-accepts; a
+  separate post-intake pass (run_auto_approve_pass, after every cycle)
+  may activate a feed clip ONLY on a confident suggestion (best >= 3
+  AND margin >= 2, marked categorized_by='feed-auto'). Ambiguous,
+  unidentified or failed clips stay in the moderation queue; the admin
+  can switch the pass off from the panel (feed_state 'auto_accept',
+  default ON).
 - THE file_id PROBLEM: feed clips come from the web, so the archive row
   starts with file_id='' and keeps the public source_url. Delivery is
   solved in two stages (see story_archive.py):
@@ -101,6 +105,11 @@ AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run
 AP_RUN_SHOW_CALLS = 8           # max Aparat show calls on later runs
 AP_RUN_NEW = 5                  # max Aparat clips accepted on later runs
+
+# Auto-approve pass (user order 2026-11-06): at most this many feed
+# clips per cycle; feed_state key 'auto_accept' ("1" = on, default).
+AUTO_APPROVE_PER_CYCLE = 5
+AUTO_ACCEPT_KEY = "auto_accept"
 
 MIN_DURATION_SEC = 10
 MAX_DURATION_SEC = 60
@@ -562,6 +571,7 @@ def get_feed_status() -> dict:
         "last_run_kind": feed_get("last_run_kind", ""),
         "last_seen_tg": last_seen,
         "pending_feed": pending_feed,
+        "auto_accept": feed_get(AUTO_ACCEPT_KEY, "1") == "1",
     }
 
 
@@ -577,7 +587,9 @@ async def intake_feed_item(*, feed_key: str, source_url: str, title: str,
     Returns (True, 'ok') or (False, reason). reason: 'duplicate' |
     'too_large' | 'http' | 'timeout' | 'probe_failed' | 'no_audio' |
     'too_short' | 'too_long' | 'db' | 'bad_input'. Never raises.
-    The clip is NEVER auto-accepted — the moderation queue decides.
+    Intake itself never auto-accepts: the clip is stored pending. A
+    separate post-intake pass (run_auto_approve_pass) may activate it
+    later on a confident suggestion — see the module docstring.
     """
     import shutil
 
@@ -635,9 +647,10 @@ async def run_telegram_cycle(*, tg_fetcher=None) -> dict:
     tg_fetcher(channel) -> html | None (default: _fetch_tg_page).
     One page per channel per run; a failing channel is recorded and
     the others still run. Never raises.
-    Returns {new, skipped, per_channel, error}.
+    Returns {new, skipped, per_channel, new_keys, error}.
     """
-    out: dict = {"new": 0, "skipped": 0, "per_channel": {}, "error": None}
+    out: dict = {"new": 0, "skipped": 0, "per_channel": {}, "new_keys": [],
+                 "error": None}
     loop = asyncio.get_running_loop()
     fetch = tg_fetcher or _fetch_tg_page
     errors: list[str] = []
@@ -666,6 +679,7 @@ async def run_telegram_cycle(*, tg_fetcher=None) -> dict:
                 if ok:
                     out["new"] += 1
                     ch_new += 1
+                    out["new_keys"].append(f"tg:{channel}:{p['post_id']}")
                 else:
                     out["skipped"] += 1
                     _log.info("clip_feed tg %s post %s skipped: %s",
@@ -695,9 +709,10 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
     stays bounded — the show-call bound below is TOTAL per run, never
     per seed. Bootstrap (first run) does a bounded BFS for immediate
     stock; later runs re-walk the current seed's related list (bounded).
-    Never raises. Returns {new, skipped, calls, seed, error}.
+    Never raises. Returns {new, skipped, calls, seed, new_keys, error}.
     """
-    out = {"new": 0, "skipped": 0, "calls": 0, "seed": None, "error": None}
+    out = {"new": 0, "skipped": 0, "calls": 0, "seed": None, "new_keys": [],
+           "error": None}
     try:
         loop = asyncio.get_running_loop()
         fetch = aparat_fetcher or _fetch_aparat_show
@@ -738,6 +753,7 @@ async def run_aparat_cycle(*, bootstrap: bool = False,
                 source_username=info["owner"])
             if ok:
                 out["new"] += 1
+                out["new_keys"].append(f"ap:{info['uid']}")
             else:
                 out["skipped"] += 1
                 _log.info("clip_feed aparat %s skipped: %s", info["uid"], why)
@@ -761,10 +777,109 @@ def _feed_lock():
     return _FEED_LOCK
 
 
+def _oldest_pending_feed_ids(limit: int) -> list[int]:
+    """IDs of the oldest pending feed clips (backlog drain, FIFO)."""
+    conn = _sarch._get_conn()
+    if not conn or limit <= 0:
+        return []
+    try:
+        cur = conn.execute(
+            "SELECT id FROM story_archive"
+            " WHERE status='pending' AND feed_key != ''"
+            " ORDER BY added_at ASC LIMIT ?", (int(limit),))
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+async def run_auto_approve_pass(*, new_keys=None) -> dict:
+    """Post-intake auto-approve for FEED clips only (user order 2026-11-06:
+    manual approval forever is not feasible).
+
+    Gate: a clip is approved ONLY when the stored suggestion is confident
+    (suggest_subcategory returned a category — best >= 3 AND margin >= 2).
+    Candidates, at most AUTO_APPROVE_PER_CYCLE per call: this cycle's newly
+    intaken clips first, then the oldest pending feed clips. Each candidate
+    is analyzed once with the same analysis as the moderation queue
+    (analyze_clip_for_queue, bot=None — feed clips download from
+    source_url and never take the get_file branch). A clip that already
+    HAS a confident suggestion is approved without re-analysis; a clip
+    already analyzed without one stays pending. Ambiguous clips,
+    unidentified clips, analysis failures and forward_only clips stay
+    pending for manual review. Feed clips ONLY (feed_key present) —
+    manual/channel clips are never touched. The pass is switched off
+    from the admin panel (feed_state 'auto_accept'; default ON).
+    Never raises. Returns {enabled, checked, approved, left_pending}.
+    """
+    out = {"enabled": False, "checked": 0, "approved": 0, "left_pending": 0}
+    try:
+        if feed_get(AUTO_ACCEPT_KEY, "1") != "1":
+            return out
+        out["enabled"] = True
+        # --- candidates: this cycle's new intakes first, then oldest pending.
+        # Already-analyzed clips WITHOUT a confident suggestion are NOT
+        # candidates (re-analysis would give the same answer) — they must
+        # not take a slot, or the backlog would never drain.
+        seen_ids: set[int] = set()
+        raw: list[dict] = []
+        for key in (new_keys or []):
+            row = _sarch.get_clip_by_unique("feed:" + key)
+            if (row and row["id"] not in seen_ids
+                    and row.get("status") == "pending"):
+                raw.append(row)
+                seen_ids.add(row["id"])
+        for cid in _oldest_pending_feed_ids(50):
+            if cid in seen_ids:
+                continue
+            row = _sarch.get_clip(cid)
+            if row and row.get("status") == "pending":
+                raw.append(row)
+                seen_ids.add(cid)
+        cands: list[dict] = []
+        for clip in raw:
+            if int(clip.get("forward_only") or 0) == 1:
+                continue
+            has_sugg = bool(clip.get("sugg_category")
+                            and clip.get("sugg_subcategory"))
+            already = bool(clip.get("last_error")
+                           or clip.get("identified_title"))
+            if has_sugg or not already:
+                cands.append(clip)
+            if len(cands) >= AUTO_APPROVE_PER_CYCLE:
+                break
+        for clip in cands[:AUTO_APPROVE_PER_CYCLE]:
+            out["checked"] += 1
+            try:
+                has_sugg = bool(clip.get("sugg_category")
+                                and clip.get("sugg_subcategory"))
+                if not has_sugg:
+                    await _sarch.analyze_clip_for_queue(None, clip)
+                    clip = _sarch.get_clip(clip["id"]) or clip
+                    has_sugg = bool(clip.get("sugg_category")
+                                    and clip.get("sugg_subcategory"))
+                if (has_sugg and clip.get("status") == "pending"
+                        and _sarch.approve_clip(clip["id"], by="feed-auto")):
+                    out["approved"] += 1
+                    _log.info("clip_feed auto-approved #%s -> %s/%s",
+                              clip["id"], clip.get("sugg_category"),
+                              clip.get("sugg_subcategory"))
+                else:
+                    out["left_pending"] += 1
+            except Exception as e:
+                _log.warning("clip_feed auto-approve #%s failed: %s",
+                             clip.get("id"), e)
+                out["left_pending"] += 1
+        return out
+    except Exception as e:
+        _log.warning("clip_feed auto-approve pass failed: %s", e)
+        return out
+
+
 async def run_feed_cycle(*, bootstrap: bool = False,
                          tg_fetcher=None, aparat_fetcher=None) -> dict:
-    """One full feed cycle (Telegram + Aparat). Single-flight: a second
-    concurrent call returns {'skipped': True}. Never raises."""
+    """One full feed cycle (Telegram + Aparat), then the auto-approve pass
+    for confident feed clips. Single-flight: a second concurrent call
+    returns {'skipped': True}. Never raises."""
     lock = _feed_lock()
     if lock.locked():
         return {"skipped": True, "tg_new": 0, "ap_new": 0, "error": None}
@@ -772,7 +887,8 @@ async def run_feed_cycle(*, bootstrap: bool = False,
         t0 = time.time()
         _log.info("clip_feed cycle start (bootstrap=%s)", bootstrap)
         stats = {"skipped": False, "tg_new": 0, "ap_new": 0,
-                 "tg_error": None, "ap_error": None, "error": None}
+                 "tg_error": None, "ap_error": None, "error": None,
+                 "auto_enabled": False, "auto_checked": 0, "auto_approved": 0}
         try:
             tg = await run_telegram_cycle(tg_fetcher=tg_fetcher)
             stats["tg_new"] = tg.get("new", 0)
@@ -787,6 +903,12 @@ async def run_feed_cycle(*, bootstrap: bool = False,
             stats["ap_seed"] = ap.get("seed")
             errs = [e for e in (tg.get("error"), ap.get("error")) if e]
             stats["error"] = ";".join(errs) if errs else None
+            aa = await run_auto_approve_pass(
+                new_keys=list(tg.get("new_keys") or [])
+                + list(ap.get("new_keys") or []))
+            stats["auto_enabled"] = aa.get("enabled", False)
+            stats["auto_checked"] = aa.get("checked", 0)
+            stats["auto_approved"] = aa.get("approved", 0)
         except Exception as e:
             _log.warning("clip_feed cycle failed: %s", e)
             stats["error"] = "cycle_failed"
@@ -799,8 +921,8 @@ async def run_feed_cycle(*, bootstrap: bool = False,
         except Exception:
             pass
         _log.info("clip_feed cycle done in %.1fs: tg_new=%d ap_new=%d "
-                  "error=%s", time.time() - t0, stats["tg_new"],
-                  stats["ap_new"], stats["error"])
+                  "auto_approved=%d error=%s", time.time() - t0, stats["tg_new"],
+                  stats["ap_new"], stats["auto_approved"], stats["error"])
         return stats
 
 

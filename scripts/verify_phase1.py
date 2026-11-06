@@ -393,6 +393,27 @@ async def main():
           and row["categorized_by"] == "admin"
           and int(row["categorized_at"] or 0) > 0)
 
+    # --- T5b: approve_clip(by='feed-auto') marks the approval source --
+    sarch.intake_channel_post(
+        file_unique_id="uq-a2", file_id="f-a2", chat_id=-1001, message_id=12,
+        username="chan", category="love", subcategory="express",
+        caption="عشق و دوستت دارم", duration=18, width=720, height=1280,
+        auto_approve=False, watermark_ok=False, file_size=2_000_000)
+    aid = conn.execute(
+        "SELECT id FROM story_archive WHERE file_unique_id='uq-a2'").fetchone()[0]
+    sarch.save_suggestion(aid, sugg_category="love", sugg_subcategory="express",
+                          score=6, reasons="ترانه: عشق")
+    check("approve_clip(by='feed-auto'): approves",
+          sarch.approve_clip(aid, by="feed-auto") is True)
+    row = sarch.get_clip(aid)
+    check("approve_clip(by='feed-auto'): categorized_by='feed-auto'",
+          row["status"] == "active" and row["category"] == "love"
+          and row["subcategory"] == "express"
+          and row["categorized_by"] == "feed-auto")
+    check("approve_clip(by='bogus'): falls back to 'admin'",
+          sarch.approve_clip(aid, by="bogus") is True
+          and sarch.get_clip(aid)["categorized_by"] == "admin")
+
     # --- T6: reject keeps the row and blocks re-intake -----------------
     sarch.intake_channel_post(
         file_unique_id="uq-e", file_id="f-e", chat_id=-1001, message_id=13,

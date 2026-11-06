@@ -546,6 +546,18 @@ async def main():
           (not ok) and why in ("http", "error", "timeout"), f"got {why}")
 
     # --- T4/T5: full bootstrap cycle (fixture fetchers, real download) -
+    # The auto-approve pass runs INSIDE run_feed_cycle, so install
+    # deterministic (unconfident) identify/lyrics fakes FIRST — otherwise
+    # the pass would call the real Shazam/lyrics services in the sandbox.
+    async def _no_identify(data):
+        return ("", "")
+
+    async def _no_lyrics(title, artist):
+        return ""
+
+    sarch._identify_audio_bytes = _no_identify
+    sarch._fetch_lyrics_text = _no_lyrics
+
     html_cycle = re.sub(
         r"https://cdn4\.telesco\.pe/file/f2efeb7ace\.mp4\?token=TOKEN",
         "file://" + _media("ehsas_vid1.mp4"), tg_html)
@@ -881,6 +893,146 @@ async def main():
     check("refresh: stale pending TG url replaced from the fresh page",
           n_ref >= 1 and row["source_url"].startswith("file://"),
           f"n={n_ref} url={row['source_url'][:40]!r}")
+
+    # --- T11: auto-approve pass -------------------------------------------
+    async def aa_identify(data):
+        return ("تردید", "سامان جلیلی")
+
+    async def aa_lyrics(title, artist):
+        return TARDID_LYRICS + " عشق دوستت دارم عاشقانه"
+
+    # 7 fresh pending feed clips (file:// media) for the cap test.
+    aa_keys = []
+    for i in range(7):
+        k = f"tg:aa{i}"
+        ok, why = await feed.intake_feed_item(
+            feed_key=k, source_url=url_ok, title="کلیپ عاشقانه با متن",
+            duration_hint=18, source_username="ehsaspaak")
+        check(f"auto-approve setup: intake {k} ok", ok, f"got {why}")
+        aa_keys.append(k)
+    sarch._identify_audio_bytes = aa_identify
+    sarch._fetch_lyrics_text = aa_lyrics
+    stats_aa = await feed.run_auto_approve_pass(new_keys=aa_keys)
+    check("auto-approve: cap — at most 5 approved in one pass",
+          stats_aa.get("approved") == 5 and stats_aa.get("checked") == 5,
+          f"got {stats_aa}")
+    aa_rows = [sarch.get_clip_by_unique("feed:" + k) for k in aa_keys]
+    ap_rows = [r for r in aa_rows if r and r["status"] == "active"]
+    check("auto-approve: new intakes first (first 5 keys approved)",
+          [r["feed_key"] for r in ap_rows] == aa_keys[:5],
+          f"got {[r['feed_key'] for r in ap_rows]}")
+    check("auto-approve: approved rows active + feed-auto + love/express",
+          len(ap_rows) == 5 and all(
+              r["categorized_by"] == "feed-auto"
+              and r["category"] == "love" and r["subcategory"] == "express"
+              and (r["cat_score"] or 0) >= 3 for r in ap_rows))
+    check("auto-approve: the 2 remaining stay pending",
+          sum(1 for r in aa_rows if r and r["status"] == "pending") == 2)
+    # Second pass drains the backlog: the pre-suggested 117112 (T8) plus
+    # the 2 remaining aa clips. Already-analyzed clips without a
+    # Drain the backlog: repeated passes (cap 5 each) until the 7 aa clips
+    # and the pre-suggested 117112 are all active. The backlog holds older
+    # cycle clips, so the aa clips are NOT necessarily next — the pass
+    # works oldest-first. Already-analyzed clips without a suggestion
+    # must not clog the candidate slots.
+    max_per_pass = 0
+    for _ in range(10):
+        done = all(
+            (sarch.get_clip_by_unique("feed:" + k) or {}).get("status") == "active"
+            for k in aa_keys)
+        done = done and (sarch.get_clip_by_unique(
+            "feed:tg:ehsaspaak:117112") or {}).get("status") == "active"
+        if done:
+            break
+        st = await feed.run_auto_approve_pass()
+        max_per_pass = max(max_per_pass, st.get("approved", 0))
+    check("auto-approve: per-pass cap respected while draining",
+          max_per_pass <= 5, f"max={max_per_pass}")
+    check("auto-approve: all 7 aa clips eventually active",
+          all((sarch.get_clip_by_unique("feed:" + k) or {}).get("status") == "active"
+              for k in aa_keys))
+    check("auto-approve: pre-suggested clip approved as feed-auto",
+          (sarch.get_clip_by_unique("feed:tg:ehsaspaak:117112") or {}).get(
+              "categorized_by") == "feed-auto")
+    # Unconfident: not identified -> stays pending.
+    sarch._identify_audio_bytes = _no_identify
+    sarch._fetch_lyrics_text = _no_lyrics
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-weak", source_url=url_ok, title="کلیپ",
+        duration_hint=18, source_username="ehsaspaak")
+    check("auto-approve setup: weak intake ok", ok, f"got {why}")
+    stats_aa3 = await feed.run_auto_approve_pass(new_keys=["tg:aa-weak"])
+    weak = sarch.get_clip_by_unique("feed:tg:aa-weak")
+    check("auto-approve: unconfident clip stays pending",
+          stats_aa3.get("approved") == 0 and weak
+          and weak["status"] == "pending"
+          and weak.get("last_error") == "not_identified",
+          f"got {stats_aa3} row={weak}")
+    # Toggle OFF: nothing auto-approved even with confident fakes.
+    sarch._identify_audio_bytes = aa_identify
+    sarch._fetch_lyrics_text = aa_lyrics
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-off", source_url=url_ok, title="کلیپ عاشقانه با متن",
+        duration_hint=18, source_username="ehsaspaak")
+    check("auto-approve setup: toggle-off intake ok", ok, f"got {why}")
+    feed.feed_set("auto_accept", "0")
+    check("auto-approve: get_feed_status reports auto_accept off",
+          feed.get_feed_status().get("auto_accept") is False)
+    stats_aa4 = await feed.run_auto_approve_pass(new_keys=["tg:aa-off"])
+    off_row = sarch.get_clip_by_unique("feed:tg:aa-off")
+    check("auto-approve: toggle OFF -> nothing approved",
+          stats_aa4.get("enabled") is False and stats_aa4.get("approved") == 0
+          and off_row and off_row["status"] == "pending",
+          f"got {stats_aa4}")
+    feed.feed_set("auto_accept", "1")
+    check("auto-approve: get_feed_status reports auto_accept on",
+          feed.get_feed_status().get("auto_accept") is True)
+    # No bot call for feed clips: StrictBot raises on ANY bot call, yet
+    # analysis succeeds with the confident fakes.
+    strict = StrictBot()
+    await sarch.analyze_clip_for_queue(strict, off_row)
+    off_row2 = sarch.get_clip(off_row["id"])
+    check("auto-approve: feed analysis never calls the bot",
+          off_row2.get("sugg_category") == "love"
+          and off_row2.get("sugg_subcategory") == "express",
+          f"got sugg={off_row2.get('sugg_category')}")
+    # Source gone: a fresh unanalyzed clip stays pending, no crash.
+    ok, why = await feed.intake_feed_item(
+        feed_key="tg:aa-gone", source_url=url_ok, title="کلیپ عاشقانه با متن",
+        duration_hint=18, source_username="ehsaspaak")
+    check("auto-approve setup: gone intake ok", ok, f"got {why}")
+    gone_row = sarch.get_clip_by_unique("feed:tg:aa-gone")
+    conn.execute(
+        "UPDATE story_archive SET source_url='file:///tmp/does-not-exist.mp4'"
+        " WHERE id=?", (gone_row["id"],))
+    conn.commit()
+    stats_aa5 = await feed.run_auto_approve_pass(new_keys=["tg:aa-gone"])
+    gone2 = sarch.get_clip(gone_row["id"])
+    check("auto-approve: dead source stays pending, no crash",
+          gone2 and gone2["status"] == "pending"
+          and gone2.get("last_error") == "source_gone"
+          and stats_aa5.get("approved", 0) <= 5,
+          f"got {stats_aa5} err={gone2.get('last_error') if gone2 else None}")
+    # Toggle handler: sarch:autoacc flips the flag + re-renders the panel.
+    autoacc_h = find_handler(r2router, "eq:data=sarch:autoacc")
+    check("auto-approve: sarch:autoacc handler registered", autoacc_h is not None)
+    if autoacc_h is not None:
+        cb = FakeCallback("sarch:autoacc", StrictBot())
+        await autoacc_h(cb, cfg, FakeState())
+        check("auto-approve: toggle handler flips auto_accept off",
+              feed.feed_get("auto_accept", "1") == "0")
+        btns = [b for _t, kb in (cb.message.edits + cb.message.answers)
+                if kb is not None for b in kb_buttons(kb)]
+        check("auto-approve: panel re-renders with خاموش",
+              any("خاموش" in (t or "") for t, _c in btns), f"btns={btns}")
+        cb2 = FakeCallback("sarch:autoacc", StrictBot())
+        await autoacc_h(cb2, cfg, FakeState())
+        check("auto-approve: toggle handler flips auto_accept back on",
+              feed.feed_get("auto_accept", "1") == "1")
+        btns2 = [b for _t, kb in (cb2.message.edits + cb2.message.answers)
+                 if kb is not None for b in kb_buttons(kb)]
+        check("auto-approve: panel re-renders with روشن",
+              any("روشن" in (t or "") for t, _c in btns2), f"btns={btns2}")
 
     shutil.rmtree(tmpd, ignore_errors=True)
     fails = [r for r in RESULTS if not r[1]]

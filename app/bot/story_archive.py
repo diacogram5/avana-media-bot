@@ -16,12 +16,19 @@ Hard constraints honored:
 - Every DB op is try/except isolated: this module can never crash the bot.
 - Protected-content posts are never archived (respect author restriction).
 
-Final design (user-approved 2026-11-05, Phase 1):
-- NO auto-accept at start: EVERY clip goes to the moderation queue first;
-  the system suggests a subcategory (song + lyrics + caption + source) and
-  the admin confirms or picks another. After >=20 clips + an accuracy
-  review, auto-accept is reconsidered.
-- Suggestion is ADVISORY only — the admin decides (approve_clip).
+Final design (user-approved 2026-11-05, Phase 1; auto-approve added
+2026-11-06 by user order — manual approval forever is not feasible):
+- Feed clips may be auto-approved by the hourly feed pass (see
+  clip_feed.run_auto_approve_pass) ONLY on a confident suggestion
+  (best >= 3 AND margin >= 2); they are marked
+  categorized_by='feed-auto'. Ambiguous, unidentified or failed feed
+  clips stay pending for the admin. The admin can switch the pass off
+  from the panel (feed_state key 'auto_accept', default ON).
+- Channel/manual clips: NO auto-accept — EVERY clip goes to the
+  moderation queue first; the system suggests a subcategory and the
+  admin confirms or picks another.
+- Suggestion is ADVISORY for channel/manual clips — the admin decides
+  (approve_clip).
 - Files > Bot API download limit (20MB) are forward-only (no processing).
 - Processing (Waveframe + outro) happens ONCE at approval — Phase 2.
 - Before ANY schema change, _init_tables copies the current rows into
@@ -268,7 +275,10 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     A suggestion is returned ONLY when best >= 3 AND it leads the
     runner-up by >= 2; otherwise (None, None, best_score, reasons) —
     the clip goes to the admin queue with no suggestion and the admin
-    decides by watching it. No clip is ever auto-categorized.
+    decides by watching it. A confident suggestion is the gate for the
+    feed's auto-approve pass (clip_feed.run_auto_approve_pass, feed
+    clips only, categorized_by='feed-auto'); channel/manual clips are
+    never auto-categorized.
     """
     scored = []
     for (cat, sub), kws in SUBCAT_KEYWORDS.items():
@@ -707,9 +717,14 @@ def set_clip_file_id(clip_id: int, file_id: str) -> bool:
         return False
 
 
-def approve_clip(clip_id: int) -> bool:
+def approve_clip(clip_id: int, by: str = "admin") -> bool:
     """Approve a pending clip: apply the stored suggestion (if any) as its
-    final category, mark categorized_by='admin', status='active'.
+    final category, mark status='active'.
+
+    by: who approved — 'admin' (manual queue approval, default) or
+    'feed-auto' (the feed's auto-approve pass, confident suggestion
+    only). Stored in categorized_by so the approval source stays
+    distinguishable in the DB.
 
     Phase 2 wires the one-time processing (Waveframe + outro + storage)
     into this step; Phase 1 only records the approval. On a processing
@@ -718,6 +733,8 @@ def approve_clip(clip_id: int) -> bool:
     conn = _get_conn()
     if not conn:
         return False
+    if by not in ("admin", "feed-auto"):
+        by = "admin"
     try:
         clip = get_clip(clip_id)
         if not clip:
@@ -726,8 +743,8 @@ def approve_clip(clip_id: int) -> bool:
         sub = clip.get("sugg_subcategory") or clip.get("subcategory")
         conn.execute(
             "UPDATE story_archive SET category=?, subcategory=?, status='active',"
-            " categorized_by='admin', categorized_at=? WHERE id=?",
-            (cat, sub, int(time.time()), clip_id))
+            " categorized_by=?, categorized_at=? WHERE id=?",
+            (cat, sub, by, int(time.time()), clip_id))
         conn.commit()
         return True
     except Exception as e:
@@ -1016,6 +1033,8 @@ def register_story_archive_handlers(router) -> None:
             [_btn("➕ ثبت کانال جدید", callback_data="sarch:addchan")],
             [_btn("📋 کانال‌ها", callback_data="sarch:chans")],
             [_btn(f"⏳ صف تأیید ({st['pending']})", callback_data="sarch:queue")],
+            [_btn(f"⚙️ تایید خودکار: {'روشن ✅' if (_fs or {}).get('auto_accept', True) else 'خاموش'}",
+                  callback_data="sarch:autoacc")],
             [_btn("🗂 مرور آرشیو", callback_data="sarch:browse")],
             [_btn("📥 افزودن دستی کلیپ", callback_data="sarch:manual")],
             [_btn("🔙 پنل مدیریت", callback_data="adm:panel")],
@@ -1030,6 +1049,24 @@ def register_story_archive_handlers(router) -> None:
             await callback.message.edit_text(txt, parse_mode="HTML", reply_markup=kb)
         except Exception:
             await callback.message.answer(txt, parse_mode="HTML", reply_markup=kb)
+
+
+    @router.callback_query(F.data == "sarch:autoacc")
+    async def sarch_autoacc(callback: CallbackQuery, config, state: FSMContext):
+        # Kill-switch for the feed's auto-approve pass (feed_state key
+        # 'auto_accept', default ON). Follows the channel-toggle pattern:
+        # flip the flag, answer with the new state, re-render the panel.
+        if not _is_owner_cb(callback, config):
+            return
+        cur = True
+        try:
+            from .clip_feed import feed_get as _fg, feed_set as _fset
+            cur = _fg("auto_accept", "1") == "1"
+            _fset("auto_accept", "0" if cur else "1")
+        except Exception as e:
+            _log.warning("sarch autoacc toggle failed: %s", e)
+        await callback.answer("تایید خودکار " + ("خاموش شد" if cur else "روشن شد"))
+        await sarch_panel(callback, config, state)
 
 
     @router.callback_query(F.data == "sarch:addchan")
