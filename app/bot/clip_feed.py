@@ -396,6 +396,28 @@ def _fetch_aparat_show(uid: str) -> dict | None:
         return None
 
 
+def refresh_aparat_file_link(uid: str) -> str:
+    """Re-fetch one Aparat video's file_link via the show API.
+
+    Aparat file_link tokens expire after hours, so a feed clip stored
+    long ago can fail at delivery time with a dead URL (clip #193,
+    2026-11-07: badge download failed, raw-URL fallback failed too).
+    The show endpoint returns a fresh tokenized link for the same UID —
+    call this when a delivery download fails, then retry once with the
+    fresh link. Returns "" on any failure. Never raises.
+    """
+    if not uid:
+        return ""
+    try:
+        payload = _fetch_aparat_show(uid)
+        info = parse_aparat_show(payload) if payload else None
+        if not info:
+            return ""
+        return info.get("file_link") or ""
+    except Exception:
+        return ""
+
+
 def download_url_to_file(url: str, dest: str,
                          max_bytes: int = MAX_DOWNLOAD_BYTES
                          ) -> tuple[str | None, int | str]:

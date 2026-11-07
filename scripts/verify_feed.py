@@ -449,6 +449,26 @@ async def main():
           f"got {info}")
     check("aparat show: passes the accept gate",
           bool(info) and feed._aparat_accept(info))
+    # --- T2b: refresh_aparat_file_link (clip #193, 2026-11-07) --------
+    # A stored Aparat file_link can expire; the show API returns a fresh
+    # tokenized link for the same UID. The helper returns "" on failure.
+    _real_show = feed._fetch_aparat_show
+    feed._fetch_aparat_show = lambda uid: ap_payload
+    try:
+        check("aparat refresh: fresh file_link for the same UID",
+              feed.refresh_aparat_file_link("jtk01l2")
+              == (info["file_link"] or ""),
+              f"got {feed.refresh_aparat_file_link('jtk01l2')!r}")
+    finally:
+        feed._fetch_aparat_show = _real_show
+    feed._fetch_aparat_show = lambda uid: None
+    try:
+        check("aparat refresh: failed show fetch -> empty link",
+              feed.refresh_aparat_file_link("jtk01l2") == "")
+    finally:
+        feed._fetch_aparat_show = _real_show
+    check("aparat refresh: empty UID -> empty link",
+          feed.refresh_aparat_file_link("") == "")
     rel = feed.parse_aparat_related(ap_payload)
     check("aparat related: 5 UIDs embedded in the excerpt",
           len(rel) == 5 and rel[0]["uid"] == "dobi73z"

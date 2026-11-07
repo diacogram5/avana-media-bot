@@ -21,6 +21,11 @@ Checks:
      (no "1/1", no YouTube); with clips, nav + YouTube return.
   9. Manual add stays active with categorized_by='admin'.
  10. All archive keyboards build (panel, home, cat, sub, queue).
+ 11. Final redesign (2026-11-07): 5 categories, direct send, nav
+     buttons, pick_next_clip, forward nav, processed-file_id caching.
+ 12. Expired Aparat link (clip #193, 2026-11-07): deliver_feed_first
+     refreshes the file_link via the show API once and retries; a
+     failed refresh leaves the stored URL untouched.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
 Run: python3 scripts/verify_phase1.py ; exit 0 = all PASS.
@@ -813,6 +818,85 @@ async def main():
               f"downloads={len(dl_calls2)} sent={bot_g2.sent}")
     finally:
         _mw.apply_waveframe_badge = _real_badge
+
+    # --- T12: expired Aparat link is refreshed at delivery (clip #193) --
+    # A feed clip whose stored file_link expired fails the first download
+    # with ('http'); deliver_feed_first refreshes the link via the show
+    # API once (feed_key ap:<uid>) and retries — the clip delivers and
+    # the DB keeps the fresh link. A failed refresh leaves the stored
+    # URL untouched (badge_failed is recorded, as before).
+    from app.bot import clip_feed as feed
+    import app.bot.motion_watermark as _mw2
+    _real_badge2 = _mw2.apply_waveframe_badge
+    _real_outro2 = _mw2.overlay_outro
+    _real_refresh = feed.refresh_aparat_file_link
+
+    def _fast_copy(src, out):
+        shutil.copyfile(src, out)
+        return "mocked"
+    _mw2.apply_waveframe_badge = _fast_copy
+    _mw2.overlay_outro = _fast_copy
+    _refresh_calls = []
+    _fresh_url = "file://" + str(REF_CLIP)
+
+    def _fake_refresh(uid):
+        _refresh_calls.append(uid)
+        return _fresh_url
+    feed.refresh_aparat_file_link = _fake_refresh
+    try:
+        ok, _ = sarch.archive_clip(
+            file_unique_id="feed:ap:testuid", file_id="",
+            category="sad", subcategory="tears", mode="resend",
+            status="active", added_by=111, file_size=2_000_000,
+            categorized_by="feed-auto", categorized_at=1234567890,
+            source_url="https://dead.invalid/old.mp4?token=expired",
+            feed_key="ap:testuid")
+        assert ok
+        fresh_id = conn.execute(
+            "SELECT id FROM story_archive WHERE file_unique_id=?",
+            ("feed:ap:testuid",)).fetchone()[0]
+        conn.commit()
+        playh2 = find_handler(r2, "startswith:data:sarch:play:")
+        bot_t = NavBot(fixture=REF_CLIP)
+        cb_t = FakeCallback(f"sarch:play:{fresh_id}:sad:tears:0", bot_t)
+        await playh2(cb_t, cfg, FakeState())
+        row_t = sarch.get_clip(fresh_id)
+        check("refresh: expired link is refreshed and the clip delivers",
+              len(bot_t.sent) == 1 and row_t
+              and row_t.get("source_url") == _fresh_url
+              and row_t.get("processed_file_id") == "proc-xyz",
+              f"sent={len(bot_t.sent)} url={row_t and row_t.get('source_url')}")
+        check("refresh: the show API is called once for the clip's UID",
+              _refresh_calls == ["testuid"], f"calls={_refresh_calls}")
+        # Failed refresh: stored URL untouched, badge_failed recorded.
+        _refresh_calls.clear()
+        feed.refresh_aparat_file_link = lambda uid: ""
+        ok2, _ = sarch.archive_clip(
+            file_unique_id="feed:ap:dead2", file_id="",
+            category="sad", subcategory="tears", mode="resend",
+            status="active", added_by=111, file_size=2_000_000,
+            categorized_by="feed-auto", categorized_at=1234567890,
+            source_url="https://dead.invalid/old2.mp4?token=expired",
+            feed_key="ap:dead2")
+        assert ok2
+        dead_id = conn.execute(
+            "SELECT id FROM story_archive WHERE file_unique_id=?",
+            ("feed:ap:dead2",)).fetchone()[0]
+        conn.commit()
+        bot_t2 = NavBot(fixture=REF_CLIP)
+        cb_t2 = FakeCallback(f"sarch:play:{dead_id}:sad:tears:0", bot_t2)
+        await playh2(cb_t2, cfg, FakeState())
+        row_t2 = sarch.get_clip(dead_id)
+        check("refresh: failed refresh leaves the stored URL untouched",
+              row_t2 and row_t2.get("source_url")
+              == "https://dead.invalid/old2.mp4?token=expired"
+              and row_t2.get("last_error") == "badge_failed",
+              f"url={row_t2 and row_t2.get('source_url')} "
+              f"err={row_t2 and row_t2.get('last_error')}")
+    finally:
+        _mw2.apply_waveframe_badge = _real_badge2
+        _mw2.overlay_outro = _real_outro2
+        feed.refresh_aparat_file_link = _real_refresh
 
     fails = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} PASS")

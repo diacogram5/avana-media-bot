@@ -890,6 +890,24 @@ def set_clip_file_id(clip_id: int, file_id: str) -> bool:
         return False
 
 
+def set_clip_source_url(clip_id: int, source_url: str) -> bool:
+    """Replace a clip's stored source_url (e.g. after refreshing an
+    expired Aparat file_link). Never raises."""
+    if not source_url:
+        return False
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        conn.execute("UPDATE story_archive SET source_url=? WHERE id=?",
+                     (source_url, clip_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("set_clip_source_url failed: %s", e)
+        return False
+
+
 def approve_clip(clip_id: int, by: str = "admin") -> bool:
     """Approve a pending clip: apply the stored suggestion (if any) as its
     final category, mark status='active'.
@@ -1879,11 +1897,36 @@ def register_story_archive_handlers(router) -> None:
             async with _wm_sem():
                 src = os.path.join(tmpd, "src.mp4")
                 out = os.path.join(tmpd, "badged.mp4")
-                from .clip_feed import download_url_to_file
+                from .clip_feed import (download_url_to_file,
+                                        refresh_aparat_file_link)
                 loop = asyncio.get_running_loop()
                 _p, _e = await loop.run_in_executor(
                     None, download_url_to_file, clip["source_url"], src,
                     BOT_API_DOWNLOAD_LIMIT)
+                if not _p and _e != "too_large":
+                    # Aparat file_link tokens expire: a clip stored hours
+                    # ago can fail at delivery with a dead URL (clip #193,
+                    # 2026-11-07 — badge download AND raw-URL fallback
+                    # both failed). Refresh the link via the show API
+                    # once and retry the download; the raw-URL fallback
+                    # below then also uses the fresh link. One retry
+                    # only; a failed refresh falls through unchanged.
+                    _fk = (clip.get("feed_key") or "")
+                    if _fk.startswith("ap:"):
+                        try:
+                            _fresh = await loop.run_in_executor(
+                                None, refresh_aparat_file_link, _fk[3:])
+                        except Exception:
+                            _fresh = ""
+                        if _fresh and _fresh != clip.get("source_url"):
+                            _log.warning(
+                                "feed source_url refreshed (%s); "
+                                "retrying download", clip.get("id"))
+                            set_clip_source_url(clip["id"], _fresh)
+                            clip["source_url"] = _fresh
+                            _p, _e = await loop.run_in_executor(
+                                None, download_url_to_file, _fresh, src,
+                                BOT_API_DOWNLOAD_LIMIT)
                 if not _p:
                     raise RuntimeError(f"feed download failed: {_e}")
 
