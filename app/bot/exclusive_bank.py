@@ -51,8 +51,19 @@ from pathlib import Path
 _log = logging.getLogger("avana.exclusive_bank")
 
 # --- fingerprint gates (measured 2026-11-07, see module docstring) ---
+# Chromaprint needs a ~2.5s warm-up (a 2s sample yields ZERO items) and
+# then ~8 items/s, so the old single gate (sim>=0.75 AND >=15 items) made
+# every sample shorter than ~5s unmatchable BY DESIGN — the 2026-11-07
+# real-Telegram failure (a registered song was not identified from a short
+# sample). Measured on real music (reference clip = song A, valentine
+# clip = song B):
+#   TRUE  matches: 3s 0.969 / 4s 0.949 / 4s-opus32k 0.943 / 5s 0.944 / 8s 0.938
+#   FALSE matches (other song): 3s 0.656 / 4s 0.634 / 5s 0.574 / 8s 0.579 / 15s 0.533
+# The tiers keep that separation: the shorter the query, the higher the
+# similarity it must reach, so an uncertain result never sends a wrong file.
 MATCH_MIN_SIM = 0.75
-MATCH_MIN_ITEMS = 15
+MATCH_MIN_ITEMS = 3  # below this fpcalc emits nothing trustworthy
+MATCH_TIERS = ((15, 0.75), (8, 0.90), (3, 0.95))  # (min_items, min_sim), longest first
 DUP_MIN_SIM = 0.95
 FP_MAX_SECONDS = 900          # fingerprint the whole song (admin add)
 FP_SAMPLE_MAX_SECONDS = 120   # identify-time samples are short anyway
@@ -88,7 +99,7 @@ CREATE INDEX IF NOT EXISTS idx_xb_active ON exclusive_songs(active);
 
 _xb_conn = None
 _xb_ok = None
-_tables_ready = False
+_tables_ready_for: set = set()
 
 
 def _get_conn():
@@ -121,13 +132,16 @@ def _get_conn():
 
 
 def _init_tables(conn) -> None:
-    global _tables_ready
-    if _tables_ready:
+    # Per-connection, not per-process: a second connection (tests, or a
+    # re-created Turso connection after a reconnect) must get its own DDL.
+    # The DDL itself is idempotent (CREATE TABLE/INDEX IF NOT EXISTS).
+    key = id(conn)
+    if key in _tables_ready_for:
         return
     for stmt in (s.strip() for s in _TABLE_DDL.split(";") if s.strip()):
         conn.execute(stmt)
     conn.commit()
-    _tables_ready = True
+    _tables_ready_for.add(key)
 
 
 def bank_available() -> bool:
@@ -243,11 +257,18 @@ def match_against(query_items, songs):
 
     ``songs``: iterable of dicts with keys id/title/artist/fingerprint
     (comma-separated ints). Returns (song, similarity) for the best
-    CONFIDENT match, else (None, best_similarity_seen). The gate is the
-    whole point: below it, there is no match at all.
+    CONFIDENT match, else (None, best_similarity_seen). The gate is
+    tiered by query length (see MATCH_TIERS): a 5s+ sample needs
+    sim>=0.75, a 4s sample needs sim>=0.90, a 3s sample needs
+    sim>=0.95. Below 3 items there is no trustworthy match at all.
     """
     if not query_items or len(query_items) < MATCH_MIN_ITEMS:
         return None, 0.0
+    min_sim = MATCH_MIN_SIM
+    for need, sim in MATCH_TIERS:
+        if len(query_items) >= need:
+            min_sim = sim
+            break
     best_song, best_sim = None, 0.0
     for song in songs:
         try:
@@ -259,7 +280,7 @@ def match_against(query_items, songs):
         sim, _off, _n = best_match(query_items, stored)
         if sim > best_sim:
             best_sim, best_song = sim, song
-    if best_song is not None and best_sim >= MATCH_MIN_SIM:
+    if best_song is not None and best_sim >= min_sim:
         return best_song, best_sim
     return None, best_sim
 
@@ -520,17 +541,34 @@ def match_sample(conn, query_items):
 
     Returns (song, similarity) or (None, best_similarity). Never raises;
     an empty bank or any error means 'no match' (caller falls through).
+    Songs without a usable fingerprint are counted and skipped (never
+    silently treated as a miss); every check is logged so the bank's
+    activity is provable from the Render logs.
     """
     try:
         songs = list_songs(conn, active_only=True)
     except Exception as e:
         _log.warning("exclusive_bank: match_sample list failed: %s", e)
         return None, 0.0
+    skipped, usable = 0, []
+    for s in songs:
+        n = len([x for x in (s.get("fingerprint") or "").split(",") if x])
+        if n < MATCH_MIN_ITEMS:
+            skipped += 1
+        else:
+            usable.append(s)
+    if skipped:
+        _log.warning("exclusive_bank: match_sample skipped %d active song(s) "
+                     "with no usable fingerprint", skipped)
     try:
-        return match_against(query_items, songs)
+        song, sim = match_against(query_items, usable)
     except Exception as e:
         _log.warning("exclusive_bank: match_against failed: %s", e)
         return None, 0.0
+    _log.info("exclusive_bank: match_sample items=%d songs=%d skipped=%d "
+              "best_sim=%.3f matched=%s",
+              len(query_items or []), len(usable), skipped, sim, bool(song))
+    return song, sim
 
 
 def exclusive_card_text(song) -> str:
@@ -538,12 +576,113 @@ def exclusive_card_text(song) -> str:
     which the standing rule requires on everything the bot sends). The
     bitrate shown is the MEASURED one — never a claimed 320."""
     kbps = int(song.get("bitrate_kbps") or 0)
-    quality = f"MP3 {kbps}kbps" if kbps else "MP3"
-    return (f"🎵 {song['title']}\n"
-            f"🎤 {song['artist']}\n"
-            f"💎 نسخه اختصاصی آوانو\n"
-            f"🎧 کیفیت: {quality}\n"
+    quality = f"{kbps}kbps" if kbps else "نامشخص"
+    return (f"🎵 آهنگ در بانک اختصاصی آوانو شناسایی شد!\n"
+            f"\n"
+            f"🎤 {song['artist']} — {song['title']}\n"
+            f"💎 نسخه کامل اختصاصی آوانو\n"
+            f"🎧 کیفیت واقعی: {quality}\n"
             f"\n@AvanoMediaBot")
+
+
+# ---------------------------------------------------------------------------
+# Bank health audit + fingerprint repair (user order 2026-11-07)
+# ---------------------------------------------------------------------------
+
+def audit_bank(conn):
+    """DB-only health audit of every bank row. Never raises, changes nothing.
+
+    Returns a list of dicts {id, title, artist, status, detail}:
+    'ok' (usable fingerprint) | 'no_fingerprint' | 'partial' (2 MB head
+    only — only the start of the song is identifiable) | 'no_file' |
+    'duplicate' (same normalized title+artist as an earlier row).
+    Nothing is deleted here — the admin repair handler decides.
+    """
+    songs = list_songs(conn, active_only=False)
+    seen, out = {}, []
+    for s in songs:
+        n = len([x for x in (s.get("fingerprint") or "").split(",") if x])
+        key = (_norm(s.get("title")), _norm(s.get("artist")))
+        if not s.get("file_id"):
+            status, detail = "no_file", "فایل ذخیره نشده"
+        elif n < MATCH_MIN_ITEMS:
+            status, detail = "no_fingerprint", "اثر انگشت ندارد"
+        elif s.get("fp_partial"):
+            status, detail = "partial", "اثر انگشت جزئی (فقط ابتدای آهنگ)"
+        else:
+            status, detail = "ok", f"{n} اثر انگشت"
+        if key in seen:
+            status, detail = "duplicate", f"تکراریِ «{seen[key]}»"
+        else:
+            seen[key] = s.get("title")
+        out.append({"id": s["id"], "title": s.get("title", ""),
+                    "artist": s.get("artist", ""), "status": status,
+                    "detail": detail, "fp_partial": bool(s.get("fp_partial"))})
+    return out
+
+
+def update_song_fingerprint(conn, song_id, fp_items, fp_duration, fp_partial=False):
+    """Replace a song's stored fingerprint (repair path). Never raises."""
+    try:
+        conn.execute("UPDATE exclusive_songs SET fingerprint=?, fp_duration=?, "
+                     "fp_partial=? WHERE id=?",
+                     (fp_items, fp_duration, 1 if fp_partial else 0, song_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.warning("exclusive_bank: update_song_fingerprint failed: %s", e)
+        return False
+
+
+async def repair_fingerprint(bot, token, conn, song_id):
+    """Download a stored bank file and (re)generate its fingerprint.
+
+    Same download pattern as the add flow: full file via Bot API when
+    <=20 MB, else the first-2 MB Range head (flagged partial). Returns
+    (ok, detail). Never raises, never deletes the row: an unreachable
+    file is reported, not removed.
+    """
+    try:
+        song = get_song(conn, song_id)
+        if song is None:
+            return False, "یافت نشد"
+        if not song.get("file_id"):
+            return False, "فایل ذخیره نشده"
+        import asyncio as _asyncio
+        import io as _io
+        size = int(song.get("file_size") or 0)
+        data, partial = None, False
+        try:
+            tg_file = await bot.get_file(song["file_id"])
+            file_path = tg_file.file_path
+        except Exception:
+            return False, "فایل در تلگرام در دسترس نیست"
+        if size and size <= 20 * 1024 * 1024:
+            try:
+                buf = _io.BytesIO()
+                await bot.download_file(file_path, buf)
+                data = buf.getvalue()
+            except Exception:
+                data = None
+        if not data:
+            data = await _asyncio.get_running_loop().run_in_executor(
+                None, download_head, token, file_path)
+            partial = True
+        if not data:
+            return False, "دانلود فایل ممکن نشد"
+        info = await _asyncio.get_running_loop().run_in_executor(
+            None, analyse_audio_bytes, data)
+        if not info.get("fp_items"):
+            return False, "اثر انگشت ساخته نشد"
+        ok = update_song_fingerprint(conn, song_id, info["fp_items"],
+                                     info["fp_duration"], partial)
+        if not ok:
+            return False, "ذخیره اثر انگشت ممکن نشد"
+        n = len(info["fp_items"].split(","))
+        return True, f"اثر انگشت ساخته شد ({n} مورد)" + (" — جزئی" if partial else "")
+    except Exception as e:
+        _log.warning("exclusive_bank: repair_fingerprint failed: %s", e)
+        return False, "خطای داخلی"
 
 # ---------------------------------------------------------------------------
 # Admin handlers (lazy aiogram; owner-only; inside the existing admin panel)
@@ -622,6 +761,7 @@ def register_exclusive_bank_handlers(router) -> None:
             rows.append([_btn(f"{mark} {s['title']} — {s['artist']}",
                               f"xbank:view:{s['id']}")])
         rows.append([_btn("➕ افزودن آهنگ", "xbank:add")])
+        rows.append([_btn("🔍 بررسی سلامت بانک", "xbank:audit")])
         rows.append([_btn("🔙 بازگشت", "adm:panel")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -651,6 +791,40 @@ def register_exclusive_bank_handlers(router) -> None:
             return
         await callback.answer()
         await _show_panel(callback, config)
+
+    @router.callback_query(F.data == "xbank:audit")
+    async def xbank_audit(callback: CallbackQuery, config):
+        if not _is_owner_cb(callback, config):
+            await callback.answer("⛔", show_alert=True)
+            return
+        conn = _get_conn()
+        if conn is None:
+            await callback.answer("بانک در دسترس نیست.", show_alert=True)
+            return
+        await callback.answer("⏳ در حال بررسی بانک…")
+        rows = audit_bank(conn)
+        tok = getattr(config, "bot_token", "") or ""
+        lines = ["🔍 سلامت بانک اختصاصی آوانو", ""]
+        for r in rows:
+            tag = f"«{r['title']}» — {r['artist']}"
+            if r["status"] == "ok":
+                lines.append(f"✅ {tag}: {r['detail']}")
+            elif r["status"] == "partial":
+                lines.append(f"⚠️ {tag}: {r['detail']}")
+            elif r["status"] == "duplicate":
+                lines.append(f"⚠️ {tag}: {r['detail']} — حذف نشد")
+            elif r["status"] == "no_file":
+                lines.append(f"❌ {tag}: فایل ذخیره نشده — حذف نشد")
+            elif r["status"] == "no_fingerprint":
+                ok, why = await repair_fingerprint(callback.bot, tok, conn, r["id"])
+                if ok:
+                    lines.append(f"🔧 {tag}: {why}")
+                else:
+                    lines.append(f"❌ {tag}: {why} — حذف نشد")
+        if not rows:
+            lines.append("بانک خالی است.")
+        await callback.message.edit_text("\n".join(lines),
+                                         reply_markup=_panel_kb(list_songs(conn)))
 
     @router.callback_query(F.data.startswith("xbank:view:"))
     async def xbank_view(callback: CallbackQuery, config):

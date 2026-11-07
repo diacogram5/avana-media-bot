@@ -1872,16 +1872,23 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                 match_sample as _xb_match, _get_conn as _xb_conn)
             import asyncio as _asyncio
             _xb_items = None
+            _xb_fp_failed = False
             try:
                 _xb_bytes = wav if wav is not None else data
                 _dur, _xb_items = await _asyncio.get_running_loop().run_in_executor(
                     None, _xb_fingerprint, _xb_bytes,
                     ".wav" if wav is not None else ".bin")
-            except Exception:
-                _xb_items = None
+            except Exception as _fe:
+                _xb_fp_failed = True
+                log_event(log, "identify_stage", stage="exclusive_bank",
+                          ok=False,
+                          reason=f"fingerprint_failed:{type(_fe).__name__}")
             if _xb_items:
                 _xb_c = _xb_conn()
-                if _xb_c is not None:
+                if _xb_c is None:
+                    log_event(log, "identify_stage", stage="exclusive_bank",
+                              ok=False, reason="bank_unavailable")
+                else:
                     _song, _sim = _xb_match(_xb_c, _xb_items)
                     if _song is not None:
                         log_event(log, "identify_stage", stage="exclusive_bank",
@@ -1896,6 +1903,16 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                         return AudioIdResult(status="identified",
                                              title=_song["title"],
                                              artist=_song["artist"])
+                    # No match is logged too (with the best similarity and
+                    # the query size): a silent bank check is how the
+                    # 2026-11-07 short-sample failure stayed invisible.
+                    log_event(log, "identify_stage", stage="exclusive_bank",
+                              ms=int((_time.time() - t0) * 1000),
+                              status="no_match", sim=round(_sim, 3),
+                              items=len(_xb_items))
+            elif not _xb_fp_failed:
+                log_event(log, "identify_stage", stage="exclusive_bank",
+                          ok=False, reason="fingerprint_empty")
         except Exception as _e:
             log_event(log, "identify_stage", stage="exclusive_bank",
                       ok=False, reason=f"bank_check_failed:{type(_e).__name__}")
@@ -3821,16 +3838,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         # claimed identified). A video's audio is extracted to a real,
         # validated MP3 — the user already has the video; the value is a
         # playable audio file. Audio files are already audio and go back
-        # as-is.
+        # as-is. No speculation about the song (no AI-made guess): the
+        # not-found line above already says it plainly.
         try:
-            cap = t("ai_channel_note", ulang)
             if message.video is not None:
-                await _extract_and_send_clip_audio(
-                    message, conn, data,
-                    caption=t("extracted_audio_note", ulang))
+                await _extract_and_send_clip_audio(message, conn, data)
             elif message.audio is not None:
-                sent = await send_song_audio(
-                    message, media.file_id, "", "", caption=cap)
+                sent = await send_song_audio(message, media.file_id, "", "")
                 if sent is not None:
                     _track(conn, message, sent)
         except Exception:

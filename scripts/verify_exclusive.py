@@ -62,6 +62,19 @@ def main():
          "-i", f"{tmp}/A_full.wav", "-b:a", "128k", f"{tmp}/A_5s_128k.mp3"])
     run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "4", "-t", "6",
          "-i", f"{tmp}/B_full.wav", f"{tmp}/B_6s.wav"])
+    # T6 fixtures: short middle excerpts, bot-style mono 22050 WAVs.
+    for dur, off in ((2, 8), (3, 8), (4, 8)):
+        run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(off),
+             "-t", str(dur), "-i", f"{tmp}/A_full.wav", "-ac", "1",
+             "-ar", "22050", f"{tmp}/A_mid_{dur}s.wav"])
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"{tmp}/A_mid_4s.wav",
+         "-c:a", "libopus", "-b:a", "32k", f"{tmp}/A_mid_4s_opus.opus"])
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"{tmp}/A_mid_4s_opus.opus",
+         "-ac", "1", "-ar", "22050", f"{tmp}/A_mid_4s_opus.wav"])
+    for dur in (3, 4, 5, 8, 15):
+        run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2", "-t", str(dur),
+             "-i", f"{tmp}/B_full.wav", "-ac", "1", "-ar", "22050",
+             f"{tmp}/B_{dur}s.wav"])
 
     print("T1 fingerprint matching (real music, vendored fpcalc)")
     check("fpcalc binary present + executable",
@@ -97,8 +110,8 @@ def main():
     check("B excerpt does NOT match song A", m is None, f"sim={sim:.3f}")
     m, sim = xb.match_against(q5, [song_b])
     check("A excerpt does NOT match song B", m is None, f"sim={sim:.3f}")
-    m, sim = xb.match_against([fp_a[0], fp_a[1], fp_a[2]], [song_a])
-    check("too-short query (<15 items) never matches", m is None)
+    m, sim = xb.match_against(fp_a[:2], [song_a])
+    check("too-short query (<3 items) never matches", m is None)
     m, sim = xb.match_against([], [song_a])
     check("empty query never matches", m is None)
 
@@ -187,14 +200,72 @@ def main():
     print("T5 delivery card (exact format, measured bitrate)")
     card = xb.exclusive_card_text(
         {"title": "تردید", "artist": "سامان جلیلی", "bitrate_kbps": 320})
-    check("card is the specified 4 lines + bot id",
-          card == ("🎵 تردید\n🎤 سامان جلیلی\n💎 نسخه اختصاصی آوانو\n"
-                   "🎧 کیفیت: MP3 320kbps\n\n@AvanoMediaBot"),
+    check("card is the specified format + bot id",
+          card == ("🎵 آهنگ در بانک اختصاصی آوانو شناسایی شد!\n\n"
+                   "🎤 سامان جلیلی — تردید\n"
+                   "💎 نسخه کامل اختصاصی آوانو\n"
+                   "🎧 کیفیت واقعی: 320kbps\n\n@AvanoMediaBot"),
           repr(card))
     card192 = xb.exclusive_card_text(
         {"title": "X", "artist": "Y", "bitrate_kbps": 192})
     check("non-320 file shows its REAL bitrate, never 320",
-          "MP3 192kbps" in card192 and "320" not in card192, repr(card192))
+          "192kbps" in card192 and "320" not in card192, repr(card192))
+
+    print("T6 tiered gate: short samples match, other songs never do")
+    _d, q3 = xb.fingerprint_file(f"{tmp}/A_mid_3s.wav")
+    _d, q4 = xb.fingerprint_file(f"{tmp}/A_mid_4s.wav")
+    _d, q2 = xb.fingerprint_file(f"{tmp}/A_mid_2s.wav")
+    q2 = q2 or []  # fingerprint_file returns None when nothing is emitted
+    _d, q4opus = xb.fingerprint_file(f"{tmp}/A_mid_4s_opus.wav")
+    check("3s middle excerpt has only a few items (fpcalc warm-up)",
+          0 < len(q3) <= 7, f"items={len(q3)}")
+    m, sim = xb.match_against(q3, [song_a, song_b])
+    check("3s middle excerpt matches song A (tier sim>=0.95)",
+          m is not None and m["id"] == 1, f"sim={sim:.3f}")
+    m, sim = xb.match_against(q4, [song_a, song_b])
+    check("4s middle excerpt matches song A (tier sim>=0.90)",
+          m is not None and m["id"] == 1, f"sim={sim:.3f}")
+    m, sim = xb.match_against(q4opus, [song_a, song_b])
+    check("4s voice-like Opus excerpt matches song A",
+          m is not None and m["id"] == 1, f"sim={sim:.3f}")
+    check("2s excerpt yields no usable fingerprint",
+          len(q2) < 3, f"items={len(q2)}")
+    m, sim = xb.match_against(q2, [song_a, song_b])
+    check("2s excerpt honestly never matches", m is None)
+    for dur in (3, 4, 5, 8, 15):
+        _d, qf = xb.fingerprint_file(f"{tmp}/B_{dur}s.wav")
+        m, sim = xb.match_against(qf, [song_a])
+        check(f"other song {dur}s excerpt does NOT match A",
+              m is None, f"sim={sim:.3f}")
+
+    print("T6b audit + fingerprint repair (in-memory sqlite)")
+    conn2 = sqlite3.connect(":memory:")
+    sid_ok = xb.add_song(conn2, title="تردید", artist="سامان جلیلی",
+                         file_id="fileA", file_unique_id="uqA",
+                         duration_sec=18.0, bitrate_kbps=320, file_size=735652,
+                         fingerprint=",".join(map(str, fp_a)),
+                         fp_duration=dur_a or 0, fp_partial=False)
+    sid_nofp = xb.add_song(conn2, title="بی‌اثر", artist="نامشخص",
+                           file_id="fileX", file_unique_id="uqX",
+                           duration_sec=200.0, bitrate_kbps=320,
+                           file_size=8000000,
+                           fingerprint="", fp_duration=0, fp_partial=False)
+    rows = xb.audit_bank(conn2)
+    by_id = {r["id"]: r for r in rows}
+    check("audit flags the fingerprint-less song",
+          by_id[sid_nofp]["status"] == "no_fingerprint")
+    check("audit passes the healthy song",
+          by_id[sid_ok]["status"] == "ok")
+    ok = xb.update_song_fingerprint(conn2, sid_nofp,
+                                    ",".join(map(str, fp_b)), 21.0)
+    check("repair stores a fingerprint", ok)
+    rows = xb.audit_bank(conn2)
+    by_id = {r["id"]: r for r in rows}
+    check("audit passes the repaired song",
+          by_id[sid_nofp]["status"] == "ok")
+    m, sim = xb.match_sample(conn2, q5)
+    check("match_sample still finds A after repair",
+          m is not None and m["title"] == "تردید", f"sim={sim:.3f}")
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
