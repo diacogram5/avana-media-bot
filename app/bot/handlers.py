@@ -3460,7 +3460,6 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         # page fetches and resolve time).
         _resolved = None
         if outcome.kind == "instagram":
-            import time as _time
             _rt = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
