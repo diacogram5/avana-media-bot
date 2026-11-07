@@ -485,7 +485,7 @@ def render_queue(jobs: list[dict], lang: str = "fa") -> str:
 _JOB_COLUMNS = (
     "id", "user_id", "url", "source", "content_type", "status", "stage",
     "progress", "formats_json", "chosen_format", "result_file_id",
-    "result_url", "error", "created_at", "updated_at",
+    "result_url", "audio_url", "error", "created_at", "updated_at",
 )
 
 

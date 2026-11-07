@@ -14,6 +14,11 @@ from .config import get_config
 
 def main() -> int:
     config = get_config()
+    if not config.has_token:
+        print("خطا: BOT_TOKEN تنظیم نشده است. فایل .env را از روی .env.example بسازید و توکن BotFather را وارد کنید.")
+        # Exit non-zero so Render restarts and the dead-bot state is
+        # visible instead of reporting the service Live.
+        return 2
     try:
         asyncio.run(run_bot(config))
     except KeyboardInterrupt:

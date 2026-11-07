@@ -380,6 +380,13 @@ def test_job_crud_roundtrip(db):
     update_job(db, job_id, status="working", progress=42)
     job = get_job(db, job_id)
     assert job["status"] == "working" and job["progress"] == 42
+    # audio_url survives a get_job round-trip (Instagram DASH mux):
+    # a fresh job defaults to "" and an updated value is kept, so
+    # run_job's fetch_merged_video branch can actually run.
+    assert job["audio_url"] == ""
+    update_job(db, job_id, audio_url="https://cdn.example.com/a.mp3")
+    job = get_job(db, job_id)
+    assert job["audio_url"] == "https://cdn.example.com/a.mp3"
     jobs = list_jobs(db, 7)
     assert len(jobs) == 1 and jobs[0]["id"] == job_id
     assert list_jobs(db, 8) == []

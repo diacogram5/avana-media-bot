@@ -1578,11 +1578,14 @@ async def _extract_and_send_clip_audio(message, conn, data: bytes,
     try:
         if not data:
             return None
-        if has_audio_stream(data) is False:
+        # ffprobe/ffmpeg run in a thread: the sync subprocess calls
+        # (ffprobe timeout 30 s, ffmpeg timeout 180 s) must never block
+        # the event loop (same pattern as instagram.py fetch_merged_video).
+        if await asyncio.to_thread(has_audio_stream, data) is False:
             return None
-        src_br, _dur = probe_audio(data, "mp4")
+        src_br, _dur = await asyncio.to_thread(probe_audio, data, "mp4")
         target = 320 if (src_br or 0) >= 300 else max(96, src_br or 128)
-        conv = transcode_mp3(data, "mp4", target)
+        conv = await asyncio.to_thread(transcode_mp3, data, "mp4", target)
         mp3 = conv[0] if conv[0] else None
         if not mp3:
             return None
@@ -1703,7 +1706,7 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 return
             # Distinct honest cause when the video provably has no audio track.
             try:
-                audible = has_audio_stream(data)
+                audible = await asyncio.to_thread(has_audio_stream, data)
             except Exception:
                 audible = None
             if audible is False:
@@ -1834,7 +1837,11 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # Stage 1: validation gate (keeps the signable WAV for the lookup).
     t0 = _time.time()
     try:
-        analysis, wav = analyze_audio_with_wav(data)
+        # Sync ffmpeg transcode + pure-Python WAV analysis run in the
+        # default executor so identification never blocks the event
+        # loop (same pattern as the fpcalc call below).
+        analysis, wav = await asyncio.get_running_loop().run_in_executor(
+            None, analyze_audio_with_wav, data)
     except Exception as exc:
         log_event(log, "identify_stage", stage="validate", ok=False,
                   reason=f"analyze_crashed:{type(exc).__name__}")
@@ -2135,6 +2142,21 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
         if _shortcode in (url or ""):
             log_event(log, "identify", stage="hardcoded_hit",
                       shortcode=_shortcode, title=_t[:40])
+            # Cache the hit so the tap path finds it: video_identify's
+            # url-key pre-check consults url:{entry audio_url} (the
+            # resolved media audio URL), and repeat link identifies
+            # consult url:{reel URL}. No hash: key can be stored here —
+            # the content hash is sha256 of audio bytes, and this branch
+            # downloads nothing (heard_bytes is empty by design).
+            if conn is not None:
+                try:
+                    dbmod.set_identify_cache(conn, f"url:{url}",
+                                             "identified", _t, _a)
+                    if resolved is not None and resolved[0]:
+                        dbmod.set_identify_cache(conn, f"url:{resolved[0]}",
+                                                 "identified", _t, _a)
+                except Exception:
+                    pass
             # Return as identified (status, title, artist, needs_file, page_text, heard_bytes)
             # heard_bytes empty - the caller will still download video for the user
             return ("identified", _t, _a, False, "", b"")
@@ -4594,7 +4616,9 @@ async def run_bot(config: Config) -> None:
 
     if not config.has_token:
         print("خطا: BOT_TOKEN تنظیم نشده است. فایل .env را از روی .env.example بسازید و توکن BotFather را وارد کنید.")
-        return
+        # Fail loudly: a silent return makes main() exit 0 and Render
+        # reports the service Live while the bot is dead.
+        raise SystemExit(2)
     conn = init_db(config.db_path)
     # Web admin panel runs alongside polling, only with a token set.
     web = None
