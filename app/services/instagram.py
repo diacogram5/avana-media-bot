@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .. import timing as _timing
 from ..logging_config import get_logger, log_event
 from .link_media import (
     extract_dash_audio_url,
@@ -168,7 +169,8 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
 
 async def fetch_merged_video(video_url: str, audio_url: str | None = None,
                              timeout: int = 40,
-                             max_mb: int = 50) -> tuple[bytes, bool]:
+                             max_mb: int = 50,
+                             req_id: str | None = None) -> tuple[bytes, bool]:
     """Download an Instagram DASH video stream and, when available, its
     separate audio stream, then mux both into a single MP4 with ffmpeg.
 
@@ -183,7 +185,6 @@ async def fetch_merged_video(video_url: str, audio_url: str | None = None,
     video path is preserved.
     """
     import asyncio as _asyncio
-    import subprocess as _sp
     import tempfile as _tf
     import time as _time
 
@@ -227,18 +228,20 @@ async def fetch_merged_video(video_url: str, audio_url: str | None = None,
             vp, ap, op = (f"{tmp}/v.mp4", f"{tmp}/a.m4a", f"{tmp}/out.mp4")
             open(vp, "wb").write(video_data)
             open(ap, "wb").write(audio_data)
-            r = _sp.run(
+            r = _timing.run(
                 ["ffmpeg", "-y", "-v", "error",
                  "-i", vp, "-i", ap,
                  "-c:v", "copy", "-c:a", "aac",
                  "-shortest", "-movflags", "+faststart", op],
+                req_id=req_id, logger=log, stage="ffmpeg_mux",
                 capture_output=True, timeout=120)
             if r.returncode != 0 or not __import__("os").path.exists(op):
                 return b""
             # Validate: the muxed file must really carry an audio stream.
-            p = _sp.run(
+            p = _timing.run(
                 ["ffprobe", "-v", "error", "-show_entries",
                  "stream=codec_type", "-of", "csv=p=0", op],
+                req_id=req_id, logger=log,
                 capture_output=True, timeout=30)
             types = p.stdout.decode(errors="replace")
             if "audio" not in types or "video" not in types:

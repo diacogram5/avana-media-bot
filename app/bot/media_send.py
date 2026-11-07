@@ -20,14 +20,17 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 
 from aiogram.types import BufferedInputFile, LinkPreviewOptions, Message
 
 from .audio_send import _safe_filename_part, detect_audio_ext
+from .. import timing as _timing
 from ..i18n import t
+from ..logging_config import get_logger
+
+log = get_logger(__name__)
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -81,11 +84,12 @@ def probe_audio(data: bytes, ext: str) -> tuple[int | None, float | None]:
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as fh:
                 fh.write(data)
                 path = fh.name
-            proc = subprocess.run(
+            proc = _timing.run(
                 ["ffprobe", "-v", "error", "-select_streams", "a:0",
                  "-show_entries",
                  "stream=bit_rate,duration:format=bit_rate,duration",
                  "-of", "json", path],
+                logger=log,
                 timeout=30, capture_output=True, text=True)
             if proc.returncode == 0:
                 import json as _json
@@ -136,9 +140,10 @@ def has_audio_stream(data: bytes) -> bool | None:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as fh:
             fh.write(data)
             path = fh.name
-        proc = subprocess.run(
+        proc = _timing.run(
             ["ffprobe", "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            logger=log,
             timeout=30, capture_output=True, text=True)
         if proc.returncode == 0:
             return bool(proc.stdout.strip())
@@ -172,9 +177,10 @@ def transcode_mp3(data: bytes, src_ext: str,
             src_path = src.name
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as dst:
             dst_path = dst.name
-        proc = subprocess.run(
+        proc = _timing.run(
             ["ffmpeg", "-y", "-v", "error", "-i", src_path,
              "-codec:a", "libmp3lame", "-b:a", f"{target_kbps}k", dst_path],
+            logger=log,
             timeout=180, capture_output=True)
         if proc.returncode == 0:
             with open(dst_path, "rb") as fh:

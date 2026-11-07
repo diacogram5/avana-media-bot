@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
+
+from .. import timing as _timing
 
 from ..bot.logic import (
     carries_version_tokens,
@@ -98,7 +101,11 @@ def _download(query: str, artist: str, title: str,
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
                                "socket_timeout": 20, "retries": 1}) as ydl:
+            _t_ydl = time.perf_counter()
             info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            _timing.log_subprocess(log, None, "yt-dlp",
+                                   (time.perf_counter() - _t_ydl) * 1000,
+                                   op="ytsearch")
             for e in ((info or {}).get("entries") or [])[:5]:
                 url = e.get("webpage_url") or e.get("id") or ""
                 if url:
@@ -141,7 +148,13 @@ def _download(query: str, artist: str, title: str,
             }
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
+                    _t_ydl = time.perf_counter()
                     info2 = ydl.extract_info(cand["url"], download=True)
+                    _timing.log_subprocess(log, None, "yt-dlp",
+                                           (time.perf_counter() - _t_ydl) * 1000,
+                                           op="download",
+                                           candidate_idx=idx,
+                                           player_client=player_client)
                     if not info2:
                         continue
                     for f in os.listdir(tmpdir):

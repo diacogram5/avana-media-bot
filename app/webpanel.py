@@ -44,6 +44,17 @@ def make_handler(db_path, config):
             self.wfile.write(data)
 
         def do_GET(self):
+            # Public liveness probe for an external uptime pinger
+            # (logs deploy): NO auth, NO database, NO Turso — returns
+            # 200 "ok" immediately. Must stay FIRST, before _auth().
+            if urllib.parse.urlparse(self.path).path == "/health":
+                data = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if not self._auth():
                 self._send("<h1>⛔ دسترسی غیرمجاز</h1>", 403); return
             conn = self._conn()

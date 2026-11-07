@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import shutil
 import struct
-import subprocess
 from dataclasses import dataclass
 
+from .. import timing as _timing
 from ..logging_config import get_logger, log_event
 
 log = get_logger(__name__)
@@ -82,7 +82,8 @@ async def _recognize_bytes(data: bytes) -> tuple[dict | None, bool]:
             pass
 
 
-def transcode_to_wav(data: bytes, max_seconds: int = 90) -> bytes | None:
+def transcode_to_wav(data: bytes, max_seconds: int = 90,
+                     req_id: str | None = None) -> bytes | None:
     """Transcode arbitrary audio bytes to Shazam-signable WAV.
 
     Root-cause fix (2026-10-29): shazamio's signature core rejects AAC
@@ -104,10 +105,11 @@ def transcode_to_wav(data: bytes, max_seconds: int = 90) -> bytes | None:
     tmp_path = tmp.name
     tmp.close()
     try:
-        proc = subprocess.run(
+        proc = _timing.run(
             [ffmpeg, "-v", "error", "-y", "-i", "pipe:0",
              "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le",
              "-t", str(max_seconds), "-f", "wav", tmp_path],
+            req_id=req_id, logger=log, stage="ffmpeg_transcode",
             input=data, capture_output=True, timeout=90)
         if proc.returncode != 0:
             log_event(log, "transcode_failed",
@@ -132,7 +134,7 @@ def transcode_to_wav(data: bytes, max_seconds: int = 90) -> bytes | None:
             pass
 
 
-def analyze_audio_with_wav(data: bytes) -> tuple:
+def analyze_audio_with_wav(data: bytes, req_id: str | None = None) -> tuple:
     """Validate extracted audio AND keep the signable WAV.
 
     Speed: the WAV produced here (mono 22050Hz PCM) is exactly what the
@@ -142,7 +144,7 @@ def analyze_audio_with_wav(data: bytes) -> tuple:
     ``analyze_audio``'s; wav is None when ffmpeg is missing or the
     transcode failed.
     """
-    wav = transcode_to_wav(data, max_seconds=120)
+    wav = transcode_to_wav(data, max_seconds=120, req_id=req_id)
     if wav is None:
         if shutil.which("ffmpeg") is None:
             return ({"ok": True, "reason": "unverified_no_ffmpeg",
@@ -244,7 +246,7 @@ def wav_time_slice(wav: bytes, start_frac: float, end_frac: float):
         return None
 
 
-def analyze_audio(data: bytes) -> dict:
+def analyze_audio(data: bytes, req_id: str | None = None) -> dict:
     """Validate extracted audio before it reaches the lookup service.
 
     Returns {ok, reason, duration_s, sample_rate, channels, rms_db}.
@@ -252,12 +254,13 @@ def analyze_audio(data: bytes) -> dict:
     unverified_no_ffmpeg. An unsuitable sample is reported with its own
     reason — never misreported downstream as "song not identified".
     """
-    analysis, _wav = analyze_audio_with_wav(data)
+    analysis, _wav = analyze_audio_with_wav(data, req_id=req_id)
     return analysis
 
 
 async def identify_bytes_shazam(data: bytes,
-                                prepared_wav: bytes | None = None) -> ShazamIdResult:
+                                prepared_wav: bytes | None = None,
+                                req_id: str | None = None) -> ShazamIdResult:
     """Identify raw audio/video bytes via a Shazam signature.
 
     `data` is the Telegram file bytes or a downloaded media file. When
@@ -288,7 +291,7 @@ async def identify_bytes_shazam(data: bytes,
                 wav = prepared_wav
             else:
                 log_event(log, "shazam_transcode", input_bytes=len(data))
-                wav = transcode_to_wav(data)
+                wav = transcode_to_wav(data, req_id=req_id)
                 if wav:
                     log_event(log, "shazam_transcode_ok", wav_bytes=len(wav))
             if not wav:

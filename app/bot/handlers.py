@@ -46,6 +46,7 @@ from aiogram.types import (
 )
 
 from .. import db as dbmod
+from .. import timing as _timing
 from ..bot.audio_send import send_song_audio
 # NEW (2026-11-03): story clips — independent module. Guarded import so a
 # module bug can never break existing handlers or the main menu.
@@ -1267,7 +1268,8 @@ async def cmd_voice(message: Message, command: CommandObject,
 
 
 async def _send_link_video(message: Message, conn, outcome, config=None,
-                           bot_id: str = "", resolved: tuple | None = None):
+                           bot_id: str = "", resolved: tuple | None = None,
+                           req_id: str | None = None, t_req=None):
     """Send the video of the sent link itself for download — no video search.
 
     Direct public video file: send that same file. Instagram: the real
@@ -1286,8 +1288,11 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
 
     delivery, text = link_video_delivery(outcome)
     if delivery == "direct_video_file":
+        _t_send = _time.perf_counter()
         sent = await send_video(message, outcome.official_url,
                                 caption=t("m_link_video_dl", ulang))
+        _timing.log_stage(log, "link_stage", req_id, t_req, "send_video",
+                          _t_send)
         if sent is not None:
             _track(conn, message, sent)
             await _attach_identify_button(message, conn, sent)
@@ -1296,7 +1301,8 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
         return None
     elif delivery == "platform_official" and outcome.kind == "instagram":
         sent = await _send_instagram_video_file(message, conn, outcome, config,
-                                                resolved=resolved)
+                                                resolved=resolved,
+                                                req_id=req_id, t_req=t_req)
         if sent == _INSTAGRAM_GATED:
             # Dedicated age-gate line; the caller must not overwrite it
             # with the generic card or run identification stages on it.
@@ -1334,7 +1340,9 @@ def _looks_like_audio(data: bytes) -> bool:
 
 async def _send_instagram_video_file(message: Message, conn, outcome,
                                      config=None,
-                                     resolved: tuple | None = None):
+                                     resolved: tuple | None = None,
+                                     req_id: str | None = None,
+                                     t_req=None):
     """Fetch the reel's real video file (anonymous resolver) and send it.
 
     Returns the sent Message, or None when no fetchable video exists —
@@ -1370,7 +1378,7 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         if gating == "age_gated":
             return _INSTAGRAM_GATED
         return None
-    t0 = _time.time()
+    _t_dl = _time.perf_counter()
     max_mb = getattr(config, "max_file_mb", 50) if config is not None else 50
     try:
         from ..services.instagram import fetch_merged_video
@@ -1379,17 +1387,18 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         # both and mux to one MP4 (falls back to video-only when the
         # audio stream is missing — the healthy path is preserved).
         data, _has_audio = await fetch_merged_video(
-            video_url, audio_url, max_mb=max_mb)
+            video_url, audio_url, max_mb=max_mb, req_id=req_id)
     except Exception:
         return None
-    log_event(log, "identify_stage", stage="video_download",
-              ms=int((_time.time() - t0) * 1000), bytes=len(data or b""),
-              has_audio=_has_audio)
+    _timing.log_stage(log, "link_stage", req_id, t_req, "download", _t_dl,
+                      bytes=len(data or b""), has_audio=_has_audio)
     if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
         return None
+    _t_send = _time.perf_counter()
     sent = await send_video(
         message, BufferedInputFile(data, filename="video.mp4"),
         caption=t("m_link_video_dl", ulang))
+    _timing.log_stage(log, "link_stage", req_id, t_req, "send_video", _t_send)
     if sent is not None:
         _track(conn, message, sent)
         # Pass the reel's separate audio-stream URL so the one-click
@@ -1531,7 +1540,8 @@ async def _attach_identify_button(message: Message, conn, sent,
         pass
 
 
-async def _download_link_audio(url: str, config) -> bytes:
+async def _download_link_audio(url: str, config, req_id: str | None = None,
+                               t_req=None) -> bytes:
     """Download a reel's separate audio stream for identification.
 
     Same validation as the video path: size cap, real container bytes —
@@ -1539,13 +1549,13 @@ async def _download_link_audio(url: str, config) -> bytes:
     import time as _time
     headers = {"User-Agent": "Mozilla/5.0",
                "Referer": "https://www.instagram.com/"}
-    t = _time.time()
+    t = _time.perf_counter()
     async with httpx.AsyncClient(timeout=40) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         data = resp.content
-    log_event(log, "identify_stage", stage="download",
-              ms=int((_time.time() - t) * 1000), bytes=len(data or b""))
+    _timing.log_stage(log, "identify_stage", req_id, t_req, "download", t,
+                      bytes=len(data or b""))
     max_mb = getattr(config, "max_file_mb", 50)
     if not data or len(data) > max_mb * 1024 * 1024 \
             or not _looks_like_audio(data):
@@ -1657,6 +1667,11 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         return
     _VIDEO_IDENTIFY_RUNNING.add(token)
     await callback.answer(t("m_identifying_video", ulang))
+    # Timing instrumentation (logs only): one request id per tap.
+    _req_id = _timing.new_req_id()
+    _t_req = _time.perf_counter()
+    _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
+                      _t_req)
     # URL-key cache pre-check: the same audio URL identified before ->
     # skip the download AND the lookup for a stored "identified" result
     # (the link flow stores its result under the reel's audio URL, so a
@@ -1674,6 +1689,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             _ck = None
         if _ck is not None and _ck["status"] == "identified":
             log_event(log, "identify_stage", stage="cache_check", ms=0,
+                      req_id=_req_id,
+                      total_ms=int((_time.perf_counter() - _t_req) * 1000),
                       hit=True, via="url")
             cached_result = AudioIdResult(status="identified",
                                           title=_ck["title"],
@@ -1690,12 +1707,18 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             # file, exactly as before.
             try:
                 if audio_url:
-                    data = await _download_link_audio(audio_url, config)
+                    data = await _download_link_audio(audio_url, config,
+                                                      req_id=_req_id,
+                                                      t_req=_t_req)
                 else:
+                    _t_dl = _time.perf_counter()
                     tg_file = await callback.bot.get_file(entry["file_id"])
                     buf = io.BytesIO()
                     await callback.bot.download_file(tg_file.file_path, buf)
                     data = buf.getvalue()
+                    _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                                      "download", _t_dl,
+                                      bytes=len(data or b""))
             except Exception:
                 await callback.message.answer(
                     t("m_video_fetch_fail", ulang))
@@ -1705,17 +1728,22 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                     t("m_video_invalid", ulang))
                 return
             # Distinct honest cause when the video provably has no audio track.
+            _t_ac = _time.perf_counter()
             try:
                 audible = await asyncio.to_thread(has_audio_stream, data)
             except Exception:
                 audible = None
+            _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                              "audio_check", _t_ac, audible=audible)
             if audible is False:
                 await callback.message.answer(
                     t("m_video_no_audio", ulang))
                 return
             result = await _identify_audio(
                 data, "clip.mp3" if entry.get("kind") == "audio" else "clip.mp4",
-                config, conn, cache_url_key=audio_url)
+                config, conn, cache_url_key=audio_url,
+                req_id=_req_id, t_req=_t_req)
+        _t_send = _time.perf_counter()
         if result.status == "identified":
             # Cache-hit path has no bytes in hand: arm the bank sample
             # from the audio URL (arm_sample downloads it) so the 🔎
@@ -1727,7 +1755,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 callback.message, conn, result.title, result.artist,
                 config, bot_id=dbmod.get_bot_id(conn, config),
                 bank_tok=_tok,
-                own_media=("video", entry["file_id"]))
+                own_media=("video", entry["file_id"]),
+                req_id=_req_id)
         elif result.status == "not_found":
             await _answer_identify_clip_fallback(
                 callback.message, conn, config, data, entry["file_id"])
@@ -1754,12 +1783,19 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             }.get(result.detail)
             await callback.message.answer(
                 _detail_msg or t("audio_error", ulang))
+        _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                          "result_send", _t_send,
+                          status=result.status if result is not None else "error")
     finally:
         _VIDEO_IDENTIFY_RUNNING.discard(token)
+        _timing.log_total(log, "identify_stage", _req_id, _t_req,
+                          result.status if result is not None else "error",
+                          headline_total="click_to_identify_ms")
 
 
 async def _identify_audio(data: bytes, filename: str, config: Config,
-                        conn=None, cache_url_key: str | None = None) -> AudioIdResult:
+                        conn=None, cache_url_key: str | None = None,
+                        req_id: str | None = None, t_req=None) -> AudioIdResult:
     """Shazam signature first (no token), AudD with a token as fallback.
 
     Pipeline stages (each logged with timing; errors carry their stage):
@@ -1787,34 +1823,40 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     import time as _time
     import hashlib as _hashlib
     from ..services.shazam_id import analyze_audio_with_wav, wav_time_slice
-    t0 = _time.time()
-    log_event(log, "identify_stage", stage="input_received",
-              bytes=len(data or b""), filename=filename)
+    # Timing instrumentation (logs only): one request id per identify
+    # call. Callers pass the tap/link request's id so the whole request
+    # groups under it; otherwise a fresh id is generated here.
+    if req_id is None:
+        req_id = _timing.new_req_id()
+    if t_req is None:
+        t_req = _time.perf_counter()
+
+    def _st(stage, t_stage, **extra):
+        _timing.log_stage(log, "identify_stage", req_id, t_req, stage,
+                          t_stage, **extra)
+
+    t0 = _time.perf_counter()
+    _st("input_received", t_req, bytes=len(data or b""), filename=filename)
     if not data:
-        log_event(log, "identify_stage", stage="validate", ok=False,
-                  reason="empty_input")
+        _st("validate", t_req, ok=False, reason="empty_input")
         return AudioIdResult(status="error", detail="undecodable")
     # Stage 0: audio-content-hash cache. Same bytes re-identified ->
     # stored terminal result, skipping download and lookup entirely.
     audio_hash = ""
-    t0 = _time.time()
+    t0 = _time.perf_counter()
     try:
         audio_hash = _hashlib.sha256(data).hexdigest()
         cached = dbmod.get_identify_cache(conn, f"hash:{audio_hash}") \
             if conn is not None else None
     except Exception:
         cached = None
-    log_event(log, "identify_stage", stage="cache_check",
-              ms=int((_time.time() - t0) * 1000),
-              hit=cached is not None)
+    _st("cache_check", t0, hit=cached is not None)
     # A cached "not_found" predates the exclusive bank: the bank may hold
     # this song now, so fall through to the bank-only check below (Stage 1
     # + fingerprint) instead of returning — Shazam is NOT re-run.
     bank_only = False
     if cached is not None:
-        log_event(log, "identify_stage", stage="result_sent",
-                  ms=int((_time.time() - t0) * 1000),
-                  status=cached["status"], cached=True)
+        _st("result_sent", t0, status=cached["status"], cached=True)
         if cached["status"] == "identified":
             return AudioIdResult(status="identified", title=cached["title"],
                                  artist=cached["artist"])
@@ -1835,20 +1877,20 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
             pass
 
     # Stage 1: validation gate (keeps the signable WAV for the lookup).
-    t0 = _time.time()
+    t0 = _time.perf_counter()
     try:
         # Sync ffmpeg transcode + pure-Python WAV analysis run in the
         # default executor so identification never blocks the event
         # loop (same pattern as the fpcalc call below).
+        import functools as _functools
         analysis, wav = await asyncio.get_running_loop().run_in_executor(
-            None, analyze_audio_with_wav, data)
+            None, _functools.partial(analyze_audio_with_wav, data,
+                                     req_id=req_id))
     except Exception as exc:
-        log_event(log, "identify_stage", stage="validate", ok=False,
-                  reason=f"analyze_crashed:{type(exc).__name__}")
+        _st("validate", t_req, ok=False,
+            reason=f"analyze_crashed:{type(exc).__name__}")
         return AudioIdResult(status="error", detail="undecodable")
-    log_event(log, "identify_stage", stage="validate",
-              ms=int((_time.time() - t0) * 1000), wav_reused=wav is not None,
-              **analysis)
+    _st("validate", t0, wav_reused=wav is not None, **analysis)
     if not analysis.get("ok"):
         reason = analysis.get("reason", "undecodable")
         if reason == "undecodable" and data:
@@ -1859,8 +1901,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
             try:
                 if has_audio_stream(data) is False:
                     reason = "silent"
-                    log_event(log, "identify_stage", stage="validate",
-                              ms=0, ok=False, reason="silent_no_stream")
+                    _st("validate", t0, ok=False, reason="silent_no_stream")
             except Exception:
                 pass
         if reason == "undecodable" and data and _XBANK_OK:
@@ -1875,22 +1916,22 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                     inc_identify as _xb_inc,
                     match_sample as _xb_match, _get_conn as _xb_conn)
                 import asyncio as _asyncio
+                import functools as _functools
                 import os as _os
                 _suf = _os.path.splitext(filename or "")[1] or ".bin"
                 _dur, _items = await _asyncio.get_running_loop().run_in_executor(
-                    None, _xb_fingerprint, data, _suf)
+                    None, _functools.partial(_xb_fingerprint, data, _suf,
+                                             req_id=req_id))
                 if _items:
                     _c = _xb_conn()
                     if _c is not None:
-                        _song, _sim = _xb_match(_c, _items)
+                        _song, _sim = _xb_match(_c, _items, req_id=req_id)
                         if _song is not None:
-                            log_event(log, "identify_stage",
-                                      stage="exclusive_bank",
-                                      ms=int((_time.time() - t0) * 1000),
-                                      status="identified", sim=round(_sim, 3),
-                                      title=_song["title"], via="raw_fallback")
+                            _st("exclusive_bank", t0,
+                                status="identified", sim=round(_sim, 3),
+                                title=_song["title"], via="raw_fallback")
                             try:
-                                _xb_inc(_c, _song["id"])
+                                _xb_inc(_c, _song["id"], req_id=req_id)
                             except Exception:
                                 pass
                             _cache_store("identified", _song["title"],
@@ -1909,38 +1950,40 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # fails OPEN: the Shazam -> AudD -> ACRCloud chain runs untouched.
     # `bank_only` (cached not_found) skips that chain after the bank check.
     if _XBANK_OK:
+        _t_bank = _time.perf_counter()
         try:
             from .exclusive_bank import (
                 fingerprint_bytes as _xb_fingerprint,
                 inc_identify as _xb_inc,
                 match_sample as _xb_match, _get_conn as _xb_conn)
             import asyncio as _asyncio
+            import functools as _functools
             _xb_items = None
             _xb_fp_failed = False
             try:
                 _xb_bytes = wav if wav is not None else data
                 _dur, _xb_items = await _asyncio.get_running_loop().run_in_executor(
-                    None, _xb_fingerprint, _xb_bytes,
-                    ".wav" if wav is not None else ".bin")
+                    None, _functools.partial(
+                        _xb_fingerprint, _xb_bytes,
+                        ".wav" if wav is not None else ".bin",
+                        req_id=req_id))
             except Exception as _fe:
                 _xb_fp_failed = True
-                log_event(log, "identify_stage", stage="exclusive_bank",
-                          ok=False,
-                          reason=f"fingerprint_failed:{type(_fe).__name__}")
+                _st("exclusive_bank", _t_bank, ok=False,
+                    reason=f"fingerprint_failed:{type(_fe).__name__}")
             if _xb_items:
                 _xb_c = _xb_conn()
                 if _xb_c is None:
-                    log_event(log, "identify_stage", stage="exclusive_bank",
-                              ok=False, reason="bank_unavailable")
+                    _st("exclusive_bank", _t_bank, ok=False,
+                        reason="bank_unavailable")
                 else:
-                    _song, _sim = _xb_match(_xb_c, _xb_items)
+                    _song, _sim = _xb_match(_xb_c, _xb_items, req_id=req_id)
                     if _song is not None:
-                        log_event(log, "identify_stage", stage="exclusive_bank",
-                                  ms=int((_time.time() - t0) * 1000),
-                                  status="identified", sim=round(_sim, 3),
-                                  title=_song["title"])
+                        _st("exclusive_bank", _t_bank,
+                            status="identified", sim=round(_sim, 3),
+                            title=_song["title"])
                         try:
-                            _xb_inc(_xb_c, _song["id"])
+                            _xb_inc(_xb_c, _song["id"], req_id=req_id)
                         except Exception:
                             pass
                         _cache_store("identified", _song["title"], _song["artist"])
@@ -1950,16 +1993,15 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                     # No match is logged too (with the best similarity and
                     # the query size): a silent bank check is how the
                     # 2026-11-07 short-sample failure stayed invisible.
-                    log_event(log, "identify_stage", stage="exclusive_bank",
-                              ms=int((_time.time() - t0) * 1000),
-                              status="no_match", sim=round(_sim, 3),
-                              items=len(_xb_items))
+                    _st("exclusive_bank", _t_bank,
+                        status="no_match", sim=round(_sim, 3),
+                        items=len(_xb_items))
             elif not _xb_fp_failed:
-                log_event(log, "identify_stage", stage="exclusive_bank",
-                          ok=False, reason="fingerprint_empty")
+                _st("exclusive_bank", _t_bank, ok=False,
+                    reason="fingerprint_empty")
         except Exception as _e:
-            log_event(log, "identify_stage", stage="exclusive_bank",
-                      ok=False, reason=f"bank_check_failed:{type(_e).__name__}")
+            _st("exclusive_bank", _t_bank, ok=False,
+                reason=f"bank_check_failed:{type(_e).__name__}")
     if bank_only:
         return AudioIdResult(status="not_found")
     # Stage 2: Shazam windows. Each window is (raw_probe, prepared_wav):
@@ -1977,21 +2019,29 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         windows.append((data[len(data) // 3:], None))
         windows.append((data[2 * len(data) // 3:], None))
     log_event(log, "identify_stage", stage="input_prepared",
+              req_id=req_id,
+              total_ms=int((_time.perf_counter() - t_req) * 1000),
               windows=len(windows),
               sizes=[len(w[1]) if w[1] is not None else len(w[0])
                      for w in windows],
               wav_reused=wav is not None)
     shazam = None
+    _t_shazam = _time.perf_counter()
     for i, (probe, prepared) in enumerate(windows):
-        t0 = _time.time()
+        t0 = _time.perf_counter()
         try:
             candidate = await identify_bytes_shazam(probe,
-                                                    prepared_wav=prepared)
+                                                    prepared_wav=prepared,
+                                                    req_id=req_id)
             log_event(log, "identify_stage", stage="lookup_response",
-                      window=i, ms=int((_time.time() - t0) * 1000),
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
+                      window=i, ms=int((_time.perf_counter() - t0) * 1000),
                       status=candidate.status if candidate else "none")
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window=i,
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             candidate = None
@@ -1999,59 +2049,66 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
             shazam = candidate
             if candidate.status == "identified":
                 break
+    _st("api_shazam", _t_shazam,
+        status=shazam.status if shazam is not None else "none",
+        windows=len(windows))
     if shazam is not None and shazam.status == "identified":
         _cache_store("identified", shazam.title, shazam.artist)
-        log_event(log, "identify_stage", stage="result_sent",
-                  ms=int((_time.time() - t0) * 1000), status="identified",
-                  title=shazam.title, artist=shazam.artist)
+        _st("result_sent", t0, status="identified",
+            title=shazam.title, artist=shazam.artist)
         return AudioIdResult(status="identified", title=shazam.title, artist=shazam.artist)
     if config.audd_token:
-        t0 = _time.time()
+        t0 = _time.perf_counter()
         try:
             audd = await identify_bytes(data, filename, config.audd_token)
             log_event(log, "identify_stage", stage="lookup_response",
-                      window="audd", ms=int((_time.time() - t0) * 1000),
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
+                      window="audd", ms=int((_time.perf_counter() - t0) * 1000),
                       status=audd.status if audd else "none")
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="audd",
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             audd = None
+        _st("api_audd", t0, status=audd.status if audd is not None else "none")
         if audd is not None and audd.status == "identified":
             _cache_store("identified", audd.title, audd.artist)
-            log_event(log, "identify_stage", stage="result_sent",
-                      ms=int((_time.time() - t0) * 1000), status="identified",
-                      title=audd.title, artist=audd.artist)
+            _st("result_sent", t0, status="identified",
+                title=audd.title, artist=audd.artist)
             return audd
     # ACRCloud as third fallback (150M tracks, MENA coverage, sped-up tolerant)
     if config.acrcloud_host and config.acrcloud_key and config.acrcloud_secret:
-        t0 = _time.time()
+        t0 = _time.perf_counter()
         try:
             acr = await identify_acrcloud(
                 data, config.acrcloud_host,
                 config.acrcloud_key, config.acrcloud_secret)
             log_event(log, "identify_stage", stage="lookup_response",
-                      window="acrcloud", ms=int((_time.time() - t0) * 1000),
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
+                      window="acrcloud", ms=int((_time.perf_counter() - t0) * 1000),
                       status=acr.status if acr else "none")
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="acrcloud",
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             acr = None
+        _st("api_acrcloud", t0, status=acr.status if acr is not None else "none")
         if acr is not None and acr.status == "identified":
             _cache_store("identified", acr.title, acr.artist)
-            log_event(log, "identify_stage", stage="result_sent",
-                      ms=int((_time.time() - t0) * 1000), status="identified",
-                      title=acr.title, artist=acr.artist)
+            _st("result_sent", t0, status="identified",
+                title=acr.title, artist=acr.artist)
             return acr
     if shazam is not None and shazam.status == "not_found":
         _cache_store("not_found")
-        log_event(log, "identify_stage", stage="result_sent",
-                  ms=int((_time.time() - t0) * 1000), status="not_found")
+        _st("result_sent", t0, status="not_found")
         return AudioIdResult(status="not_found")
-    log_event(log, "identify_stage", stage="result_sent",
-              ms=int((_time.time() - t0) * 1000), status="error",
-              detail="lookup_error")
+    _st("result_sent", t0, status="error", detail="lookup_error")
     return AudioIdResult(status="error", detail="lookup_error")
 
 
@@ -2096,14 +2153,24 @@ async def _bg_identify_link(outcome, config, conn, resolved):
     user taps «🎵 شناسایی موسیقی», the button handler gets a cache hit
     and responds instantly. Fire-and-forget: all exceptions swallowed.
     """
+    _req_id = _timing.new_req_id()
+    _t_req = _time.perf_counter()
+    _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
+                      _t_req)
+    _status = "error"
     try:
-        await _identify_link_audio(outcome, config, conn, resolved=resolved)
+        _res = await _identify_link_audio(outcome, config, conn,
+                                          resolved=resolved,
+                                          req_id=_req_id, t_req=_t_req)
+        _status = _res[0] if _res else "error"
     except Exception:
         pass
+    _timing.log_total(log, "identify_stage", _req_id, _t_req, _status)
 
 
 async def _identify_link_audio(outcome, config: Config, conn=None,
-                             resolved: tuple | None = None):
+                             resolved: tuple | None = None,
+                             req_id: str | None = None, t_req=None):
     """Identify a sent link's audio.
 
     Returns (status, title, artist, needs_file, page_text, heard_bytes).
@@ -2130,6 +2197,11 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
     """
     import time as _time
     url = outcome.official_url
+    # Timing instrumentation (logs only): one request id per link-identify.
+    if req_id is None:
+        req_id = _timing.new_req_id()
+    if t_req is None:
+        t_req = _time.perf_counter()
     # HARDCODED MAPPINGS for known underground tracks not in Shazam/AudD.
     # These are verified by the user. This is a temporary bridge until the
     # auto-indexer builds a proper fingerprint database.
@@ -2169,12 +2241,14 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
             _ck = None
         if _ck is not None:
             log_event(log, "identify_stage", stage="cache_check", ms=0,
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
                       hit=True, via="url")
             # 8th element: the audio/file URL, so the caller can still
             # arm the bank sample from real bytes on a cache hit.
             return (_ck["status"], _ck["title"], _ck["artist"], False,
                     "", b"", "", url)
-        t = _time.time()
+        t = _time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(url)
@@ -2182,12 +2256,13 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                 data = resp.content
         except Exception:
             return ("error", "", "", False, "", b"")
-        log_event(log, "identify_stage", stage="download",
-                  ms=int((_time.time() - t) * 1000), bytes=len(data or b""))
+        _timing.log_stage(log, "identify_stage", req_id, t_req, "download",
+                          t, bytes=len(data or b""))
         if len(data) > config.max_file_mb * 1024 * 1024:
             return ("error", "", "", False, "", b"")
         result = await _identify_audio(data, "clip.mp4", config, conn,
-                                       cache_url_key=url)
+                                       cache_url_key=url,
+                                       req_id=req_id, t_req=t_req)
         return (result.status, result.title, result.artist, False, "", data)
     media_url = None
     page_text = ""
@@ -2201,12 +2276,15 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
         if resolved is not None:
             media_url, _video_url, page_text, strategy = resolved
         else:
+            _t_res = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
                 media_url, _video_url, page_text, strategy = \
                     await resolve_instagram_media(url)
             except Exception:
                 media_url, _video_url, page_text, strategy = None, None, "", "none"
+            _timing.log_stage(log, "identify_stage", req_id, t_req,
+                              "resolve", _t_res, strategy=strategy)
     else:
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
@@ -2227,6 +2305,8 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
             _ck = None
         if _ck is not None:
             log_event(log, "identify_stage", stage="cache_check", ms=0,
+                      req_id=req_id,
+                      total_ms=int((_time.perf_counter() - t_req) * 1000),
                       hit=True, via="url")
             # 8th element: the media URL, so the caller can still arm
             # the bank sample from real bytes on a cache hit.
@@ -2239,7 +2319,7 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
     fetched: tuple[str, bytes] | None = None
     if media_url:
         data = b""
-        t = _time.time()
+        t = _time.perf_counter()
         try:
             headers = {"User-Agent": "Mozilla/5.0",
                        "Referer": "https://www.instagram.com/"}
@@ -2249,21 +2329,25 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                 data = resp.content
         except Exception:
             data = b""
-        log_event(log, "identify_stage", stage="download",
-                  ms=int((_time.time() - t) * 1000), bytes=len(data or b""),
-                  strategy=strategy)
+        _timing.log_stage(log, "identify_stage", req_id, t_req, "download",
+                          t, bytes=len(data or b""), strategy=strategy)
         if data and len(data) <= config.max_file_mb * 1024 * 1024:
             result = await _identify_audio(data, "clip.mp4", config, conn,
-                                           cache_url_key=media_url)
+                                           cache_url_key=media_url,
+                                           req_id=req_id, t_req=t_req)
             if result.status == "identified":
                 return ("identified", result.title, result.artist, False, page_text, data)
             if result.status in ("not_found", "error"):
                 fetched = (result.status, data)
     if config.audd_token:
+        _t_audd = _time.perf_counter()
         try:
             result = await identify_url(url, config.audd_token)
         except Exception:
             result = None
+        _timing.log_stage(log, "identify_stage", req_id, t_req, "api_audd",
+                          _t_audd,
+                          status=result.status if result is not None else "none")
         if result is not None and result.status == "identified":
             return ("identified", result.title, result.artist, False, page_text, b"")
     if fetched is not None:
@@ -2501,7 +2585,8 @@ async def _send_exclusive_song(message, song) -> bool:
 
 async def _send_identified_song(message, conn, title: str, artist: str, config,
                                 bot_id: str = "", bank_tok: str = "",
-                                own_media: tuple | None = None):
+                                own_media: tuple | None = None,
+                                req_id: str | None = None):
     """Deliver an identified song: exclusive-bank file first, else the
     catalog card. One routing point for all three identify entry points
     (video button, link, direct file/voice)."""
@@ -3300,6 +3385,12 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         allowed, reason = can_use_feature(conn, message.from_user.id, "link_fetch")
         if not allowed:
             await message.answer(t(reason, ulang)); return
+        # Timing instrumentation (logs only): one request id per link,
+        # propagated through every stage line of this request.
+        _req_id = _timing.new_req_id()
+        _t_req = _time.perf_counter()
+        _timing.log_stage(log, "link_stage", _req_id, _t_req, "receipt",
+                          _t_req)
         # SPEED: URL-based file_id cache check FIRST (instant resend < 1s).
         # If this exact URL was sent before, reuse the Telegram file_id
         # without any download or processing.
@@ -3310,7 +3401,7 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             if not _url_cached:
                 try:
                     from .turso_cache import get_url_file_id as _turso_get
-                    _url_cached = _turso_get(link_url)
+                    _url_cached = _turso_get(link_url, req_id=_req_id)
                     if _url_cached:
                         log_event(log, "link", stage="turso_cache_hit", url=link_url[:60])
                 except Exception:
@@ -3318,17 +3409,23 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             if _url_cached:
                 _fid, _ftype = _url_cached
                 log_event(log, "link", stage="url_cache_hit", url=link_url[:60])
+                _t_send = _time.perf_counter()
                 try:
                     if _ftype == "video":
                         _sent = await message.answer_video(
                             _fid, caption=t("m_link_video_dl", ulang))
                     else:
                         _sent = await message.answer_audio(_fid)
+                    _timing.log_stage(log, "link_stage", _req_id, _t_req,
+                                      "send_video", _t_send)
                     # Attach the identify button (audio_url=None → falls back to Telegram file)
                     try:
                         await _attach_identify_button(message, conn, _sent)
                     except Exception:
                         pass
+                    _timing.log_total(log, "link_stage", _req_id, _t_req,
+                                      "cache_hit",
+                                      headline_total="link_to_video_ms")
                     return
                 except Exception:
                     # Cached file_id invalid (e.g., deleted) — fall through to normal flow
@@ -3343,7 +3440,10 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             _status_msg = await message.answer("⏳ در حال پردازش...")
         except Exception:
             _status_msg = None
+        _t_detect = _time.perf_counter()
         outcome = process_link(link_url, config.max_file_mb)
+        _timing.log_stage(log, "link_stage", _req_id, _t_req, "detect",
+                          _t_detect)
         if not outcome.ok:
             if _status_msg:
                 try:
@@ -3352,6 +3452,7 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                     await message.answer(t(outcome.message, "fa"))
             else:
                 await message.answer(t(outcome.message, "fa"))
+            _timing.log_total(log, "link_stage", _req_id, _t_req, "rejected")
             return
         # Resolve Instagram media ONCE per link: the video-send stage
         # and the identify stage share the result (they used to each run
@@ -3367,10 +3468,9 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                     outcome.official_url)
             except Exception:
                 _resolved = None
-            _resolve_ms = int((_time.perf_counter() - _rt) * 1000)
-            log_event(log, "identify_stage", stage="resolve",
-                      ms=_resolve_ms,
-                      strategy=_resolved[3] if _resolved else "error")
+            _timing.log_stage(log, "link_stage", _req_id, _t_req, "resolve",
+                              _rt,
+                              strategy=_resolved[3] if _resolved else "error")
         # SPEED: Time the video send stage.
         import time as _ptime
         _vs = _ptime.perf_counter()
@@ -3379,10 +3479,11 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         # empty "not found" boxes.
         video_msg = await _send_link_video(message, conn, outcome, config,
                                            bot_id=dbmod.get_bot_id(conn, config),
-                                           resolved=_resolved)
+                                           resolved=_resolved,
+                                           req_id=_req_id, t_req=_t_req)
         # SPEED: Log video send timing.
-        _vsend_ms = int((_ptime.perf_counter() - _vs) * 1000)
-        log_event(log, "link", stage="video_sent", ms=_vsend_ms, url=link_url[:60])
+        _timing.log_stage(log, "link_stage", _req_id, _t_req,
+                          "video_send_total", _vs)
         # SPEED: Delete the "processing" status message now that video is sent.
         if _status_msg:
             try:
@@ -3393,9 +3494,11 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             # Age-gated reel: the dedicated message is already shown.
             # There is no audio any anonymous fetch can reach, so no
             # identification, bank sample, or channel stage runs.
+            _timing.log_total(log, "link_stage", _req_id, _t_req, "age_gated")
             return
         # SPEED: Store file_id in URL cache for instant resend (< 1s next time).
         # video_msg is the sent Message object; extract file_id from it.
+        _t_store = _time.perf_counter()
         try:
             from .file_cache import store_url_file_id
             _vid = None
@@ -3417,10 +3520,12 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                     # Also store in persistent Turso cache (survives restarts)
                     try:
                         from .turso_cache import store_url_file_id as _turso_store
-                        if _turso_store(link_url, _vid, _vtype):
+                        if _turso_store(link_url, _vid, _vtype, req_id=_req_id):
                             log_event(log, "link", stage="turso_cache_stored", url=link_url[:60])
                     except Exception:
                         pass
+                    _timing.log_stage(log, "link_stage", _req_id, _t_req,
+                                      "cache_store", _t_store)
         except Exception:
             pass
         # NOTE 2026-10-31: Background identify (competitor's model).
@@ -3432,6 +3537,8 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             _aio.create_task(_bg_identify_link(outcome, config, conn, _resolved))
         except Exception:
             pass
+        _timing.log_total(log, "link_stage", _req_id, _t_req, "sent",
+                          headline_total="link_to_video_ms")
         return
     allowed, reason = can_use_feature(conn, message.from_user.id, "song_search")
     if not allowed:
@@ -4305,9 +4412,10 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
                     vpath = vf.name
                 apath = vpath + ".m4a"
                 try:
-                    _sp.run(["ffmpeg", "-y", "-i", vpath, "-vn",
-                             "-c:a", "aac", "-b:a", "128k", apath],
-                            capture_output=True, timeout=30)
+                    _timing.run(["ffmpeg", "-y", "-i", vpath, "-vn",
+                                 "-c:a", "aac", "-b:a", "128k", apath],
+                                req_id=req_id, logger=log,
+                                capture_output=True, timeout=30)
                     if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
                         with open(apath, "rb") as af:
                             audio_bytes = af.read()
@@ -4643,6 +4751,14 @@ async def run_bot(config: Config) -> None:
     _install_ad_hook(bot, conn, config)
     dp = build_dispatcher(conn, config)
     log_event(log, "bot_start", **config.safe_summary())
+    # Timing instrumentation (logs only): one process_start line per
+    # process lifetime, so cold starts / restarts are visible in the
+    # logs (uptime_seconds on every request total is measured from it).
+    log_event(log, "process_start",
+              started_at=_time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        _time.gmtime(_timing.PROCESS_START)),
+              cpu_count=_timing.cpu_count(),
+              max_rss_kb=_timing.max_rss_kb())
     # Daily auto-indexer: DISABLED (2026-11-01) - it was blocking the event
     # loop on Render's 0.1 CPU box, causing the bot to stop responding to
     # Telegram updates. The indexer uses synchronous requests which starve

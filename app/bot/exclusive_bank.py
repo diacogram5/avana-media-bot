@@ -48,12 +48,12 @@ Design
 import hashlib
 import json
 import os
-import subprocess
 import tempfile
 import time
 import urllib.request
 from pathlib import Path
 
+from .. import timing as _timing
 from ..logging_config import get_logger
 
 _log = get_logger("avana.exclusive_bank")
@@ -213,7 +213,8 @@ def _ensure_executable(path: str) -> bool:
         return False
 
 
-def fingerprint_file(path: str, max_seconds: int = FP_MAX_SECONDS):
+def fingerprint_file(path: str, max_seconds: int = FP_MAX_SECONDS,
+                     req_id: str | None = None):
     """Run fpcalc on an audio file. Returns (duration, [ints]) or (None, None).
 
     Never raises. ``-raw`` gives the integer array directly (no compressed
@@ -224,8 +225,9 @@ def fingerprint_file(path: str, max_seconds: int = FP_MAX_SECONDS):
         _log.warning("exclusive_bank: fpcalc not executable at %s", fpcalc)
         return None, None
     try:
-        r = subprocess.run(
+        r = _timing.run(
             [fpcalc, "-raw", "-length", str(max_seconds), path],
+            req_id=req_id, logger=_log,
             capture_output=True, text=True, timeout=FPCALC_TIMEOUT_SEC)
     except Exception as e:
         _log.warning("exclusive_bank: fpcalc failed: %s", e)
@@ -247,7 +249,8 @@ def fingerprint_file(path: str, max_seconds: int = FP_MAX_SECONDS):
     return dur, items
 
 
-def fingerprint_bytes(data: bytes, suffix: str = ".bin"):
+def fingerprint_bytes(data: bytes, suffix: str = ".bin",
+                      req_id: str | None = None):
     """Fingerprint raw audio bytes via a temp file. (duration, [ints]) or (None, None)."""
     if not data:
         return None, None
@@ -256,7 +259,8 @@ def fingerprint_bytes(data: bytes, suffix: str = ".bin"):
         os.write(fd, data)
         os.close(fd)
         fd = None
-        return fingerprint_file(path, max_seconds=FP_SAMPLE_MAX_SECONDS)
+        return fingerprint_file(path, max_seconds=FP_SAMPLE_MAX_SECONDS,
+                                req_id=req_id)
     except Exception as e:
         _log.warning("exclusive_bank: fingerprint_bytes failed: %s", e)
         return None, None
@@ -337,7 +341,7 @@ def match_against(query_items, songs):
 # Bitrate probe (ffprobe) + head download
 # ---------------------------------------------------------------------------
 
-def probe_bitrate(path: str) -> int:
+def probe_bitrate(path: str, req_id: str | None = None) -> int:
     """Measured audio bitrate in kbps (0 when unknown). Never raises.
 
     ffprobe reads the stream bit_rate from the MP3 frame headers (or the
@@ -345,10 +349,11 @@ def probe_bitrate(path: str) -> int:
     full file (verified 2026-11-07: 320k head -> 320000, 128k head -> 128000).
     """
     try:
-        r = subprocess.run(
+        r = _timing.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=bit_rate",
              "-of", "csv=p=0", path],
+            req_id=req_id, logger=_log,
             capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SEC)
         out = (r.stdout or "").strip().split(",")
         for field in out:
@@ -360,12 +365,13 @@ def probe_bitrate(path: str) -> int:
     return 0
 
 
-def probe_duration(path: str) -> float:
+def probe_duration(path: str, req_id: str | None = None) -> float:
     """Media duration in seconds (0 when unknown). Never raises."""
     try:
-        r = subprocess.run(
+        r = _timing.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
+            req_id=req_id, logger=_log,
             capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SEC)
         return float((r.stdout or "").strip().split(",")[0])
     except Exception:
@@ -396,7 +402,7 @@ def download_head(bot_token: str, file_path: str, max_bytes: int = HEAD_MAX_BYTE
         return None
 
 
-def probe_tags(path: str):
+def probe_tags(path: str, req_id: str | None = None):
     """(title, artist) from the file's own metadata tags, "" when absent.
 
     ffprobe reads format tags; keys are matched case-insensitively.
@@ -404,9 +410,10 @@ def probe_tags(path: str):
     audio's own title/performer.
     """
     try:
-        r = subprocess.run(
+        r = _timing.run(
             ["ffprobe", "-v", "error", "-show_entries", "format_tags",
              "-of", "json", path],
+            req_id=req_id, logger=_log,
             capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SEC)
         tags = (json.loads(r.stdout or "{}").get("format") or {}).get("tags") or {}
         lower = {str(k).lower(): v for k, v in tags.items()}
@@ -453,7 +460,7 @@ def analyse_audio_bytes(data: bytes):
             pass
 
 
-def upconvert_to_320(data: bytes):
+def upconvert_to_320(data: bytes, req_id: str | None = None):
     """Re-encode audio bytes to MP3 320 kbps CBR via ffmpeg.
 
     Returns the upgraded bytes, or None on any failure. Never raises.
@@ -471,9 +478,10 @@ def upconvert_to_320(data: bytes):
         fd_in = None
         os.close(fd_out)
         fd_out = None
-        r = subprocess.run(
+        r = _timing.run(
             ["ffmpeg", "-v", "error", "-y", "-i", path_in,
              "-vn", "-c:a", "libmp3lame", "-b:a", "320k", path_out],
+            req_id=req_id, logger=_log,
             capture_output=True, timeout=UPGRADE_TIMEOUT_SEC)
         if r.returncode != 0:
             return None
@@ -522,16 +530,21 @@ def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
 
-def list_songs(conn, active_only: bool = False):
+def list_songs(conn, active_only: bool = False,
+               req_id: str | None = None):
     _init_tables(conn)
     q = f"SELECT {', '.join(_COLS)} FROM exclusive_songs"
     if active_only:
         q += " WHERE active = 1"
     q += " ORDER BY added_at DESC, id DESC"
+    _tq = time.perf_counter()
     try:
         rows = conn.execute(q).fetchall()
     except Exception:
         rows = conn.execute(q).fetchall()
+    finally:
+        _timing.note_turso(req_id, "exclusive_songs.list",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
     return [_row_to_dict(r, _COLS) for r in rows]
 
 
@@ -641,11 +654,14 @@ def delete_song(conn, song_id: int) -> None:
     conn.commit()
 
 
-def inc_identify(conn, song_id: int) -> None:
+def inc_identify(conn, song_id: int, req_id: str | None = None) -> None:
     try:
+        _tq = time.perf_counter()
         conn.execute("UPDATE exclusive_songs SET identify_count = identify_count + 1 WHERE id = ?",
                      (song_id,))
         conn.commit()
+        _timing.note_turso(req_id, "exclusive_songs.inc_identify",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
     except Exception:
         pass
 
@@ -659,7 +675,7 @@ def inc_download(conn, song_id: int) -> None:
         pass
 
 
-def match_sample(conn, query_items):
+def match_sample(conn, query_items, req_id: str | None = None):
     """Fingerprint-match a sample against ACTIVE bank songs.
 
     Returns (song, similarity) or (None, best_similarity). Never raises;
@@ -669,7 +685,7 @@ def match_sample(conn, query_items):
     activity is provable from the Render logs.
     """
     try:
-        songs = list_songs(conn, active_only=True)
+        songs = list_songs(conn, active_only=True, req_id=req_id)
     except Exception as e:
         _log.warning("exclusive_bank: match_sample list failed: %s", e)
         return None, 0.0

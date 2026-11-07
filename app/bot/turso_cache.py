@@ -15,6 +15,8 @@ import logging
 import os
 import time
 
+from .. import timing as _timing
+
 _log = logging.getLogger("avana.turso_cache")
 
 _turso_conn = None
@@ -90,16 +92,19 @@ def _get_conn():
         return None
 
 
-def get_url_file_id(url: str) -> tuple | None:
+def get_url_file_id(url: str, req_id: str | None = None) -> tuple | None:
     """Get (file_id, file_type) from persistent Turso cache. None if miss/error."""
     conn = _get_conn()
     if not conn:
         return None
     try:
         key = _url_key(url)
+        _tq = time.perf_counter()
         cur = conn.execute(
             "SELECT file_id, file_type, expires_at FROM url_file_cache WHERE cache_key = ?",
             (key,))
+        _timing.note_turso(req_id, "url_file_cache.get",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
         row = cur.fetchone()
         if not row:
             return None
@@ -118,7 +123,8 @@ def get_url_file_id(url: str) -> tuple | None:
         return None
 
 
-def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30) -> bool:
+def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30,
+                      req_id: str | None = None) -> bool:
     """Store URL->file_id in persistent Turso cache. Returns True if stored."""
     conn = _get_conn()
     if not conn:
@@ -127,11 +133,14 @@ def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30
         key = _url_key(url)
         now = int(time.time())
         expires = now + (ttl_days * 86400)
+        _tq = time.perf_counter()
         conn.execute("""
             INSERT OR REPLACE INTO url_file_cache
             (cache_key, file_id, file_type, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?)
         """, (key, file_id, file_type, now, expires))
+        _timing.note_turso(req_id, "url_file_cache.store",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
         conn.commit()
         return True
     except Exception as e:
@@ -139,16 +148,19 @@ def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30
         return False
 
 
-def get_suggest_result(key: str) -> dict | None:
+def get_suggest_result(key: str, req_id: str | None = None) -> dict | None:
     """Get a persisted suggestion result. None if miss/expired/error."""
     conn = _get_conn()
     if not conn:
         return None
     try:
+        _tq = time.perf_counter()
         cur = conn.execute(
             "SELECT title, artist, url, preview_url, expires_at "
             "FROM suggest_results WHERE result_key = ?",
             (key,))
+        _timing.note_turso(req_id, "suggest_results.get",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
         row = cur.fetchone()
         if not row:
             return None
@@ -171,7 +183,8 @@ def get_suggest_result(key: str) -> dict | None:
 
 
 def store_suggest_result(key: str, title: str, artist: str = "", url: str = "",
-                         preview_url: str = "", ttl_days: int = 7) -> bool:
+                         preview_url: str = "", ttl_days: int = 7,
+                         req_id: str | None = None) -> bool:
     """Persist a suggestion result so its button survives restarts."""
     conn = _get_conn()
     if not conn:
@@ -179,11 +192,14 @@ def store_suggest_result(key: str, title: str, artist: str = "", url: str = "",
     try:
         now = int(time.time())
         expires = now + (ttl_days * 86400)
+        _tq = time.perf_counter()
         conn.execute("""
             INSERT OR REPLACE INTO suggest_results
             (result_key, title, artist, url, preview_url, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (key, title, artist, url, preview_url, now, expires))
+        _timing.note_turso(req_id, "suggest_results.store",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
         conn.commit()
         return True
     except Exception as e:
