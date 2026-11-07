@@ -662,6 +662,47 @@ def list_clips(category: str, subcategory: str, user_id: int,
         return ([], 0)
 
 
+def pick_next_clip(category: str, user_id: int,
+                   exclude_id: int | None = None) -> dict | None:
+    """Category-level next-clip picker (final redesign 2026-11-07).
+
+    One indexed query, no subcategory, no analysis: active clips of
+    the MAIN category only, unseen-first. Unseen clips come first
+    (newest first); seen ones follow least-recently-seen first, so a
+    user keeps getting fresh clips while unseen ones exist and gets
+    real rotation afterwards. `exclude_id` skips the clip the user
+    just watched; when it is the ONLY clip in the category, it is
+    returned again (an old but relevant clip beats nothing). The
+    (category, subcategory, status) index serves this query by its
+    category prefix — the subcategory count never slows it down.
+    """
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        cur = conn.execute(
+            """SELECT a.*,
+                      CASE WHEN s.seen_at IS NULL THEN 0 ELSE 1 END AS seen
+               FROM story_archive a
+               LEFT JOIN story_seen s
+                 ON s.user_id=? AND s.file_unique_id=a.file_unique_id
+               WHERE a.category=? AND a.status='active'
+               ORDER BY seen ASC, s.seen_at ASC, a.added_at DESC
+               LIMIT 50""",
+            (user_id, category))
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        if not rows:
+            return None
+        for row in rows:
+            if exclude_id is None or row["id"] != exclude_id:
+                return row
+        return rows[0]
+    except Exception as e:
+        _log.warning("pick_next_clip failed: %s", e)
+        return None
+
+
 def count_active_clips() -> int:
     conn = _get_conn()
     if not conn:
@@ -1093,6 +1134,67 @@ def register_story_archive_handlers(router) -> None:
         # 2026-11-04 story_clips _btn fix). Accept both forms.
         return InlineKeyboardButton(text=text,
                                     callback_data=cb or callback_data)
+
+    def clip_nav_kb(category: str, clip_id: int):
+        """Under-clip navigation (final redesign 2026-11-07).
+
+        Next clip in the same category, jump to any of the 5 MAIN
+        categories, back to the category list. Subcategories are
+        internal only (admin/classification) — they never appear here.
+        The category buttons carry the current clip id so a jump into
+        the SAME category never re-sends the clip just watched.
+        """
+        try:
+            from .story_clips import CATEGORIES
+            cats = [(c["id"], f'{c["emoji"]} {c["title"]}') for c in CATEGORIES]
+        except Exception:
+            cats = [("love", "❤️ عاشقانه"), ("sad", "💔 غمگین"),
+                    ("occasion", "🌹 مناسبتی"), ("deep", "🖤 سنگین و مفهومی"),
+                    ("happy", "✨ شاد و انرژی‌بخش")]
+        rows = [[_btn("🎬 کلیپ بعدی",
+                      callback_data=f"sarch:next:{category}:{clip_id}")]]
+        for i in range(0, len(cats), 2):
+            row = [_btn(t, callback_data=f"sarch:jump:{cid}:{clip_id}")
+                   for cid, t in cats[i:i + 2]]
+            rows.append(row)
+        rows.append([_btn("🔙 بازگشت", callback_data="sarch:home")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _send_category_clip(callback, cat: str,
+                                  exclude_id: int | None):
+        """Pick + deliver one approved clip of a MAIN category.
+
+        No analysis, no identification, no subcategory check here: the
+        clip's category was fixed at intake/approval and stored in the
+        DB; pick_next_clip reads only approved rows of that category
+        (indexed) and respects the user's seen history. On empty
+        category the exact not-available message is shown and NO
+        unrelated clip is ever sent.
+        """
+        uid = callback.from_user.id
+        clip = pick_next_clip(cat, uid, exclude_id=exclude_id)
+        if not clip:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("🔙", callback_data="sarch:home")]])
+            txt = (f"{_cat_title(cat)}\n"
+                   "هنوز کلیپ مناسبی در این دسته موجود نیست.")
+            try:
+                await callback.message.edit_text(txt, reply_markup=kb)
+            except Exception:
+                await callback.message.answer(txt, reply_markup=kb)
+            return
+        kb = clip_nav_kb(cat, clip["id"])
+        res = await deliver_clip(callback.bot, callback.message.chat.id,
+                                 clip, reply_markup=kb)
+        if res == "ok":
+            mark_seen(uid, clip["file_unique_id"])
+        elif res == "gone":
+            await callback.message.answer(
+                "🗑 این کلیپ از کانال منبع حذف شده. یکی دیگر را امتحان کنید 👇")
+        elif res == "blocked":
+            await callback.message.answer("🔒 فوروارد این کلیپ محدود شده است.")
+        else:
+            await callback.message.answer("❌ ارسال ناموفق بود؛ لطفاً دوباره تلاش کنید.")
 
 
     # Callback prefix: sarch:  (story: is the Pixabay module — untouched)
@@ -1685,13 +1787,18 @@ def register_story_archive_handlers(router) -> None:
             _WM_SEM = _aio.Semaphore(1)
         return _WM_SEM
 
-    async def deliver_waveframed(bot, chat_id: int, clip: dict) -> str:
+    async def deliver_waveframed(bot, chat_id: int, clip: dict,
+                                 reply_markup=None) -> str:
         """Download -> Waveframe badge -> send -> cleanup.
 
         Only for clips where watermark use is permitted (watermark_ok=1).
         Forwarded clips NEVER go through here (user req: direct forward
         keeps the original untouched). Runs in executor; temp dir cleaned.
         On watermark failure, falls back to plain resend (logged).
+        The processed file_id is stored after a successful send, so the
+        badge is paid ONCE per clip — later deliveries take the instant
+        processed_file_id path in deliver_clip (final redesign 2026-11-07:
+        process once at preparation, never again at request time).
         """
         import asyncio
         import os
@@ -1712,14 +1819,24 @@ def register_story_archive_handlers(router) -> None:
                 info = await loop.run_in_executor(None, _run)
                 _log.info("waveframe applied: %s", info)
                 from aiogram.types import FSInputFile
-                await bot.send_video(chat_id, FSInputFile(out),
-                                     caption=corporate_caption(clip))
+                msg = await bot.send_video(
+                    chat_id, FSInputFile(out),
+                    caption=corporate_caption(clip),
+                    reply_markup=reply_markup)
+                fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
+                if fid:
+                    # Store ONLY the processed final: file_id must keep
+                    # pointing at the ORIGINAL (downloads + plain
+                    # fallback need it). deliver_clip prefers
+                    # processed_file_id, so later sends are instant.
+                    save_processed(clip["id"], fid)
                 return "ok"
         except Exception as e:
             _log.warning("deliver_waveframed failed, plain resend fallback: %s", e)
             try:
                 await bot.send_video(chat_id, clip["file_id"],
-                                     caption=corporate_caption(clip))
+                                     caption=corporate_caption(clip),
+                                     reply_markup=reply_markup)
                 return "ok"
             except Exception as e2:
                 _log.warning("plain resend also failed: %s", e2)
@@ -1731,7 +1848,8 @@ def register_story_archive_handlers(router) -> None:
             except Exception:
                 pass
 
-    async def deliver_feed_first(bot, chat_id: int, clip: dict) -> str:
+    async def deliver_feed_first(bot, chat_id: int, clip: dict,
+                                 reply_markup=None) -> str:
         """First delivery of a feed clip (web source, no stored final).
 
         Download from source_url -> apply the Waveframe badge once +
@@ -1753,7 +1871,8 @@ def register_story_archive_handlers(router) -> None:
             if clip.get("file_id") and (clip.get("last_error") or "") == "badge_failed":
                 try:
                     await bot.send_video(chat_id, clip["file_id"],
-                                         caption=corporate_caption(clip))
+                                         caption=corporate_caption(clip),
+                                         reply_markup=reply_markup)
                     return "ok"
                 except Exception:
                     pass  # fall through to the badge attempt below
@@ -1790,7 +1909,8 @@ def register_story_archive_handlers(router) -> None:
                 _final = await loop.run_in_executor(None, _run)
                 from aiogram.types import FSInputFile
                 msg = await bot.send_video(
-                    chat_id, FSInputFile(_final), caption=corporate_caption(clip))
+                    chat_id, FSInputFile(_final), caption=corporate_caption(clip),
+                    reply_markup=reply_markup)
                 fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
                 if fid:
                     save_processed(clip["id"], fid)
@@ -1802,7 +1922,8 @@ def register_story_archive_handlers(router) -> None:
             set_clip_error(clip["id"], "badge_failed")
             try:
                 msg = await bot.send_video(
-                    chat_id, clip["source_url"], caption=corporate_caption(clip))
+                    chat_id, clip["source_url"], caption=corporate_caption(clip),
+                    reply_markup=reply_markup)
                 fid = getattr(getattr(msg, "video", None), "file_id", "") or ""
                 if fid:
                     set_clip_file_id(clip["id"], fid)
@@ -1816,7 +1937,8 @@ def register_story_archive_handlers(router) -> None:
             except Exception:
                 pass
 
-    async def deliver_clip(bot, chat_id: int, clip: dict) -> str:
+    async def deliver_clip(bot, chat_id: int, clip: dict,
+                           reply_markup=None) -> str:
         """Deliver one clip. Returns 'ok'|'gone'|'blocked'|'error'.
 
         User order 2026-11-05 (error report — SUPERSEDES the 09:41
@@ -1826,14 +1948,26 @@ def register_story_archive_handlers(router) -> None:
         FINAL file (Waveframe badge + AVANO MEDIA outro, applied once at
         first delivery for feed clips); legacy clips without a final fall
         back to the on-delivery Waveframe badge when permitted, else
-        plain resend.
+        plain resend. `reply_markup` (final redesign 2026-11-07) is
+        attached to the sent video — or, for a forward, applied to the
+        forwarded message afterwards (best-effort; the clip itself is
+        never re-sent for a failed markup edit). No analysis, no
+        identification, no subcategory check happens here: the clip's
+        category was fixed at intake/approval and stored in the DB.
         """
         try:
             if clip.get("mode") == "forward":
                 if clip.get("source_chat_id") and clip.get("source_message_id"):
                     try:
-                        await bot.forward_message(
+                        msg = await bot.forward_message(
                             chat_id, clip["source_chat_id"], clip["source_message_id"])
+                        if reply_markup is not None:
+                            try:
+                                await bot.edit_message_reply_markup(
+                                    chat_id, msg.message_id,
+                                    reply_markup=reply_markup)
+                            except Exception:
+                                pass  # nav buttons are a bonus, not the clip
                         return "ok"
                     except Exception as e:
                         msg = str(e).lower()
@@ -1849,16 +1983,20 @@ def register_story_archive_handlers(router) -> None:
             # resend mode: stored final first, then Waveframe, then plain
             if clip.get("processed_file_id"):
                 await bot.send_video(chat_id, clip["processed_file_id"],
-                                     caption=corporate_caption(clip))
+                                     caption=corporate_caption(clip),
+                                     reply_markup=reply_markup)
                 return "ok"
             if clip.get("source_url"):
                 # Feed clip without a stored final: badge once at first
                 # delivery (or send the raw URL when the badge fails).
-                return await deliver_feed_first(bot, chat_id, clip)
+                return await deliver_feed_first(bot, chat_id, clip,
+                                                reply_markup=reply_markup)
             if int(clip.get("watermark_ok") or 0) == 1:
-                return await deliver_waveframed(bot, chat_id, clip)
+                return await deliver_waveframed(bot, chat_id, clip,
+                                                reply_markup=reply_markup)
             await bot.send_video(chat_id, clip["file_id"],
-                                 caption=corporate_caption(clip))
+                                 caption=corporate_caption(clip),
+                                 reply_markup=reply_markup)
             return "ok"
         except Exception as e:
             _log.warning("deliver_clip failed: %s", e)
@@ -1888,24 +2026,29 @@ def register_story_archive_handlers(router) -> None:
 
     @router.callback_query(F.data.startswith("sarch:cat:"))
     async def sarch_cat(callback: CallbackQuery, config, state: FSMContext):
+        """Category tap (final redesign 2026-11-07): send ONE approved
+        clip of the MAIN category immediately — no subtopic list, no
+        clip-name list. Subcategories stay internal (admin /
+        classification) and are never shown to the audience."""
         await callback.answer()
         cat = callback.data.split(":")[2]
-        try:
-            from .story_clips import CATEGORIES
-            subs = next(c["subtopics"] for c in CATEGORIES if c["id"] == cat)
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [_btn(s["title"], callback_data=f'sarch:sub:{cat}:{s["id"]}:0')]
-                for s in subs
-            ] + [[_btn("🔙 دسته‌ها", callback_data="sarch:home")]])
-        except Exception:
-            kb = None
-        try:
-            await callback.message.edit_text(
-                f"{_cat_title(cat)}\nزیردسته را انتخاب کنید:",
-                reply_markup=kb)
-        except Exception:
-            await callback.message.answer(
-                f"{_cat_title(cat)}\nزیردسته را انتخاب کنید:", reply_markup=kb)
+        await _send_category_clip(callback, cat, exclude_id=None)
+
+    @router.callback_query(F.data.startswith("sarch:next:"))
+    async def sarch_next(callback: CallbackQuery, config, state: FSMContext):
+        """«🎬 کلیپ بعدی»: another approved clip of the SAME category,
+        never the one just watched (unless it is the only clip)."""
+        await callback.answer()
+        _, _, cat, clip_id = callback.data.split(":")
+        await _send_category_clip(callback, cat, exclude_id=int(clip_id))
+
+    @router.callback_query(F.data.startswith("sarch:jump:"))
+    async def sarch_jump(callback: CallbackQuery, config, state: FSMContext):
+        """Under-clip category button: a clip from the chosen category,
+        never the one just watched."""
+        await callback.answer()
+        _, _, cat, clip_id = callback.data.split(":")
+        await _send_category_clip(callback, cat, exclude_id=int(clip_id))
 
 
 

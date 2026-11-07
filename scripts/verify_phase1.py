@@ -573,12 +573,246 @@ async def main():
     check("manual add: active + categorized_by='admin'",
           okm and rowm and rowm[0] == "active" and rowm[1] == "admin")
 
-    # --- T10: all archive keyboards build ------------------------------
-    for marker, label in (("eq:data=sarch:panel", "panel"),
-                          ("eq:data=sarch:home", "home"),
-                          ("startswith:data:sarch:cat:", "cat")):
-        h = find_handler(r2, marker)
-        check(f"keyboard builds: {label}", h is not None)
+    # --- T11: final redesign — 5 categories, direct send, nav buttons --
+    # Neutralize earlier fixtures that would pollute the picker: 'uq-f'
+    # (T7/T8, love/express, added_at set to the far future), 'uq-man'
+    # (T9, love/express, active), 'uq-a'/'uq-a2' (T5/T5b, approved
+    # forward-mode love clips) and 'old-uniq-1' (T1, love/longing) are
+    # all active love clips; the picker is category-level, so any of
+    # them could win over the redesign clips below.
+    conn.execute(
+        "UPDATE story_archive SET status='pending'"
+        " WHERE file_unique_id IN ('uq-f', 'uq-man', 'uq-a', 'uq-a2',"
+        " 'old-uniq-1')")
+    conn.commit()
+
+    class NavBot(MockBot):
+        """Records send_video kwargs (reply_markup) + returns a message
+        with a video file_id, like the real Bot API send."""
+
+        def __init__(self, fixture=None):
+            super().__init__()
+            self.fixture = fixture
+            self.sent = []  # (chat_id, video, caption, reply_markup)
+
+        async def forward_message(self, chat_id, from_chat_id, message_id):
+            self.calls.append(("forward", chat_id, from_chat_id, message_id))
+            return SimpleNamespace(message_id=777)
+
+        async def edit_message_reply_markup(self, chat_id, message_id,
+                                            reply_markup=None, **kw):
+            self.calls.append(("edit_markup", chat_id, message_id,
+                               reply_markup))
+
+        async def send_video(self, chat_id, video, caption=None, **kw):
+            self.sent.append((chat_id, getattr(video, "path", video),
+                              caption, kw.get("reply_markup")))
+            class _V:
+                file_id = "proc-xyz"
+            class _M:
+                video = _V()
+            return _M()
+
+        async def get_file(self, file_id):
+            class F:
+                file_path = "fixture.mp4"
+            return F()
+
+        async def download_file(self, file_path, destination=None):
+            self.calls.append(("download_file", file_path, destination))
+            shutil.copyfile(self.fixture, destination)
+
+    def nav_buttons(kb):
+        if kb is None:
+            return []
+        return [(b.text, b.callback_data)
+                for row in kb.inline_keyboard for b in row]
+
+    # Active clips with a stored processed final (instant send path):
+    # love/express x3, sad/lonely x1, occasion/* none.
+    love_ids = []
+    for i in (1, 2, 3):
+        ok, _ = sarch.archive_clip(
+            file_unique_id=f"uq-red-love{i}", file_id=f"f-love{i}",
+            category="love", subcategory="express", mode="resend",
+            status="active", added_by=111, file_size=2_000_000,
+            categorized_by="feed-auto", categorized_at=1234567890)
+        assert ok
+        conn.execute(
+            "UPDATE story_archive SET processed_file_id=? WHERE file_unique_id=?",
+            (f"proc-love{i}", f"uq-red-love{i}"))
+        love_ids.append(conn.execute(
+            "SELECT id FROM story_archive WHERE file_unique_id=?",
+            (f"uq-red-love{i}",)).fetchone()[0])
+    ok, _ = sarch.archive_clip(
+        file_unique_id="uq-red-sad1", file_id="f-sad1",
+        category="sad", subcategory="lonely", mode="resend",
+        status="active", added_by=111, file_size=2_000_000,
+        categorized_by="feed-auto", categorized_at=1234567890)
+    assert ok
+    conn.execute(
+        "UPDATE story_archive SET processed_file_id=? WHERE file_unique_id=?",
+        ("proc-sad1", "uq-red-sad1"))
+    sad_id = conn.execute(
+        "SELECT id FROM story_archive WHERE file_unique_id=?",
+        ("uq-red-sad1",)).fetchone()[0]
+    conn.commit()
+
+    cath = find_handler(r2, "startswith:data:sarch:cat:")
+    check("redesign: sarch:cat handler registered", cath is not None)
+    nexth = find_handler(r2, "startswith:data:sarch:next:")
+    check("redesign: sarch:next handler registered", nexth is not None)
+    jumph = find_handler(r2, "startswith:data:sarch:jump:")
+    check("redesign: sarch:jump handler registered", jumph is not None)
+
+    # (a) category tap sends ONE love clip immediately, with nav buttons.
+    bot_a = NavBot()
+    cb_a = FakeCallback("sarch:cat:love", bot_a)
+    await cath(cb_a, cfg, FakeState())
+    check("redesign: category tap sends a clip (no list first)",
+          len(bot_a.sent) == 1 and bot_a.sent[0][1] in
+          ("proc-love1", "proc-love2", "proc-love3"),
+          f"sent={[(s[1]) for s in bot_a.sent]}")
+    btns_a = nav_buttons(bot_a.sent[0][3]) if bot_a.sent else []
+    # The sent clip's id is carried by its own «next» button.
+    sent_id_a = None
+    for _t, _d in btns_a:
+        if _t == "🎬 کلیپ بعدی" and _d.startswith("sarch:next:love:"):
+            sent_id_a = int(_d.split(":")[-1])
+    check("redesign: under-clip nav has next button for the sent clip",
+          sent_id_a is not None and
+          ("🎬 کلیپ بعدی", f"sarch:next:love:{sent_id_a}") in btns_a,
+          f"got {btns_a}")
+    check("redesign: nav has all 5 category buttons",
+          all((f"sarch:jump:{c}:{sent_id_a}") in
+              [d for _, d in btns_a] for c in
+              ("love", "sad", "occasion", "deep", "happy"))
+          and ("🔙 بازگشت", "sarch:home") in btns_a,
+          f"got {btns_a}")
+    seen_a = conn.execute(
+        "SELECT COUNT(*) FROM story_seen WHERE user_id=111").fetchone()[0]
+    check("redesign: sent clip is marked seen", seen_a >= 1,
+          f"seen={seen_a}")
+
+    # (b) «next» sends a DIFFERENT love clip (excludes the watched one).
+    bot_b = NavBot()
+    cb_b = FakeCallback(f"sarch:next:love:{sent_id_a}", bot_b)
+    await nexth(cb_b, cfg, FakeState())
+    check("redesign: next sends a different clip of the same category",
+          len(bot_b.sent) == 1 and bot_b.sent[0][1] in
+          ("proc-love1", "proc-love2", "proc-love3")
+          and bot_b.sent[0][1] != bot_a.sent[0][1],
+          f"sent={[(s[1]) for s in bot_b.sent]}")
+
+    # (c) jump to another category sends a clip from THAT category.
+    bot_c = NavBot()
+    cb_c = FakeCallback(f"sarch:jump:sad:{sent_id_a}", bot_c)
+    await jumph(cb_c, cfg, FakeState())
+    check("redesign: jump sends a clip from the chosen category",
+          len(bot_c.sent) == 1 and bot_c.sent[0][1] == "proc-sad1",
+          f"sent={[(s[1]) for s in bot_c.sent]}")
+
+    # (d) empty category: exact not-available message, NO clip sent.
+    bot_d = NavBot()
+    cb_d = FakeCallback("sarch:cat:occasion", bot_d)
+    await cath(cb_d, cfg, FakeState())
+    shown_d = cb_d.message.edits + cb_d.message.answers
+    check("redesign: empty category shows not-available, sends nothing",
+          len(bot_d.sent) == 0 and shown_d and
+          "هنوز کلیپ مناسبی در این دسته موجود نیست" in (shown_d[0][0] or ""),
+          f"sent={len(bot_d.sent)} shown={shown_d}")
+
+    # (e) rotation: once all love clips are seen, next still returns an
+    # old but relevant clip (never an error, never another category).
+    for uid_f in ("uq-red-love1", "uq-red-love2", "uq-red-love3"):
+        conn.execute(
+            "INSERT OR IGNORE INTO story_seen (user_id, file_unique_id, seen_at)"
+            " VALUES (?,?,?)", (111, uid_f, 100))
+    conn.commit()
+    bot_e = NavBot()
+    cb_e = FakeCallback(f"sarch:next:love:{love_ids[0]}", bot_e)
+    await nexth(cb_e, cfg, FakeState())
+    check("redesign: all seen -> next returns an old relevant clip",
+          len(bot_e.sent) == 1 and bot_e.sent[0][1] in
+          ("proc-love1", "proc-love2", "proc-love3"),
+          f"sent={[(s[1]) for s in bot_e.sent]}")
+
+    # (f) pick_next_clip pure checks.
+    check("redesign: pick_next_clip empty category -> None",
+          sarch.pick_next_clip("occasion", 111) is None)
+    pick1 = sarch.pick_next_clip("sad", 111)
+    check("redesign: pick_next_clip returns the sad clip",
+          pick1 and pick1["id"] == sad_id, f"got {pick1 and pick1['id']}")
+    pick2 = sarch.pick_next_clip("sad", 111, exclude_id=sad_id)
+    check("redesign: pick_next_clip single clip -> re-sends it",
+          pick2 and pick2["id"] == sad_id, f"got {pick2 and pick2['id']}")
+
+    # (h) forward-mode clip: the nav keyboard is applied to the
+    # forwarded message itself (raw forward, never processed).
+    ok, _ = sarch.archive_clip(
+        file_unique_id="uq-red-fwd", file_id="f-fwd",
+        category="love", subcategory="express", mode="forward",
+        source_chat_id=-1001, source_message_id=99, status="active",
+        added_by=111, file_size=2_000_000, categorized_by="admin",
+        categorized_at=1234567890)
+    assert ok
+    conn.execute(
+        "UPDATE story_archive SET added_at=2000000000"
+        " WHERE file_unique_id='uq-red-fwd'")
+    conn.commit()
+    bot_h = NavBot()
+    cb_h = FakeCallback("sarch:cat:love", bot_h)
+    await cath(cb_h, cfg, FakeState())
+    fwd_h = [c for c in bot_h.calls if c[0] == "forward"]
+    edits_h = [c for c in bot_h.calls if c[0] == "edit_markup"]
+    check("redesign: forward clip is forwarded raw (not processed)",
+          len(fwd_h) == 1 and fwd_h[0][3] == 99, f"calls={bot_h.calls}")
+    check("redesign: forward clip gets nav buttons on its message",
+          len(edits_h) == 1 and any(
+              t == "🎬 کلیپ بعدی" for t, _ in nav_buttons(edits_h[0][3])),
+          f"calls={bot_h.calls}")
+
+    # (g) deliver_waveframed caches the processed file_id (process once).
+    import app.bot.motion_watermark as _mw
+    _real_badge = _mw.apply_waveframe_badge
+
+    def _fast_badge(src, out):
+        shutil.copyfile(src, out)
+        return "mocked-badge"
+    _mw.apply_waveframe_badge = _fast_badge
+    try:
+        ok, _ = sarch.archive_clip(
+            file_unique_id="uq-red-leg", file_id="f-leg",
+            category="love", subcategory="express", mode="resend",
+            watermark_ok=1, status="active", added_by=111,
+            file_size=2_000_000, categorized_by="admin",
+            categorized_at=1234567890)
+        assert ok
+        leg_id = conn.execute(
+            "SELECT id FROM story_archive WHERE file_unique_id=?",
+            ("uq-red-leg",)).fetchone()[0]
+        conn.commit()
+        playh = find_handler(r2, "startswith:data:sarch:play:")
+        bot_g = NavBot(fixture=REF_CLIP)
+        cb_g = FakeCallback(f"sarch:play:{leg_id}:love:express:0", bot_g)
+        await playh(cb_g, cfg, FakeState())
+        row_g = sarch.get_clip(leg_id)
+        check("redesign: waveframed delivery stores processed_file_id",
+              row_g and row_g.get("processed_file_id") == "proc-xyz",
+              f"got {row_g and row_g.get('processed_file_id')}")
+        dl_calls = [c for c in bot_g.calls if c[0] == "download_file"]
+        check("redesign: first waveframed delivery downloads once",
+              len(dl_calls) == 1, f"downloads={len(dl_calls)}")
+        bot_g2 = NavBot(fixture=REF_CLIP)
+        cb_g2 = FakeCallback(f"sarch:play:{leg_id}:love:express:0", bot_g2)
+        await playh(cb_g2, cfg, FakeState())
+        dl_calls2 = [c for c in bot_g2.calls if c[0] == "download_file"]
+        check("redesign: second delivery reuses processed file_id (no download)",
+              len(dl_calls2) == 0 and bot_g2.sent and
+              bot_g2.sent[0][1] == "proc-xyz",
+              f"downloads={len(dl_calls2)} sent={bot_g2.sent}")
+    finally:
+        _mw.apply_waveframe_badge = _real_badge
 
     fails = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} PASS")
