@@ -701,6 +701,18 @@ def delivery_file_id(song) -> str:
     return (song.get("ready_file_id") or song.get("file_id") or "")
 
 
+def delivery_candidates(song) -> list:
+    """Ordered file_ids to try at delivery: the prepared version first,
+    then the original (deduped). A stale prepared file_id must never
+    lose the song — the original is always the fallback (root-cause
+    fix 2026-11-07)."""
+    cands = []
+    for fid in (song.get("ready_file_id") or "", song.get("file_id") or ""):
+        if fid and fid not in cands:
+            cands.append(fid)
+    return cands
+
+
 def exclusive_card_text(song) -> str:
     """The delivery card, exactly as the user specified (plus the bot id,
     which the standing rule requires on everything the bot sends). The
@@ -962,8 +974,21 @@ def register_exclusive_bank_handlers(router) -> None:
                     lines.append(f"❌ {tag}: {why} — حذف نشد")
         if not rows:
             lines.append("بانک خالی است.")
-        await callback.message.edit_text("\n".join(lines),
-                                         reply_markup=_panel_kb(list_songs(conn)))
+        try:
+            await callback.message.edit_text("\n".join(lines),
+                                             reply_markup=_panel_kb(list_songs(conn)))
+        except Exception as e:
+            # Tapping audit twice shows the identical result: Telegram
+            # rejects the no-op edit ("message is not modified") — the
+            # result is already on screen, so just acknowledge the tap.
+            # Any other edit failure still delivers the audit as a new
+            # message, so the result never vanishes silently.
+            if "message is not modified" in str(e):
+                await callback.answer("✅ نتیجه بررسی در همین پیام است.")
+            else:
+                await callback.message.answer(
+                    "\n".join(lines),
+                    reply_markup=_panel_kb(list_songs(conn)))
 
     @router.callback_query(F.data.startswith("xbank:view:"))
     async def xbank_view(callback: CallbackQuery, config):
@@ -1383,22 +1408,35 @@ def register_exclusive_bank_handlers(router) -> None:
                 f"این آهنگ تکراری است — «{dup['title']}» از «{dup['artist']}» "
                 "پیش‌تر در بانک ثبت شده است.")
             return
-        sid = add_song(
-            conn, title=data.get("title", ""), artist=data.get("artist", ""),
-            file_id=data.get("file_id", ""), file_unique_id=data.get("file_unique_id", ""),
-            duration_sec=data.get("duration_sec") or 0,
-            bitrate_kbps=data.get("bitrate_kbps") or 0,
-            file_size=data.get("file_size") or 0,
-            fingerprint=data.get("fp_items", ""),
-            fp_duration=data.get("fp_duration") or 0,
-            fp_partial=bool(data.get("fp_partial")),
-            cover_file_id=data.get("cover_file_id", ""),
-            description=data.get("description", ""),
-            added_by=callback.from_user.id,
-            ready_file_id=data.get("ready_file_id", ""),
-            ready_file_unique_id=data.get("ready_file_unique_id", ""),
-            ready_bitrate_kbps=data.get("ready_bitrate_kbps") or 0,
-            ready_file_size=data.get("ready_file_size") or 0)
+        try:
+            sid = add_song(
+                conn, title=data.get("title", ""), artist=data.get("artist", ""),
+                file_id=data.get("file_id", ""), file_unique_id=data.get("file_unique_id", ""),
+                duration_sec=data.get("duration_sec") or 0,
+                bitrate_kbps=data.get("bitrate_kbps") or 0,
+                file_size=data.get("file_size") or 0,
+                fingerprint=data.get("fp_items", ""),
+                fp_duration=data.get("fp_duration") or 0,
+                fp_partial=bool(data.get("fp_partial")),
+                cover_file_id=data.get("cover_file_id", ""),
+                description=data.get("description", ""),
+                added_by=callback.from_user.id,
+                ready_file_id=data.get("ready_file_id", ""),
+                ready_file_unique_id=data.get("ready_file_unique_id", ""),
+                ready_bitrate_kbps=data.get("ready_bitrate_kbps") or 0,
+                ready_file_size=data.get("ready_file_size") or 0)
+        except Exception as e:
+            _log.warning("exclusive_bank: add_song failed: %s", e)
+            sid = None
+        if not sid:
+            # Never claim success without a persisted row (root-cause
+            # fix 2026-11-07): the state is kept so the owner can retry
+            # the confirm instead of believing the song is registered.
+            await callback.answer("ثبت نشد.", show_alert=True)
+            await callback.message.answer(
+                "⚠️ ثبت آهنگ در بانک انجام نشد (خطای پایگاه داده). "
+                "لطفاً دوباره تأیید کنید.")
+            return
         await state.clear()
         await callback.answer("ثبت شد.")
         song = get_song(conn, sid) if sid else None

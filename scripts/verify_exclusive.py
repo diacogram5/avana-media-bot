@@ -353,6 +353,105 @@ def main():
     check("untagged files report empty title/artist (never raises)",
           plain_info.get("title") == "" and plain_info.get("artist") == "")
 
+    print("T9 root fix: one shared bank engine for all three inputs (user order 2026-11-07)")
+    # Register the FULL song A in a fresh bank (full-file fingerprint).
+    conn4 = sqlite3.connect(":memory:")
+    sid_full = xb.add_song(conn4, title="تردید", artist="سامان جلیلی",
+                           file_id="fileFull", file_unique_id="uqFull",
+                           duration_sec=dur_a or 18.0, bitrate_kbps=320,
+                           file_size=735652,
+                           fingerprint=",".join(map(str, fp_a)),
+                           fp_duration=dur_a or 0, fp_partial=False,
+                           ready_file_id="fileReady", ready_file_unique_id="uqReady",
+                           ready_bitrate_kbps=320, ready_file_size=720000)
+    # Input A: short sample (5s middle excerpt) -> bank identifies A.
+    m, sim = xb.match_sample(conn4, q5)
+    check("A. short sample identifies the bank song",
+          m is not None and m["id"] == sid_full, f"sim={sim:.3f}")
+    # Input B: video carrying the song -> extract audio first, then match.
+    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "color=c=black:s=320x240:d=18", "-i", f"{tmp}/A_full.wav",
+         "-shortest", "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k",
+         f"{tmp}/A_video.mp4"])
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"{tmp}/A_video.mp4",
+         "-vn", "-ac", "1", "-ar", "22050", f"{tmp}/A_video_audio.wav"])
+    _d, q_vid = xb.fingerprint_file(f"{tmp}/A_video_audio.wav")
+    m, sim = xb.match_sample(conn4, q_vid)
+    check("B. video: extracted audio identifies the bank song",
+          m is not None and m["id"] == sid_full, f"sim={sim:.3f}")
+    # Input B2: raw video bytes (the validation-transcode-failed fallback).
+    with open(f"{tmp}/A_video.mp4", "rb") as f:
+        vid_bytes = f.read()
+    _d, q_raw = xb.fingerprint_bytes(vid_bytes, ".mp4")
+    m, sim = xb.match_sample(conn4, q_raw)
+    check("B2. raw video bytes fingerprint identifies the bank song",
+          m is not None and m["id"] == sid_full, f"sim={sim:.3f}")
+    # Input C: the complete file itself -> fingerprint matches the bank row.
+    with open(f"{tmp}/A_320.mp3", "rb") as f:
+        full_bytes = f.read()
+    _d, q_full = xb.fingerprint_bytes(full_bytes, ".mp3")
+    m, sim = xb.match_sample(conn4, q_full)
+    check("C. full file identifies the bank song (never rejected)",
+          m is not None and m["id"] == sid_full, f"sim={sim:.3f}")
+    # Delivery: the matched row carries the prepared version.
+    got_full = xb.get_song(conn4, sid_full)
+    check("matched row delivers the prepared version by file_id",
+          xb.delivery_file_id(got_full) == "fileReady")
+    # Delivery candidates: ready first, original as fallback, deduped.
+    check("delivery candidates: ready then original",
+          xb.delivery_candidates(got_full) == ["fileReady", "fileFull"])
+    check("delivery candidates: original only when no ready version",
+          xb.delivery_candidates(old) == ["fileOld"])
+    check("delivery candidates: deduped when ready == original",
+          xb.delivery_candidates({"file_id": "f1", "ready_file_id": "f1"}) == ["f1"])
+
+    print("T10 video identify: extract audio, same engine as the Track (user order 2026-11-07)")
+    from app.services.shazam_id import analyze_audio_with_wav
+    GREEK = os.path.expanduser(
+        "~/workspace/user/files/Split_AvanoMediaBot_Me_Li_Ser_Dem__2_5_n7lk.mp3")
+    VID30 = os.path.expanduser(
+        "~/workspace/clip_from_song_climax/avano-real-singer-30s-wm.mp4")
+    VID15 = os.path.expanduser(
+        "~/workspace/clip_from_song_climax/avano-sea-mv-15s-sample.mp4")
+    # Register the full Greek song in a fresh bank (as the add flow does).
+    dur_g, fp_g = xb.fingerprint_file(GREEK)
+    conn5 = sqlite3.connect(":memory:")
+    sid_g = xb.add_song(conn5, title="Me Li Ser Dem", artist="Unknown",
+                        file_id="fileGreek", file_unique_id="uqGreek",
+                        duration_sec=dur_g or 81.84, bitrate_kbps=179,
+                        file_size=os.path.getsize(GREEK),
+                        fingerprint=",".join(map(str, fp_g or [])),
+                        fp_duration=dur_g or 0, fp_partial=False,
+                        ready_file_id="fileGreekReady",
+                        ready_file_unique_id="uqGreekReady",
+                        ready_bitrate_kbps=320, ready_file_size=900000)
+    check("Greek song fingerprints for the bank",
+          fp_g is not None and len(fp_g) > 50, f"items={len(fp_g) if fp_g else 0}")
+    # Track (working path): full MP3 identifies the bank row.
+    _d, q_track = xb.fingerprint_bytes(open(GREEK, "rb").read(), ".mp3")
+    m, sim = xb.match_sample(conn5, q_track)
+    check("TRACK full file identifies the bank song",
+          m is not None and m["id"] == sid_g, f"sim={sim:.3f}")
+    for name, vid in (("30s singer clip", VID30), ("15s sea MV", VID15)):
+        vb = open(vid, "rb").read()
+        # Step 1: the engine's own validation transcodes the video to mono 22050 WAV.
+        analysis, wav = analyze_audio_with_wav(vb)
+        check(f"{name}: video audio validates (mono 22050, audible)",
+              analysis.get("ok") and wav is not None
+              and analysis.get("sample_rate") == 22050
+              and analysis.get("channels") == 1,
+              repr(analysis))
+        # Step 2: the extracted WAV fingerprints and matches the SAME row as the Track.
+        _d, q_wav = xb.fingerprint_bytes(wav, ".wav") if wav else (None, None)
+        m, sim = xb.match_sample(conn5, q_wav)
+        check(f"{name}: extracted audio identifies the same bank song as the Track",
+              m is not None and m["id"] == sid_g, f"sim={sim:.3f}")
+        # Step 3: raw video bytes (the undecodable-fallback path) match too.
+        _d, q_raw = xb.fingerprint_bytes(vb, ".mp4")
+        m, sim = xb.match_sample(conn5, q_raw)
+        check(f"{name}: raw video bytes identify the same bank song",
+              m is not None and m["id"] == sid_g, f"sim={sim:.3f}")
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -1856,6 +1856,43 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                               ms=0, ok=False, reason="silent_no_stream")
             except Exception:
                 pass
+        if reason == "undecodable" and data and _XBANK_OK:
+            # Bank-first even when the validation transcode failed (user
+            # order 2026-11-07): an extraction error must not hide a bank
+            # song. fpcalc reads the raw container itself, so fingerprint
+            # the raw bytes directly; only a confident match returns
+            # identified, otherwise the honest error below stands.
+            try:
+                from .exclusive_bank import (
+                    fingerprint_bytes as _xb_fingerprint,
+                    inc_identify as _xb_inc,
+                    match_sample as _xb_match, _get_conn as _xb_conn)
+                import asyncio as _asyncio
+                import os as _os
+                _suf = _os.path.splitext(filename or "")[1] or ".bin"
+                _dur, _items = await _asyncio.get_running_loop().run_in_executor(
+                    None, _xb_fingerprint, data, _suf)
+                if _items:
+                    _c = _xb_conn()
+                    if _c is not None:
+                        _song, _sim = _xb_match(_c, _items)
+                        if _song is not None:
+                            log_event(log, "identify_stage",
+                                      stage="exclusive_bank",
+                                      ms=int((_time.time() - t0) * 1000),
+                                      status="identified", sim=round(_sim, 3),
+                                      title=_song["title"], via="raw_fallback")
+                            try:
+                                _xb_inc(_c, _song["id"])
+                            except Exception:
+                                pass
+                            _cache_store("identified", _song["title"],
+                                         _song["artist"])
+                            return AudioIdResult(status="identified",
+                                                 title=_song["title"],
+                                                 artist=_song["artist"])
+            except Exception:
+                pass
         # Distinct extraction-stage error — never "not_found".
         return AudioIdResult(status="error", detail=reason)
     # Stage 1.5: exclusive Avano bank (user order 2026-11-07) — fingerprint
@@ -2396,27 +2433,39 @@ async def _send_exclusive_song(message, song) -> bool:
 
     Sends the PREPARED version's stored Telegram file_id when one is
     stored, else the original file_id — no re-download, no re-conversion
-    at delivery time, and no bitrate error can block the send. Returns
-    True on success; False when the send failed (caller falls back to
-    the catalog card).
+    at delivery time, and no bitrate error can block the send. When the
+    prepared version's send fails (e.g. a stale file_id), the stored
+    ORIGINAL file is tried before giving up — the bank file must reach
+    the user, not fall through to a public search. Returns True on
+    success; False only when every stored version failed (caller falls
+    back to the catalog card).
     """
-    from .exclusive_bank import delivery_file_id, exclusive_card_text, inc_download
+    from .exclusive_bank import (exclusive_card_text, inc_download,
+                                 delivery_candidates)
     caption = exclusive_card_text(song)
-    fid = delivery_file_id(song)
+    _cands = delivery_candidates(song)
     sent = None
-    try:
-        if song.get("cover_file_id"):
-            try:
-                sent = await message.answer_audio(
-                    fid, caption=caption,
-                    thumbnail=song["cover_file_id"])
-            except Exception:
-                sent = None
-        if sent is None:
-            sent = await message.answer_audio(fid, caption=caption)
-    except Exception as e:
+    _last_err = None
+    for fid in _cands:
+        try:
+            if song.get("cover_file_id"):
+                try:
+                    sent = await message.answer_audio(
+                        fid, caption=caption,
+                        thumbnail=song["cover_file_id"])
+                except Exception:
+                    sent = None
+            if sent is None:
+                sent = await message.answer_audio(fid, caption=caption)
+            if sent is not None:
+                break
+        except Exception as e:
+            _last_err = e
+            sent = None
+    if sent is None:
         log_event(log, "exclusive_bank", stage="send_failed",
-                  song_id=song.get("id"), reason=type(e).__name__)
+                  song_id=song.get("id"),
+                  reason=type(_last_err).__name__ if _last_err else "no_file_id")
         return False
     try:
         from .exclusive_bank import _get_conn as _xb_conn
@@ -3782,7 +3831,10 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         await message.bot.download_file(file.file_path, buf)
         data = buf.getvalue()
     except Exception:
-        await message.answer(t("audio_error", ulang)); return
+        # A failed download is not an identification error: say so.
+        _dl_msg = (t("m_video_fetch_fail", ulang)
+                   if message.video is not None else t("audio_error", ulang))
+        await message.answer(_dl_msg); return
     if len(data) > config.max_file_mb * 1024 * 1024:
         await message.answer(t("m_file_too_large", ulang)); return
     # Intent from a film is deterministic (no button needed): identify
@@ -3872,8 +3924,19 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             # line (never skipped just because no full-version MP3
             # exists in the sources).
             await _extract_and_send_clip_audio(message, conn, data)
-        await _answer(message, conn, t("audio_error", ulang),
-                      reply_markup=_err_kb)
+        # Distinct honest cause for video inputs (user order 2026-11-07):
+        # the generic "audio_error" line must never hide the real cause.
+        # The m_* keys word the cause for a video; audio/voice inputs
+        # keep the generic line (their wording differs).
+        _err_msg = t("audio_error", ulang)
+        if message.video is not None:
+            _err_msg = {
+                "silent": t("m_no_usable_audio", ulang),
+                "undecodable": t("m_audio_corrupt", ulang),
+                "too_short": t("m_audio_too_short", ulang),
+                "lookup_error": t("m_identify_error", ulang),
+            }.get(getattr(result, "detail", ""), _err_msg)
+        await _answer(message, conn, _err_msg, reply_markup=_err_kb)
         return
     _tok = await _arm_bank_sample(conn, config, "file",
                                   __import__("hashlib").sha256(data).hexdigest(),
