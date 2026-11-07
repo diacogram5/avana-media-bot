@@ -144,6 +144,10 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
     "crawler_dash". strategy is "none" when nothing yielded media.
     page_text is the best title/caption found (for the channel query).
 
+    RapidAPI /fetch is the last-resort fallback when RAPIDAPI_KEY is
+    set in the environment (2026-11-08); without the key the behaviour
+    is exactly as before.
+
     - page/embed strategies: the advertised media URL is a progressive
       .mp4, so it serves as both the watchable video and the audio
       source for identification.
@@ -200,6 +204,29 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                               strategy="crawler_dash",
                               ms=int((_time.time() - _t0) * 1000))
                     return audio_url, video_url, page_text, "crawler_dash"
+            # RapidAPI fallback (2026-11-08): only when the four
+            # anonymous strategies all failed AND RAPIDAPI_KEY is set.
+            # Fail-open: no key (or any API failure) leaves the
+            # behaviour exactly as before (strategy "none"). The
+            # signed CDN URL is never cached — it expires.
+            try:
+                from .rapidapi_resolve import (
+                    RapidAPIKeyMissing,
+                    resolve_via_rapidapi,
+                )
+                try:
+                    _ra_audio, _ra_video, _ = await resolve_via_rapidapi(
+                        page_url)
+                except RapidAPIKeyMissing:
+                    _ra_audio = _ra_video = None
+                if _ra_audio and _ra_video:
+                    log_event(log, "instagram_resolve",
+                              strategy="rapidapi",
+                              ms=int((_time.time() - _t0) * 1000))
+                    return _ra_audio, _ra_video, page_text, "rapidapi"
+            except Exception as exc:
+                log_event(log, "instagram_resolve_error",
+                          error=f"rapidapi:{str(exc)[:80]}")
     except Exception as exc:
         log_event(log, "instagram_resolve_error", error=str(exc)[:100])
     log_event(log, "instagram_resolve", strategy="none",
