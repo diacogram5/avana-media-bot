@@ -4413,7 +4413,7 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
                 try:
                     _timing.run(["ffmpeg", "-y", "-i", vpath, "-vn",
                                  "-c:a", "aac", "-b:a", "128k", apath],
-                                req_id=req_id, logger=log,
+                                logger=log,
                                 capture_output=True, timeout=30)
                     if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
                         with open(apath, "rb") as af:

@@ -46,6 +46,20 @@ _OEMBED_ENDPOINT = "https://www.instagram.com/oauth/oembed/?url="
 # response carries (measured 2026-10-29 on reel Dd23bq7vkPr).
 _GATING_MARKERS = ("geoblock_required", "MIN_AGE_ACCOUNT", "gating_type")
 
+# Diagnostic markers for the per-strategy resolve log (booleans only —
+# never page content). A logged-out / login-walled shell carries login
+# links and "is_logged_in":false; a crawler page carrying media carries
+# the DASH manifest; a progressive page carries og:video.
+_LOGIN_SHELL_MARKERS = ("require_login", "/accounts/login/",
+                        '"is_logged_in":false')
+
+
+def _diag_markers(page: str) -> tuple[bool, bool, bool]:
+    """(login-shell?, DASH-manifest?, og:video?) — booleans only."""
+    return (any(m in page for m in _LOGIN_SHELL_MARKERS),
+            "video_dash_manifest" in page or "AdaptationSet" in page,
+            "og:video" in page)
+
 
 async def check_instagram_gating(page_url: str) -> str | None:
     """Classify an Instagram post's access restriction from its public
@@ -97,14 +111,26 @@ async def check_instagram_gating(page_url: str) -> str | None:
     return None
 
 
-async def _get(client: httpx.AsyncClient, url: str, headers: dict) -> str:
+async def _get(client: httpx.AsyncClient, url: str, headers: dict
+               ) -> tuple[int, str, int]:
+    """Fetch one strategy page: (HTTP status, body text, raw byte length).
+
+    Diagnostic-only change: the old version swallowed the status
+    ("" on any non-200 or transport error), which made a login shell,
+    a 429/403 block and a timeout indistinguishable in the logs.
+    Behaviour is unchanged: non-200 / error still yields "" text, and
+    the body is still truncated to 2,000,000 chars. status 0 means no
+    response arrived at all (transport error / timeout). No content,
+    URL, token or caption is logged or stored here.
+    """
     try:
         resp = await client.get(url, headers=headers)
     except Exception:
-        return ""
+        return 0, "", 0
+    nbytes = len(resp.content)
     if resp.status_code != 200:
-        return ""
-    return resp.text[:2_000_000]
+        return resp.status_code, "", nbytes
+    return resp.status_code, resp.text[:2_000_000], nbytes
 
 
 def _base(page_url: str) -> str:
@@ -124,6 +150,10 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
     - crawler_dash: the DASH manifest's audio AdaptationSet gives the
       audio bytes Shazam needs; the video AdaptationSet (best
       representation) gives the watchable video file to send the user.
+
+    Diagnostic: every strategy attempt logs one "instagram_resolve_diag"
+    line (HTTP status, response byte length, login-shell / DASH /
+    og:video marker booleans) — log-only, no behaviour change.
     """
     base = _base(page_url)
     page_text = ""
@@ -137,7 +167,12 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                 ("embed", base + "embed/", DESKTOP_UA),
                 ("embed_captioned", base + "embed/captioned/", DESKTOP_UA),
             ):
-                page = await _get(client, url, headers)
+                status, page, nbytes = await _get(client, url, headers)
+                _login, _dash, _og = _diag_markers(page)
+                log_event(log, "instagram_resolve_diag", strategy=name,
+                          status=status, bytes=nbytes, login=_login,
+                          dash=_dash, og_video=_og,
+                          ms=int((_time.time() - _t0) * 1000))
                 if not page:
                     continue
                 if not page_text:
@@ -149,7 +184,12 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                     return media_url, media_url, page_text, name
             # Last resort: crawler view embeds the DASH manifest with
             # separate audio/video streams.
-            page = await _get(client, base, GOOGLEBOT_UA)
+            status, page, nbytes = await _get(client, base, GOOGLEBOT_UA)
+            _login, _dash, _og = _diag_markers(page)
+            log_event(log, "instagram_resolve_diag",
+                      strategy="crawler_dash", status=status, bytes=nbytes,
+                      login=_login, dash=_dash, og_video=_og,
+                      ms=int((_time.time() - _t0) * 1000))
             if page:
                 if not page_text:
                     page_text = extract_page_text(page)
