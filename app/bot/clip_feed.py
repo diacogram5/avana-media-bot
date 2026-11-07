@@ -871,10 +871,10 @@ async def run_auto_approve_pass(*, new_keys=None) -> dict:
     Gate: a clip is approved ONLY when the stored suggestion is confident
     (suggest_subcategory returned a category — (a) best >= 3 AND
     margin >= 2, or (b) the unanimous distinctive-title rule: the
-    caption names one subcategory, the verified seed theme agrees,
-    and nothing competes at all, second-best total == 0; the margin
-    stays strict on purpose: a near-tie is genuinely ambiguous and
-    must stay queued). Candidates, at most AUTO_APPROVE_PER_CYCLE per
+    caption names one subcategory unambiguously, the verified seed
+    theme agrees, and the song's theme does not veto it — the text
+    decides; the margin stays strict on purpose: a near-tie is
+    genuinely ambiguous and must stay queued). Candidates, at most AUTO_APPROVE_PER_CYCLE per
     call: this cycle's newly intaken clips first, then the oldest pending
     feed clips. Each candidate is analyzed once with the same analysis as
     the moderation queue (analyze_clip_for_queue, bot=None — feed clips

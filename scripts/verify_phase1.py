@@ -398,8 +398,14 @@ async def main():
           f"got {(cat, sub, score)}")
     cat, sub, score, _r = sarch.suggest_subcategory(
         "دوستت دارم عاشقتم", "کلیپ تیکه دار", "", "", "deep", "sarcasm")
-    check("suggest: «تیکه» + seed prior but romantic song -> no suggestion",
-          cat is None, f"got {(cat, sub, score)}")
+    check("suggest: «تیکه» + seed prior + romantic song -> deep/sarcasm (text decides)",
+          (cat, sub) == ("deep", "sarcasm") and score == 2,
+          f"got {(cat, sub, score)}")
+    cat, sub, score, _r = sarch.suggest_subcategory(
+        "عاشقتم", "کلیپ تیکه دار", "", "", "deep", "sarcasm")
+    check("suggest: «تیکه» + seed prior, song ties the total -> deep/sarcasm (text decides)",
+          (cat, sub) == ("deep", "sarcasm") and score == 2,
+          f"got {(cat, sub, score)}")
     cat, sub, score, _r = sarch.suggest_subcategory(
         "", "کلیپ مادرم", "", "", "occasion", "parents")
     check("suggest: «مادر» + agreeing seed prior -> occasion/parents",

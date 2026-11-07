@@ -290,30 +290,37 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     the song title was never scored, and the per-cycle cap was 5 —
     all three are fixed separately (re-score, title scoring, cap 10).
 
-    Text/music disagreement guard (2026-11-06): for text-overlay clips
-    the on-video text — proxied here by the caption/title — IS the
-    theme, while the background song is incidental; scoring the song's
-    lyrics at x2 can otherwise approve a clip under its background
-    music's category (e.g. a تیکه‌دار clip with a romantic song
-    approved as love/express). So when the caption has a CLEAR single
-    best subcategory (strictly leading on caption hits alone) that
-    differs from the total-score winner, the clip is genuinely
-    ambiguous and NO suggestion is returned — it stays queued for a
-    human to watch. Agreement (or no caption signal) leaves the
-    normal gate untouched.
+    Text/music disagreement guard (2026-11-06, REVISED 2026-11-07):
+    for text-overlay clips the on-video text — proxied here by the
+    caption/title — IS the theme, while the background song is
+    incidental; scoring the song's lyrics at x2 can otherwise approve
+    a clip under its background music's category (e.g. a تیکه‌دار clip
+    with a romantic song approved as love/express). When the caption
+    has a CLEAR single best subcategory (strictly leading on caption
+    hits alone) that differs from the total-score winner, the clip
+    does NOT get the song's category. But — 2026-11-07 revision —
+    it is NOT simply left queued either: if the title is UNANIMOUS
+    (no competing caption hit at all) AND the verified seed theme
+    agrees with the title, the TEXT decides and the clip is approved
+    under the title's category. The first version of this guard
+    blocked every such clip outright, which systematically froze the
+    whole کنایه category (تیکه‌دار clips almost always use romantic
+    or sad background songs) — the disagreement is the genre, not
+    ambiguity. Only when the title is ambiguous or the seed does not
+    agree does the clip stay queued for a human to watch.
 
-    Unanimous distinctive-title rule (2026-11-06): a clip whose
-    caption names ONE subcategory distinctively, whose verified seed
-    theme agrees, and against which NOTHING competes (second-best
-    total == 0 — no lyric hit, no other caption hit anywhere) is
-    approved even below 3 points. This is NOT a margin loosening:
-    it requires zero competing signal, so the 2026-11-06 near-tie
-    (5 vs 4) still stays queued, and a lone weak caption with a
+    Unanimous distinctive-title rule (2026-11-06, REVISED 2026-11-07):
+    a clip whose caption names ONE subcategory unambiguously (no
+    competing caption hit) and whose verified seed theme agrees is
+    approved even below 3 points — the song's theme does NOT veto it.
+    This is NOT a margin loosening: it requires an unambiguous title
+    plus seed agreement, so the 2026-11-06 near-tie (5 vs 4, empty
+    caption) still stays queued, and a lone weak caption with a
     channel prior (score 2, e.g. «دلم برات تنگ شده») still gets no
     suggestion — that case has no seed prior and its signal is
     ambiguous between longing and sad. The rule only fires on
-    unanimous evidence: the creator's title + the verified seed
-    theme saying the same thing, with silence everywhere else.
+    unanimous title evidence: the creator's title + the verified seed
+    theme saying the same thing.
     """
     scored = []
     cap_scored = []
@@ -341,20 +348,31 @@ def suggest_subcategory(lyrics_text: str, caption: str,
     second = scored[1][0] if len(scored) > 1 else 0
     cap_best, cap_second = cap_scored[0], cap_scored[1][0]
     cap_clear = cap_best[0] >= 1 and cap_best[0] > cap_second
+    # The title names exactly one subcategory (no competing caption hit).
+    cap_unanimous = cap_best[0] >= 1 and cap_second == 0
+    seed_agrees = ((seed_category, seed_subcategory)
+                   == (cap_best[1], cap_best[2]))
     if best[0] >= 3 and best[0] - second >= 2:
         if (cap_clear
                 and (cap_best[1], cap_best[2]) != (best[1], best[2])):
+            if cap_unanimous and seed_agrees:
+                # Text vs song disagree, but the title is unambiguous
+                # and the verified seed theme agrees with it: the TEXT
+                # decides (the on-video text is the criterion; the
+                # background song is incidental).
+                cap_entry = next(t for t in scored
+                                 if (t[1], t[2]) == (cap_best[1], cap_best[2]))
+                return cap_entry[1], cap_entry[2], cap_entry[0], cap_entry[3]
             return None, None, best[0], best[3] + [
                 "متن کلیپ با آهنگ هم‌خوانی ندارد"]
         return best[1], best[2], best[0], best[3]
-    # (b) unanimous distinctive title (see docstring): the caption
-    # names one subcategory, the verified seed theme agrees, and
-    # nothing competes at all (second-best total == 0).
-    if (cap_clear
-            and (seed_category, seed_subcategory) == (cap_best[1], cap_best[2])
-            and (best[1], best[2]) == (cap_best[1], cap_best[2])
-            and second == 0 and best[0] >= 1):
-        return best[1], best[2], best[0], best[3]
+    # (b) unanimous distinctive title (see docstring): the title names
+    # one subcategory, the verified seed theme agrees, and the title
+    # carries no competing signal — the song's theme does not veto it.
+    if cap_unanimous and seed_agrees:
+        cap_entry = next(t for t in scored
+                         if (t[1], t[2]) == (cap_best[1], cap_best[2]))
+        return cap_entry[1], cap_entry[2], cap_entry[0], cap_entry[3]
     return None, None, best[0], best[3]
 
 
