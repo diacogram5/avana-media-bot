@@ -62,6 +62,13 @@ try:
     _STORY_ARCHIVE_OK = True
 except Exception:
     _STORY_ARCHIVE_OK = False
+# NEW (2026-11-07): exclusive Avano song bank — independent module.
+# Guarded import so a module bug can never break existing handlers.
+try:
+    from .exclusive_bank import register_exclusive_bank_handlers as _register_xbank_handlers
+    _XBANK_OK = True
+except Exception:
+    _XBANK_OK = False
 from ..bot.media_send import (
     answer_no_preview, has_audio_stream, probe_audio, send_music, send_video,
     transcode_mp3,
@@ -124,6 +131,16 @@ if _STORY_ARCHIVE_OK:
         _register_sarch_handlers(router)
     except Exception as _e:
         log.warning("story_archive handlers not registered: %s", _e)
+
+# NEW (2026-11-07): exclusive Avano song bank (exclusive_bank.py).
+# Guarded: never breaks existing handlers. Registered here — before the
+# main audio handler — so the add-flow FSM states win over the normal
+# audio flow, exactly like the story-archive manual add.
+if _XBANK_OK:
+    try:
+        _register_xbank_handlers(router)
+    except Exception as _e:
+        log.warning("exclusive_bank handlers not registered: %s", _e)
 
 
 def _new_request_id() -> str:
@@ -1195,6 +1212,11 @@ async def cmd_admin(message: Message, conn: sqlite3.Connection, config: Config):
     if _STORY_ARCHIVE_OK:
         buttons.append([InlineKeyboardButton(text="🎬 آرشیو استوری ایرانی",
                                              callback_data="sarch:panel")])
+    # NEW (2026-11-07): exclusive Avano song bank (admin panel only —
+    # no new main-menu item, per the user's order).
+    if _XBANK_OK:
+        buttons.append([InlineKeyboardButton(text="💎 بانک اختصاصی آوانو",
+                                             callback_data="xbank:panel")])
     await _answer(message, conn, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
@@ -1698,12 +1720,11 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             _tok = await _arm_bank_sample(conn, config, "video_button",
                                           entry["file_id"], data or None,
                                           audio_url or "", "")
-            await _send_professional_song_card(
+            await _send_identified_song(
                 callback.message, conn, result.title, result.artist,
-                bot_id=dbmod.get_bot_id(conn, config),
-                bank_token=_tok,
-                own_media=("video", entry["file_id"]),
-                config=config)
+                config, bot_id=dbmod.get_bot_id(conn, config),
+                bank_tok=_tok,
+                own_media=("video", entry["file_id"]))
         elif result.status == "not_found":
             await _answer_identify_clip_fallback(
                 callback.message, conn, config, data, entry["file_id"])
@@ -1783,6 +1804,10 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     log_event(log, "identify_stage", stage="cache_check",
               ms=int((_time.time() - t0) * 1000),
               hit=cached is not None)
+    # A cached "not_found" predates the exclusive bank: the bank may hold
+    # this song now, so fall through to the bank-only check below (Stage 1
+    # + fingerprint) instead of returning — Shazam is NOT re-run.
+    bank_only = False
     if cached is not None:
         log_event(log, "identify_stage", stage="result_sent",
                   ms=int((_time.time() - t0) * 1000),
@@ -1790,7 +1815,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         if cached["status"] == "identified":
             return AudioIdResult(status="identified", title=cached["title"],
                                  artist=cached["artist"])
-        return AudioIdResult(status="not_found")
+        bank_only = True
 
     def _cache_store(status: str, title: str = "", artist: str = "") -> None:
         # Terminal results only; errors are never cached.
@@ -1833,6 +1858,49 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                 pass
         # Distinct extraction-stage error — never "not_found".
         return AudioIdResult(status="error", detail=reason)
+    # Stage 1.5: exclusive Avano bank (user order 2026-11-07) — fingerprint
+    # the validated sample FIRST, before any external lookup. A confident
+    # match returns the bank song's title/artist; the delivery points route
+    # it to the exclusive file via _exclusive_song_for. Any bank error
+    # fails OPEN: the Shazam -> AudD -> ACRCloud chain runs untouched.
+    # `bank_only` (cached not_found) skips that chain after the bank check.
+    if _XBANK_OK:
+        try:
+            from .exclusive_bank import (
+                fingerprint_bytes as _xb_fingerprint,
+                inc_identify as _xb_inc,
+                match_sample as _xb_match, _get_conn as _xb_conn)
+            import asyncio as _asyncio
+            _xb_items = None
+            try:
+                _xb_bytes = wav if wav is not None else data
+                _dur, _xb_items = await _asyncio.get_running_loop().run_in_executor(
+                    None, _xb_fingerprint, _xb_bytes,
+                    ".wav" if wav is not None else ".bin")
+            except Exception:
+                _xb_items = None
+            if _xb_items:
+                _xb_c = _xb_conn()
+                if _xb_c is not None:
+                    _song, _sim = _xb_match(_xb_c, _xb_items)
+                    if _song is not None:
+                        log_event(log, "identify_stage", stage="exclusive_bank",
+                                  ms=int((_time.time() - t0) * 1000),
+                                  status="identified", sim=round(_sim, 3),
+                                  title=_song["title"])
+                        try:
+                            _xb_inc(_xb_c, _song["id"])
+                        except Exception:
+                            pass
+                        _cache_store("identified", _song["title"], _song["artist"])
+                        return AudioIdResult(status="identified",
+                                             title=_song["title"],
+                                             artist=_song["artist"])
+        except Exception as _e:
+            log_event(log, "identify_stage", stage="exclusive_bank",
+                      ok=False, reason=f"bank_check_failed:{type(_e).__name__}")
+    if bank_only:
+        return AudioIdResult(status="not_found")
     # Stage 2: Shazam windows. Each window is (raw_probe, prepared_wav):
     # signable raw inputs take the old raw path verbatim; codec-rejected
     # inputs (AAC, Opus, …) reuse the validation WAV — no second ffmpeg
@@ -2194,9 +2262,9 @@ async def _answer_link_identify_result(message, conn, config, outcome,
         # unusable, the second search can still run on this audio.
         _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                       heard or None, media_hint, page_text)
-        await _send_professional_song_card(message, conn, title, artist,
-                                           bot_id=dbmod.get_bot_id(conn, config),
-                                           bank_token=_tok)
+        await _send_identified_song(message, conn, title, artist, config,
+                                    bot_id=dbmod.get_bot_id(conn, config),
+                                    bank_tok=_tok)
     elif needs_file:
         _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                       heard or None, media_hint, page_text)
@@ -2283,6 +2351,75 @@ async def _run_link_channel_stage(message, conn, config, page_text: str) -> bool
     await _answer(message, conn,
                   f"{t('channel_post', ulang)}\n{post['post_url']}\n{post['text'][:300]}")
     return True
+
+
+def _exclusive_song_for(title: str, artist: str):
+    """Active exclusive-bank row for an identified title/artist, or None.
+
+    Never raises; an unavailable bank simply means 'no exclusive song'.
+    This is the delivery-side half of the bank priority rule: the
+    fingerprint match inside _identify_audio identifies bank-only songs,
+    and this lookup routes ANY confident identification of a bank song
+    (Shazam, AudD, cached) to the exclusive file.
+    """
+    if not _XBANK_OK:
+        return None
+    try:
+        from .exclusive_bank import _get_conn as _xb_conn, find_by_title_artist as _xb_find
+        _c = _xb_conn()
+        if _c is None:
+            return None
+        return _xb_find(_c, title, artist)
+    except Exception:
+        return None
+
+
+async def _send_exclusive_song(message, song) -> bool:
+    """Send an exclusive-bank song's full file with the exclusive card.
+
+    Sends the stored Telegram file_id as audio — no re-encode, no
+    recompression, the original quality. Returns True on success;
+    False when the send failed (caller falls back to the catalog card).
+    """
+    from .exclusive_bank import exclusive_card_text, inc_download
+    caption = exclusive_card_text(song)
+    sent = None
+    try:
+        if song.get("cover_file_id"):
+            try:
+                sent = await message.answer_audio(
+                    song["file_id"], caption=caption,
+                    thumbnail=song["cover_file_id"])
+            except Exception:
+                sent = None
+        if sent is None:
+            sent = await message.answer_audio(song["file_id"], caption=caption)
+    except Exception as e:
+        log_event(log, "exclusive_bank", stage="send_failed",
+                  song_id=song.get("id"), reason=type(e).__name__)
+        return False
+    try:
+        from .exclusive_bank import _get_conn as _xb_conn
+        _c = _xb_conn()
+        if _c is not None:
+            inc_download(_c, song["id"])
+    except Exception:
+        pass
+    return True
+
+
+async def _send_identified_song(message, conn, title: str, artist: str, config,
+                                bot_id: str = "", bank_tok: str = "",
+                                own_media: tuple | None = None):
+    """Deliver an identified song: exclusive-bank file first, else the
+    catalog card. One routing point for all three identify entry points
+    (video button, link, direct file/voice)."""
+    song = _exclusive_song_for(title, artist)
+    if song is not None and await _send_exclusive_song(message, song):
+        return
+    await _send_professional_song_card(
+        message, conn, title, artist, bot_id=bot_id,
+        bank_token=bank_tok, own_media=own_media, config=config)
 
 
 async def _send_professional_song_card(message, conn, title: str, artist: str, bot_id: str = "",
@@ -3724,12 +3861,11 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
     _tok = await _arm_bank_sample(conn, config, "file",
                                   __import__("hashlib").sha256(data).hexdigest(),
                                   data, "", caption)
-    await _send_professional_song_card(
-        message, conn, result.title, result.artist,
+    await _send_identified_song(
+        message, conn, result.title, result.artist, config,
         bot_id=dbmod.get_bot_id(conn, config),
-        bank_token=_tok,
-        own_media=(media_kind, media.file_id),
-        config=config)
+        bank_tok=_tok,
+        own_media=(media_kind, media.file_id))
 
 
 
