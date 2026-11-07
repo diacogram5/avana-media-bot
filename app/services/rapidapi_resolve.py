@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import date as _date
 
 import httpx
 
@@ -74,6 +75,30 @@ STRATEGY = "rapidapi"
 # The API waits up to 30 s on the platform; the docs ask for >= 35 s.
 DEFAULT_TIMEOUT = 35.0
 _MAX_ATTEMPTS = 2  # one retry, only on 5xx / transport errors (never billed)
+
+# Quota accounting (2026-11-08, user order): Basic free plan = 1,000
+# credits/month; IG reel/post = 2, IG story = 5, TikTok = 2. Failed
+# fetches cost 0, so only successful video fetches count. In-memory
+# only — the counter resets on restart (Render free restarts wipe it);
+# the monthly total is reconstructible from the per-fetch log lines.
+# Warn at 80% (400 reel-credits) so the cap is never hit silently.
+_QUOTA_MONTHLY_LIMIT = 1000
+_QUOTA_WARN_AT = 400
+_quota_used: dict[str, int] = {}  # "YYYY-MM" -> credits spent
+
+
+def _quota_note(url: str) -> None:
+    """Charge one successful video fetch and log the monthly total."""
+    month = _date.today().strftime("%Y-%m")
+    cost = 5 if "/stories/" in url else 2
+    total = _quota_used.get(month, 0) + cost
+    _quota_used[month] = total
+    if total >= _QUOTA_WARN_AT:
+        log.warning("rapidapi quota warning: %d/%d credits used in %s",
+                    total, _QUOTA_MONTHLY_LIMIT, month)
+    else:
+        log.info("rapidapi quota: %d/%d credits used in %s",
+                 total, _QUOTA_MONTHLY_LIMIT, month)
 
 
 class RapidAPIKeyMissing(RuntimeError):
@@ -149,7 +174,10 @@ async def resolve_via_rapidapi(
                 # 5xx: temporary, retry after a second, never billed.
                 await asyncio.sleep(1.0)
                 continue
-            return _parse_fetch_response(resp, key)
+            result = _parse_fetch_response(resp, key)
+            if result[0] and result[1]:
+                _quota_note(url)
+            return result
         # Unreachable in practice (loop always returns), kept for safety.
         log.warning("rapidapi fetch transport error: %s",
                     type(last_exc).__name__ if last_exc else "unknown")
@@ -174,6 +202,9 @@ def _parse_fetch_response(
         return None, None, STRATEGY
     if not data.get("ok"):
         detail = _redact(str(data.get("detail") or ""), key)
+        if resp.status_code == 429:
+            log.warning("rapidapi quota/rate-limit: HTTP 429, detail=%s",
+                        detail)
         log.info("rapidapi fetch: HTTP %s, ok=false, detail=%s",
                  resp.status_code, detail)
         return None, None, STRATEGY

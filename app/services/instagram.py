@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re as _re
 from urllib.parse import quote
 
 import httpx
@@ -40,6 +41,25 @@ log = get_logger(__name__)
 DESKTOP_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 GOOGLEBOT_UA = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
 _STRATEGY_TIMEOUT = 12
+
+# RapidAPI shortcode cache (2026-11-08, user order): a successful
+# /fetch costs 2 credits (500 reels/month on the free plan), so a
+# repeat of the SAME reel inside 15 min must NOT call /fetch again.
+# In-memory only, TTL 900 s, cap 128 entries. The cached URL is a
+# signed CDN link, so the TTL is deliberately short — it must never
+# be served for hours. Keyed by shortcode (not the full URL) so a
+# reel with different tracking params still hits.
+_RAPIDAPI_CACHE_TTL = 900
+_RAPIDAPI_CACHE_MAX = 128
+_rapidapi_cache: dict[str, tuple[str, str, str, float]] = {}
+
+
+def _shortcode(page_url: str) -> str:
+    """Instagram shortcode from a reel/post URL, "" when unknown."""
+    m = _re.search(r"instagram\.com/(?:reel|p|tv)/([A-Za-z0-9_-]+)",
+                   page_url)
+    return m.group(1) if m else ""
+
 
 _OEMBED_ENDPOINT = "https://www.instagram.com/oauth/oembed/?url="
 # Real gating markers an age/region-restricted reel's public oEmbed
@@ -208,18 +228,31 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
             # anonymous strategies all failed AND RAPIDAPI_KEY is set.
             # Fail-open: no key (or any API failure) leaves the
             # behaviour exactly as before (strategy "none"). The
-            # signed CDN URL is never cached — it expires.
+            # signed CDN URL is never cached beyond the 15-min
+            # shortcode cache — it expires.
             try:
                 from .rapidapi_resolve import (
                     RapidAPIKeyMissing,
                     resolve_via_rapidapi,
                 )
+                _sc = _shortcode(page_url)
+                _hit = _rapidapi_cache.get(_sc) if _sc else None
+                if _hit and (_time.time() - _hit[3]) < _RAPIDAPI_CACHE_TTL:
+                    log_event(log, "instagram_resolve",
+                              strategy="rapidapi", cached=True,
+                              ms=int((_time.time() - _t0) * 1000))
+                    return _hit[0], _hit[1], _hit[2] or page_text, "rapidapi"
                 try:
                     _ra_audio, _ra_video, _ = await resolve_via_rapidapi(
                         page_url)
                 except RapidAPIKeyMissing:
                     _ra_audio = _ra_video = None
                 if _ra_audio and _ra_video:
+                    if _sc:
+                        if len(_rapidapi_cache) >= _RAPIDAPI_CACHE_MAX:
+                            _rapidapi_cache.pop(next(iter(_rapidapi_cache)))
+                        _rapidapi_cache[_sc] = (
+                            _ra_audio, _ra_video, page_text, _time.time())
                     log_event(log, "instagram_resolve",
                               strategy="rapidapi",
                               ms=int((_time.time() - _t0) * 1000))
@@ -268,6 +301,12 @@ async def fetch_merged_video(video_url: str, audio_url: str | None = None,
                 data = resp.content
                 if data and len(data) <= max_mb * 1024 * 1024:
                     return data
+        except httpx.HTTPStatusError as exc:
+            # 2026-11-08: a 429 here means Render's IP is blocked on
+            # the CDN too — log the status so it is reported at once.
+            log_event(log, "instagram_merge", stage="stream_download",
+                      status=exc.response.status_code,
+                      ms=int((_time.time() - t0) * 1000))
         except Exception:
             pass
         return b""
