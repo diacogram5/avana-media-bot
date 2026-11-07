@@ -125,6 +125,12 @@ APARAT_SEEDS = (
     ("Masafinia.m", "d27o7qv"),
     # Single-seed (related=0, deliberate): celebratory مادر clip.
     ("toop_media", "grkx541"),
+    # REPORT4 (2026-11-07, all show-verified live with a related graph;
+    # related counts re-checked independently via included[]):
+    ("digikot", "yuq794c"),      # زنگ تفریح — جدایی 17 + دلتنگ 21 (50/50 short)
+    ("Star_2020", "necos8x"),    # باران کلیپ — ولنتاین (14/14 short)
+    ("Mina_diba", "n3570i1"),    # کافه آموزش و سرگرمی — کنایه (3rd source)
+    ("Sjadkazmei", "comv1g1"),   # رؤیای آبي — نوروز/عید (small graph, 5 short)
 )
 # SEED_PRIOR: verified single-theme seeds only (hunt REPORT2/REPORT3:
 # the seed's own video + a sampled related graph were checked clip by
@@ -143,6 +149,8 @@ SEED_PRIOR = {
     "d27o7qv": ("happy", "success"),      # Masafinia.m 2nd — موفقیت/انگیزشی
     "o214420": ("occasion", "anniversary"),  # Aparat_Media_pars — سالگرد
     "grkx541": ("occasion", "parents"),   # toop_media — تبریک روز مادر
+    "necos8x": ("occasion", "valentine"),  # Star_2020 — seed + 100% of
+    # its short graph are ولنتاین (single-theme, REPORT4).
 }
 AP_BOOTSTRAP_SHOW_CALLS = 40    # max Aparat show calls on the first run
 AP_BOOTSTRAP_NEW = 20           # max Aparat clips accepted on the first run

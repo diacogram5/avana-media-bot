@@ -31,12 +31,13 @@ Checks (all on REAL fixtures — repo excerpts of the verified fetches):
      carry data-post='dosti/...').
  12. Aparat seed rotation: THREE seeds per run (since 2026-11-06 —
      one seed per run took ~15h to cover 15 seeds), round-robin
-     across the 15 seeds / 14 creators (faezehradmanesh, Multimedia2020,
+     across the 19 seeds / 18 creators (faezehradmanesh, Multimedia2020,
      Clip_film2023, Masafinia.m x2, Amirabbas.b, AparatVision,
      Tafrihi_Best, Aparat_Media_pars, Kartoonchi, nasi20, vidoma,
-     Sargarmi_kids, Film_Tvs, toop_media); 5 runs cover all seeds, the
-     6th wraps; the per-run show-call bound (24) is TOTAL, not per
-     seed; the Multimedia2020 fixture parses (50 related, 49 short);
+     Sargarmi_kids, Film_Tvs, toop_media, digikot, Star_2020, Mina_diba,
+     Sjadkazmei); 7 runs cover all seeds, the 7th takes the last one;
+     the per-run show-call bound (24) is TOTAL, not per seed; the
+     Multimedia2020 fixture parses (50 related, 49 short);
      a 61s clip is rejected by the 60s cap.
 
 Fake aiogram mirrors the REAL aiogram 3 layout only (lesson 2026-11-05).
@@ -801,38 +802,42 @@ async def main():
 
     seeds = []
     news = []
-    for _ in range(6):
+    for _ in range(7):
         r = await feed.run_aparat_cycle(bootstrap=False,
                                         aparat_fetcher=ap_rot)
         seeds.append(r.get("seeds"))
         news.append(r.get("new"))
-    check("rotation: THREE seeds per run, round-robin across 15 seeds",
+    check("rotation: THREE seeds per run, round-robin across 19 seeds",
           seeds == [["faezehradmanesh", "Multimedia2020", "Clip_film2023"],
                     ["Masafinia.m", "Amirabbas.b", "AparatVision"],
                     ["Tafrihi_Best", "Aparat_Media_pars", "Kartoonchi"],
                     ["nasi20", "vidoma", "Sargarmi_kids"],
                     ["Film_Tvs", "Masafinia.m", "toop_media"],
-                    ["faezehradmanesh", "Multimedia2020", "Clip_film2023"]],
+                    ["digikot", "Star_2020", "Mina_diba"],
+                    ["Sjadkazmei", "faezehradmanesh", "Multimedia2020"]],
           f"got {seeds}")
     # Run 1 floods to the 15-new cap from the Multimedia2020 graph
     # (13 related; the 3 seeds are already intaken by the incremental
     # cycle test above). Run 2 takes only 2 fresh seeds — xse8if0 was
-    # intaken by that same incremental cycle. Runs 3-5 take their 3
-    # fresh seeds each. Run 6 wraps: the MM graph still has unfetched
-    # related, but the 24-call bound stops it at 1 new (15 MM dup +
-    # 1 fresh in 24 calls).
-    check("rotation: new counts per run [15, 2, 3, 3, 3, 1]",
-          news == [15, 2, 3, 3, 3, 1], f"got {news}")
-    check("rotation: seed index wraps (6 runs of 3 from 0 -> 3)",
-          feed.feed_get("ap_seed_idx") == "3",
+    # intaken by that same incremental cycle. Runs 3-6 take their 3
+    # fresh seeds each (run 6 = the three REPORT4 seeds digikot /
+    # Star_2020 / Mina_diba). Run 7 takes Sjadkazmei (the 19th seed)
+    # plus 2 wrapped seeds whose clips are already intaken — and 1
+    # more fresh clip from the Multimedia2020 graph's remaining
+    # related (run 1 hit the 15-new cap before exhausting it).
+    check("rotation: new counts per run [15, 2, 3, 3, 3, 3, 2]",
+          news == [15, 2, 3, 3, 3, 3, 2], f"got {news}")
+    check("rotation: seed index after 7 runs of 3 from 0 -> 2",
+          feed.feed_get("ap_seed_idx") == "2",
           f"got {feed.feed_get('ap_seed_idx')!r}")
-    check("rotation: each new seed's own clip intaken (REPORT2 + REPORT3 seeds)",
+    check("rotation: each new seed's own clip intaken (REPORT2 + REPORT3 + REPORT4 seeds)",
           all((sarch.get_clip_by_unique("feed:ap:" + u) or {}).get("status")
               == "pending" for u in ("DCBas", "xse8if0", "lfe35b0",
                                      "m569u20", "okm549l", "o214420",
                                      "mtnx5t2", "JcnT6", "cxoia5d",
                                      "ryg56w3", "mwrma4b", "d27o7qv",
-                                     "grkx541")))
+                                     "grkx541", "yuq794c", "necos8x",
+                                     "n3570i1", "comv1g1")))
 
     def ap_bound(uid):
         # show rejected by the accept gate (61s) while 49 related
