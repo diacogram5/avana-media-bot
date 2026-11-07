@@ -2394,23 +2394,26 @@ def _exclusive_song_for(title: str, artist: str):
 async def _send_exclusive_song(message, song) -> bool:
     """Send an exclusive-bank song's full file with the exclusive card.
 
-    Sends the stored Telegram file_id as audio — no re-encode, no
-    recompression, the original quality. Returns True on success;
-    False when the send failed (caller falls back to the catalog card).
+    Sends the PREPARED version's stored Telegram file_id when one is
+    stored, else the original file_id — no re-download, no re-conversion
+    at delivery time, and no bitrate error can block the send. Returns
+    True on success; False when the send failed (caller falls back to
+    the catalog card).
     """
-    from .exclusive_bank import exclusive_card_text, inc_download
+    from .exclusive_bank import delivery_file_id, exclusive_card_text, inc_download
     caption = exclusive_card_text(song)
+    fid = delivery_file_id(song)
     sent = None
     try:
         if song.get("cover_file_id"):
             try:
                 sent = await message.answer_audio(
-                    song["file_id"], caption=caption,
+                    fid, caption=caption,
                     thumbnail=song["cover_file_id"])
             except Exception:
                 sent = None
         if sent is None:
-            sent = await message.answer_audio(song["file_id"], caption=caption)
+            sent = await message.answer_audio(fid, caption=caption)
     except Exception as e:
         log_event(log, "exclusive_bank", stage="send_failed",
                   song_id=song.get("id"), reason=type(e).__name__)

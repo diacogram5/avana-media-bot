@@ -19,9 +19,16 @@ Design
   same song 0.93. Gate: similarity >= 0.75 AND >= 15 matched items.
   An uncertain result is NEVER declared a match.
 * Quality: the REAL bitrate is probed with ffprobe from the downloaded
-  bytes (full file, or the first 2 MB head). A file is labelled 320 kbps
-  ONLY when ffprobe reports 320000. Upconverting a low-bitrate file does
-  not create real quality, so the measured value is stored and shown.
+  bytes (full file, or the first 2 MB head). BOTH versions are stored
+  (user order 2026-11-07): the ORIGINAL file exactly as received (its
+  real bitrate is recorded) and a PREPARED MP3 320 kbps CBR copy built
+  by ffmpeg when needed — an MP3 below 320, or a non-MP3 input. An MP3
+  already at 320 needs no conversion: the prepared version IS the
+  original file. Delivery always sends the prepared version by file_id
+  (no re-download, no re-conversion); the original stays the bank
+  source. Files over the 20 MB download cap (head-only) get no prepared
+  version and deliver the original. Never claim the conversion restores
+  quality lost in the original compression.
 * Add flow: admin sends the MP3 in the admin panel (``xbank:panel``).
   Full-file download (Bot API, <= 20 MB) is tried first so the stored
   fingerprint covers the WHOLE song; for larger files the first-2 MB
@@ -40,7 +47,6 @@ Design
 
 import hashlib
 import json
-import logging
 import os
 import subprocess
 import tempfile
@@ -48,7 +54,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-_log = logging.getLogger("avana.exclusive_bank")
+from ..logging_config import get_logger
+
+_log = get_logger("avana.exclusive_bank")
 
 # --- fingerprint gates (measured 2026-11-07, see module docstring) ---
 # Chromaprint needs a ~2.5s warm-up (a 2s sample yields ZERO items) and
@@ -70,6 +78,8 @@ FP_SAMPLE_MAX_SECONDS = 120   # identify-time samples are short anyway
 HEAD_MAX_BYTES = 2 * 1024 * 1024
 FPCALC_TIMEOUT_SEC = 20
 FFPROBE_TIMEOUT_SEC = 15
+UPGRADE_TIMEOUT_SEC = 180       # ffmpeg re-encode to 320k (admin add)
+UPGRADE_MAX_BYTES = 50 * 1024 * 1024  # Bot API send cap for the upgraded file
 
 _TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS exclusive_songs (
@@ -81,6 +91,10 @@ CREATE TABLE IF NOT EXISTS exclusive_songs (
     duration_sec REAL NOT NULL DEFAULT 0,
     bitrate_kbps INTEGER NOT NULL DEFAULT 0,
     file_size INTEGER NOT NULL DEFAULT 0,
+    ready_file_id TEXT NOT NULL DEFAULT '',
+    ready_file_unique_id TEXT NOT NULL DEFAULT '',
+    ready_bitrate_kbps INTEGER NOT NULL DEFAULT 0,
+    ready_file_size INTEGER NOT NULL DEFAULT 0,
     fingerprint TEXT NOT NULL DEFAULT '',
     fp_duration REAL NOT NULL DEFAULT 0,
     fp_partial INTEGER NOT NULL DEFAULT 0,
@@ -140,8 +154,42 @@ def _init_tables(conn) -> None:
         return
     for stmt in (s.strip() for s in _TABLE_DDL.split(";") if s.strip()):
         conn.execute(stmt)
+    _migrate_tables(conn)
     conn.commit()
     _tables_ready_for.add(key)
+
+
+# Columns added after the first bank deploy (dual-version store, user
+# order 2026-11-07): the prepared MP3 320 version alongside the original.
+_READY_COLS = {
+    "ready_file_id": "TEXT NOT NULL DEFAULT ''",
+    "ready_file_unique_id": "TEXT NOT NULL DEFAULT ''",
+    "ready_bitrate_kbps": "INTEGER NOT NULL DEFAULT 0",
+    "ready_file_size": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _migrate_tables(conn) -> None:
+    """Add the ready-version columns to a pre-existing bank table.
+
+    Idempotent; runs once per connection via _init_tables. Never raises.
+    """
+    try:
+        have = {r[1] for r in conn.execute(
+            "PRAGMA table_info(exclusive_songs)").fetchall()}
+    except Exception:
+        return
+    for col, ddl in _READY_COLS.items():
+        if col not in have:
+            try:
+                conn.execute(
+                    f"ALTER TABLE exclusive_songs ADD COLUMN {col} {ddl}")
+            except Exception as e:
+                _log.warning("exclusive_bank: migrate %s failed: %s", col, e)
+    try:
+        conn.commit()
+    except Exception:
+        pass
 
 
 def bank_available() -> bool:
@@ -348,12 +396,32 @@ def download_head(bot_token: str, file_path: str, max_bytes: int = HEAD_MAX_BYTE
         return None
 
 
-def analyse_audio_bytes(data: bytes):
-    """Bitrate + fingerprint from audio bytes (full file or head).
+def probe_tags(path: str):
+    """(title, artist) from the file's own metadata tags, "" when absent.
 
-    Returns dict(bitrate_kbps, duration_sec, fp_duration, fp_items) with
-    fp_items a comma-separated string ("" when fingerprinting failed).
-    Never raises.
+    ffprobe reads format tags; keys are matched case-insensitively.
+    Never raises. Fallback suggestion when Telegram did not parse the
+    audio's own title/performer.
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SEC)
+        tags = (json.loads(r.stdout or "{}").get("format") or {}).get("tags") or {}
+        lower = {str(k).lower(): v for k, v in tags.items()}
+        return (str(lower.get("title") or "").strip(),
+                str(lower.get("artist") or "").strip())
+    except Exception:
+        return "", ""
+
+
+def analyse_audio_bytes(data: bytes):
+    """Bitrate + fingerprint + metadata tags from audio bytes (full file or head).
+
+    Returns dict(bitrate_kbps, duration_sec, fp_duration, fp_items,
+    title, artist) with fp_items a comma-separated string ("" when
+    fingerprinting failed). Never raises.
     """
     fd, path = tempfile.mkstemp(suffix=".mp3")
     try:
@@ -362,15 +430,17 @@ def analyse_audio_bytes(data: bytes):
         fd = None
         bitrate = probe_bitrate(path)
         duration = probe_duration(path)
+        tag_title, tag_artist = probe_tags(path)
         fp_dur, fp_items = fingerprint_file(path, max_seconds=FP_MAX_SECONDS)
         return {"bitrate_kbps": bitrate,
                 "duration_sec": duration,
+                "title": tag_title, "artist": tag_artist,
                 "fp_duration": fp_dur or 0.0,
                 "fp_items": ",".join(str(x) for x in fp_items) if fp_items else ""}
     except Exception as e:
         _log.warning("exclusive_bank: analyse_audio_bytes failed: %s", e)
         return {"bitrate_kbps": 0, "duration_sec": 0.0,
-                "fp_duration": 0.0, "fp_items": ""}
+                "fp_duration": 0.0, "fp_items": "", "title": "", "artist": ""}
     finally:
         try:
             if fd is not None:
@@ -381,6 +451,50 @@ def analyse_audio_bytes(data: bytes):
             os.unlink(path)
         except Exception:
             pass
+
+
+def upconvert_to_320(data: bytes):
+    """Re-encode audio bytes to MP3 320 kbps CBR via ffmpeg.
+
+    Returns the upgraded bytes, or None on any failure. Never raises.
+    Used by the admin add flow only (user order 2026-11-07): a file
+    below 320 kbps is upgraded by the bot itself instead of being
+    registered with a low-bitrate warning.
+    """
+    if not data:
+        return None
+    fd_in, path_in = tempfile.mkstemp(suffix=".bin")
+    fd_out, path_out = tempfile.mkstemp(suffix=".mp3")
+    try:
+        os.write(fd_in, data)
+        os.close(fd_in)
+        fd_in = None
+        os.close(fd_out)
+        fd_out = None
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", path_in,
+             "-vn", "-c:a", "libmp3lame", "-b:a", "320k", path_out],
+            capture_output=True, timeout=UPGRADE_TIMEOUT_SEC)
+        if r.returncode != 0:
+            return None
+        with open(path_out, "rb") as f:
+            out = f.read()
+        return out or None
+    except Exception as e:
+        _log.warning("exclusive_bank: upconvert failed: %s", e)
+        return None
+    finally:
+        for fd in (fd_in, fd_out):
+            try:
+                if fd is not None:
+                    os.close(fd)
+            except Exception:
+                pass
+        for p in (path_in, path_out):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +510,10 @@ def _row_to_dict(row, cols):
 
 
 _COLS = ("id", "title", "artist", "file_id", "file_unique_id",
-         "duration_sec", "bitrate_kbps", "file_size", "fingerprint",
+         "duration_sec", "bitrate_kbps", "file_size",
+         "ready_file_id", "ready_file_unique_id",
+         "ready_bitrate_kbps", "ready_file_size",
+         "fingerprint",
          "fp_duration", "fp_partial", "cover_file_id", "description",
          "active", "identify_count", "download_count", "added_by", "added_at")
 
@@ -469,18 +586,24 @@ def find_duplicate(conn, title: str, artist: str, fp_items):
 
 def add_song(conn, *, title, artist, file_id, file_unique_id, duration_sec,
              bitrate_kbps, file_size, fingerprint, fp_duration, fp_partial,
-             cover_file_id="", description="", added_by=0):
+             cover_file_id="", description="", added_by=0,
+             ready_file_id="", ready_file_unique_id="",
+             ready_bitrate_kbps=0, ready_file_size=0):
     _init_tables(conn)
     now = int(time.time())
     cur = conn.execute(
         """INSERT INTO exclusive_songs
            (title, artist, file_id, file_unique_id, duration_sec,
-            bitrate_kbps, file_size, fingerprint, fp_duration, fp_partial,
+            bitrate_kbps, file_size, ready_file_id, ready_file_unique_id,
+            ready_bitrate_kbps, ready_file_size,
+            fingerprint, fp_duration, fp_partial,
             cover_file_id, description, active, identify_count,
             download_count, added_by, added_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?)""",
         (title.strip(), artist.strip(), file_id, file_unique_id, duration_sec,
-         bitrate_kbps, file_size, fingerprint, fp_duration, 1 if fp_partial else 0,
+         bitrate_kbps, file_size, ready_file_id, ready_file_unique_id,
+         ready_bitrate_kbps, ready_file_size,
+         fingerprint, fp_duration, 1 if fp_partial else 0,
          cover_file_id or "", description or "", added_by, now))
     conn.commit()
     try:
@@ -571,11 +694,23 @@ def match_sample(conn, query_items):
     return song, sim
 
 
+def delivery_file_id(song) -> str:
+    """file_id to send for an identified bank song: the prepared MP3
+    version when one is stored, else the original file. No re-download,
+    no re-conversion at delivery time (user order 2026-11-07)."""
+    return (song.get("ready_file_id") or song.get("file_id") or "")
+
+
 def exclusive_card_text(song) -> str:
     """The delivery card, exactly as the user specified (plus the bot id,
     which the standing rule requires on everything the bot sends). The
-    bitrate shown is the MEASURED one — never a claimed 320."""
-    kbps = int(song.get("bitrate_kbps") or 0)
+    bitrate shown is the MEASURED one of the file actually delivered —
+    the prepared version when one is stored, else the original."""
+    if song.get("ready_file_id"):
+        kbps = int(song.get("ready_bitrate_kbps")
+                   or song.get("bitrate_kbps") or 0)
+    else:
+        kbps = int(song.get("bitrate_kbps") or 0)
     quality = f"{kbps}kbps" if kbps else "نامشخص"
     return (f"🎵 آهنگ در بانک اختصاصی آوانو شناسایی شد!\n"
             f"\n"
@@ -711,11 +846,15 @@ def _song_detail_text(song) -> str:
     fp = "کامل" if not song.get("fp_partial") else "جزئی (فقط ابتدای آهنگ)"
     lines = [f"🎵 {song['title']}",
              f"🎤 {song['artist']}",
-             f"🎧 کیفیت واقعی: MP3 {kbps}kbps" if kbps else "🎧 کیفیت واقعی: نامشخص",
+             f"🎧 کیفیت اصلی: MP3 {kbps}kbps" if kbps else "🎧 کیفیت اصلی: نامشخص",
              f"⏱ مدت: {_fmt_duration(song.get('duration_sec') or 0)}",
              f"🔍 اثر انگشت: {fp}",
              f"📊 شناسایی: {song.get('identify_count') or 0} | دانلود: {song.get('download_count') or 0}",
              f"وضعیت: {'✅ فعال' if song.get('active') else '❌ غیرفعال'}"]
+    if song.get("ready_file_id"):
+        rkbps = int(song.get("ready_bitrate_kbps") or 0)
+        lines.append(f"📤 نسخه آماده: MP3 {rkbps}kbps"
+                     if rkbps else "📤 نسخه آماده: ذخیره شده")
     if song.get("description"):
         lines.append(f"📝 {song['description']}")
     return "\n".join(lines)
@@ -983,8 +1122,7 @@ def register_exclusive_bank_handlers(router) -> None:
         await callback.answer()
         await callback.message.answer(
             "فایل MP3 کامل آهنگ را بفرستید.\n"
-            "بیت‌ریت واقعی بررسی می‌شود؛ فایلی که واقعاً 320kbps نباشد، "
-            "به‌عنوان 320 ثبت نمی‌شود.\n"
+            "فایل اصلی بدون تغییر در بانک حفظ می‌شود و نسخه MP3 با 320kbps آماده می‌شود.\n"
             "برای لغو، «لغو» را بفرستید.")
 
     @router.message(F.audio | F.document, StateFilter("xbank:add:file"))
@@ -1002,7 +1140,11 @@ def register_exclusive_bank_handlers(router) -> None:
         if fname and not fname.endswith((".mp3", ".m4a", ".flac", ".wav", ".ogg")):
             await message.answer("پسوند فایل صوتی نیست. یک فایل MP3 بفرستید.")
             return
-        await message.answer("⏳ در حال بررسی فایل…")
+        await message.answer(
+            "🎵 فایل آهنگ دریافت شد.\n"
+            "🔍 بررسی مشخصات صوتی...\n"
+            "⚙️ آماده‌سازی نسخه MP3...\n"
+            "💾 ذخیره در بانک اختصاصی آوانو")
         import asyncio as _asyncio
         import io as _io
 
@@ -1053,21 +1195,75 @@ def register_exclusive_bank_handlers(router) -> None:
                     "پیش‌تر در بانک ثبت شده است.")
                 await state.clear()
                 return
+        # Prepared MP3 version (user order 2026-11-07): the ORIGINAL file
+        # is always kept as the bank source. When it needs a prepared
+        # version — an MP3 below 320, or a non-MP3 input — ffmpeg builds
+        # an MP3 320 kbps CBR copy, uploaded to the admin chat; ITS
+        # file_id is stored as the ready version. An MP3 already at 320
+        # needs no conversion: the ready version IS the original file.
+        # Any failure falls through silently: the original is registered
+        # alone (fail open).
+        ready = {"file_id": "", "file_unique_id": "",
+                 "bitrate_kbps": 0, "file_size": 0}
+        if not partial:
+            is_mp3 = fname.endswith(".mp3") or mime == "audio/mpeg"
+            kbps0 = info["bitrate_kbps"]
+            if is_mp3 and kbps0 == 320:
+                ready = {"file_id": res["file_id"],
+                         "file_unique_id": res["file_unique_id"],
+                         "bitrate_kbps": 320, "file_size": size}
+            else:
+                up_bytes = await _asyncio.get_running_loop().run_in_executor(
+                    None, upconvert_to_320, data)
+                if up_bytes and len(up_bytes) <= UPGRADE_MAX_BYTES:
+                    up_info = await _asyncio.get_running_loop().run_in_executor(
+                        None, analyse_audio_bytes, up_bytes)
+                    if up_info.get("fp_items") and up_info.get("bitrate_kbps") == 320:
+                        try:
+                            from aiogram.types import BufferedInputFile as _BIF
+                            up_name = (fname or "song.mp3")
+                            if not up_name.lower().endswith(".mp3"):
+                                up_name = os.path.splitext(up_name)[0] + ".mp3"
+                            sent = await message.bot.send_audio(
+                                message.chat.id,
+                                _BIF(up_bytes, filename=up_name),
+                                caption="نسخه MP3 با 320kbps — نسخه آماده ارسال در بانک اختصاصی.")
+                            ready = {"file_id": sent.audio.file_id,
+                                     "file_unique_id": sent.audio.file_unique_id,
+                                     "bitrate_kbps": 320,
+                                     "file_size": len(up_bytes)}
+                        except Exception as _e:
+                            _log.warning("exclusive_bank: prepared upload failed: %s", _e)
         await state.update_data(
             file_id=res["file_id"], file_unique_id=res["file_unique_id"],
             file_size=res["file_size"], duration_sec=info["duration_sec"],
             bitrate_kbps=info["bitrate_kbps"], fp_items=info["fp_items"],
-            fp_duration=info["fp_duration"], fp_partial=res["partial"])
+            fp_duration=info["fp_duration"], fp_partial=res["partial"],
+            ready_file_id=ready["file_id"],
+            ready_file_unique_id=ready["file_unique_id"],
+            ready_bitrate_kbps=ready["bitrate_kbps"],
+            ready_file_size=ready["file_size"])
         kbps = info["bitrate_kbps"]
-        bitrate_line = (f"بیت‌ریت واقعی: {kbps}kbps ✅"
-                        if kbps == 320 else
-                        f"بیت‌ریت واقعی: {kbps}kbps — توجه: این فایل 320 نیست و به‌عنوان 320 ثبت نمی‌شود."
-                        if kbps else "بیت‌ریت واقعی: نامشخص")
+        if ready["file_id"] and ready["file_id"] != res["file_id"]:
+            bitrate_line = (f"🎧 کیفیت اصلی: {kbps}kbps\n"
+                            f"📤 نسخه آماده ارسال: MP3 320kbps ✅")
+        elif ready["file_id"]:
+            bitrate_line = (f"🎧 کیفیت اصلی: {kbps}kbps ✅ — "
+                            f"نسخه آماده همان فایل است.")
+        elif kbps:
+            bitrate_line = (f"🎧 کیفیت اصلی: {kbps}kbps — "
+                            f"نسخه آماده ساخته نشد؛ فایل اصلی ثبت می‌شود.")
+        else:
+            bitrate_line = "🎧 کیفیت اصلی: نامشخص"
         fp_line = ("اثر انگشت: کامل ✅"
                    if not res["partial"] else
                    "اثر انگشت: جزئی — فایل بزرگ‌تر از ۲۰ مگابایت است و فقط ابتدای آهنگ قابل شناسایی است.")
         sugg_title = (getattr(message.audio, "title", "") or "") if message.audio else ""
+        if not sugg_title:
+            sugg_title = info.get("title", "") or ""
         sugg_artist = (getattr(message.audio, "performer", "") or "") if message.audio else ""
+        if not sugg_artist:
+            sugg_artist = info.get("artist", "") or ""
         await state.update_data(sugg_title=sugg_title, sugg_artist=sugg_artist)
         await state.set_state("xbank:add:title")
         prompt = f"{bitrate_line}\n{fp_line}\n\nنام آهنگ را بفرستید."
@@ -1143,16 +1339,23 @@ def register_exclusive_bank_handlers(router) -> None:
         fp_line = ("اثر انگشت: کامل ✅"
                    if not data.get("fp_partial") else
                    "اثر انگشت: جزئی (فقط ابتدای آهنگ)")
-        confirm = "\n".join([
+        confirm_lines = [
             "ثبت این آهنگ در بانک اختصاصی؟",
             "",
             f"🎵 {data.get('title')}",
             f"🎤 {data.get('artist')}",
-            f"🎧 کیفیت واقعی: MP3 {kbps}kbps" if kbps else "🎧 کیفیت واقعی: نامشخص",
+            f"🎧 کیفیت اصلی: MP3 {kbps}kbps" if kbps else "🎧 کیفیت اصلی: نامشخص",
+        ]
+        if data.get("ready_file_id"):
+            rkbps = data.get("ready_bitrate_kbps") or 0
+            confirm_lines.append(
+                f"📤 نسخه آماده: MP3 {rkbps}kbps" if rkbps else "📤 نسخه آماده: ذخیره شده")
+        confirm_lines += [
             f"⏱ مدت: {_fmt_duration(data.get('duration_sec') or 0)}",
             fp_line,
             f"📝 {data.get('description')}" if data.get("description") else "",
-        ])
+        ]
+        confirm = "\n".join(confirm_lines)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [_btn("✅ ثبت در بانک", "xbank:add:confirm")],
             [_btn("❌ لغو", "xbank:add:cancel")]])
@@ -1191,7 +1394,11 @@ def register_exclusive_bank_handlers(router) -> None:
             fp_partial=bool(data.get("fp_partial")),
             cover_file_id=data.get("cover_file_id", ""),
             description=data.get("description", ""),
-            added_by=callback.from_user.id)
+            added_by=callback.from_user.id,
+            ready_file_id=data.get("ready_file_id", ""),
+            ready_file_unique_id=data.get("ready_file_unique_id", ""),
+            ready_bitrate_kbps=data.get("ready_bitrate_kbps") or 0,
+            ready_file_size=data.get("ready_file_size") or 0)
         await state.clear()
         await callback.answer("ثبت شد.")
         song = get_song(conn, sid) if sid else None

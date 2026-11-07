@@ -267,6 +267,92 @@ def main():
     check("match_sample still finds A after repair",
           m is not None and m["title"] == "تردید", f"sim={sim:.3f}")
 
+    print("T7 auto-upgrade to 320kbps (user order 2026-11-07)")
+    with open(f"{tmp}/A_128.mp3", "rb") as f:
+        a128 = f.read()
+    up = xb.upconvert_to_320(a128)
+    check("upconvert returns bytes for a 128k file", bool(up))
+    up_info = xb.analyse_audio_bytes(up) if up else {}
+    check("upconverted file probes at 320kbps",
+          up_info.get("bitrate_kbps") == 320, repr(up_info.get("bitrate_kbps")))
+    _d, fp_orig = xb.fingerprint_bytes(a128, ".mp3")
+    _d, fp_up = xb.fingerprint_bytes(up, ".mp3")
+    sim_up, _off, _n = xb.best_match(fp_up or [], fp_orig or [])
+    check("upconverted file still matches the original (sim>=0.90)",
+          sim_up >= 0.90, f"sim={sim_up:.3f}")
+    check("upconvert of garbage bytes returns None",
+          xb.upconvert_to_320(b"not audio at all") is None)
+    check("upconvert of empty bytes returns None",
+          xb.upconvert_to_320(b"") is None)
+    with open(f"{tmp}/A_320.mp3", "rb") as f:
+        a320 = f.read()
+    up320 = xb.upconvert_to_320(a320)
+    up320_info = xb.analyse_audio_bytes(up320) if up320 else {}
+    check("upconvert of an already-320 file stays 320",
+          up320_info.get("bitrate_kbps") == 320, repr(up320_info.get("bitrate_kbps")))
+
+    print("T8 dual-version store: original + prepared MP3 320 (user order 2026-11-07)")
+    # Migration: an old table without ready_* columns gains them, rows intact.
+    conn3 = sqlite3.connect(":memory:")
+    conn3.execute("""CREATE TABLE exclusive_songs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+        artist TEXT NOT NULL, file_id TEXT NOT NULL,
+        file_unique_id TEXT NOT NULL, duration_sec REAL NOT NULL DEFAULT 0,
+        bitrate_kbps INTEGER NOT NULL DEFAULT 0,
+        file_size INTEGER NOT NULL DEFAULT 0,
+        fingerprint TEXT NOT NULL DEFAULT '',
+        fp_duration REAL NOT NULL DEFAULT 0, fp_partial INTEGER NOT NULL DEFAULT 0,
+        cover_file_id TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+        identify_count INTEGER NOT NULL DEFAULT 0,
+        download_count INTEGER NOT NULL DEFAULT 0,
+        added_by INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL DEFAULT 0)""")
+    conn3.execute("INSERT INTO exclusive_songs (title, artist, file_id, file_unique_id, fingerprint) VALUES ('قدیمی', 'خواننده', 'fileOld', 'uqOld', '1,2,3')")
+    conn3.commit()
+    xb._init_tables(conn3)
+    cols3 = [r[1] for r in conn3.execute("PRAGMA table_info(exclusive_songs)").fetchall()]
+    check("migration adds the ready_* columns",
+          all(c in cols3 for c in ("ready_file_id", "ready_file_unique_id", "ready_bitrate_kbps", "ready_file_size")), repr(cols3))
+    old = xb.get_song(conn3, 1)
+    check("migration keeps the old row and defaults the ready version",
+          old is not None and old["title"] == "قدیمی" and not old.get("ready_file_id"))
+    # Dual-version add + delivery preference + card bitrate.
+    sid_dual = xb.add_song(conn2, title="دو نسخه", artist="خواننده",
+                           file_id="fileOrig", file_unique_id="uqOrig",
+                           duration_sec=18.0, bitrate_kbps=179, file_size=400000,
+                           fingerprint=",".join(map(str, fp_a)),
+                           fp_duration=dur_a or 0, fp_partial=False,
+                           ready_file_id="fileReady", ready_file_unique_id="uqReady",
+                           ready_bitrate_kbps=320, ready_file_size=720000)
+    dual = xb.get_song(conn2, sid_dual)
+    check("stored row keeps the original file and its real bitrate",
+          dual["file_id"] == "fileOrig" and dual["bitrate_kbps"] == 179)
+    check("stored row keeps the prepared version and its bitrate",
+          dual["ready_file_id"] == "fileReady" and dual["ready_bitrate_kbps"] == 320)
+    check("delivery prefers the prepared version's file_id",
+          xb.delivery_file_id(dual) == "fileReady")
+    check("delivery falls back to the original when no ready version",
+          xb.delivery_file_id(old) == "fileOld")
+    card_dual = xb.exclusive_card_text(dual)
+    check("delivery card shows the prepared version's bitrate",
+          "320kbps" in card_dual, repr(card_dual))
+    card_old = xb.exclusive_card_text(old)
+    check("delivery card falls back to the original bitrate",
+          "نامشخص" in card_old, repr(card_old))
+    # Metadata tags: ffprobe fallback when Telegram parsed nothing.
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"{tmp}/A_full.wav",
+         "-metadata", "title=تردید", "-metadata", "artist=سامان جلیلی",
+         "-b:a", "128k", f"{tmp}/A_tagged.mp3"])
+    with open(f"{tmp}/A_tagged.mp3", "rb") as f:
+        tagged = f.read()
+    tag_info = xb.analyse_audio_bytes(tagged)
+    check("analyse reads title/artist from the file's own tags",
+          tag_info.get("title") == "تردید" and tag_info.get("artist") == "سامان جلیلی",
+          repr((tag_info.get("title"), tag_info.get("artist"))))
+    plain_info = xb.analyse_audio_bytes(a128)
+    check("untagged files report empty title/artist (never raises)",
+          plain_info.get("title") == "" and plain_info.get("artist") == "")
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
