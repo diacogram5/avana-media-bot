@@ -875,36 +875,29 @@ async def main():
           bound["calls"] == 24 and bound["new"] == 0, f"got {bound}")
 
     # --- T7: approval fallback without storage + first delivery --------
-    # Final order 2026-11-06: deliver_feed_first burns the MAIN
-    # Waveframe badge (apply_waveframe_badge, HQ 2x supersample + CRF 18)
-    # plus the AVANO MEDIA end bumper (overlay_outro, portrait only);
+    # Order 2026-11-07: deliver_feed_first burns the static Waveframe
+    # badge + the AVANO MEDIA end bumper (portrait only) in ONE encode
+    # (apply_waveframe_badge_and_outro); the old two-step path
+    # (apply_waveframe_badge then overlay_outro) is retired.
     # apply_user_badge must NOT be called here.
     import app.bot.motion_watermark as mw
-    real_wave = mw.apply_waveframe_badge
+    real_combined = mw.apply_waveframe_badge_and_outro
     real_user = mw.apply_user_badge
-    real_outro = mw.overlay_outro
-    badge_calls = []
+    combined_calls = []
     user_calls = []
-    outro_calls = []
 
-    def stub_badge(src, out):
-        badge_calls.append((src, out))
+    def stub_combined(src, out):
+        combined_calls.append((src, out))
         shutil.copyfile(src, out)
-        return {"style": "stub"}
+        return {"style": "stub", "outro": True}
 
     def guard_user_badge(src, out):
         user_calls.append((src, out))
         raise AssertionError(
             "apply_user_badge must not be called from deliver_feed_first")
 
-    def stub_outro(src, out):
-        outro_calls.append((src, out))
-        shutil.copyfile(src, out)
-        return {"applied": True}
-
-    mw.apply_waveframe_badge = stub_badge
+    mw.apply_waveframe_badge_and_outro = stub_combined
     mw.apply_user_badge = guard_user_badge
-    mw.overlay_outro = stub_outro
     try:
         r2router = FakeRouter()
         sarch.register_story_archive_handlers(r2router)
@@ -924,14 +917,12 @@ async def main():
         await play_h(cb, cfg, FakeState())
         row = sarch.get_clip(clip["id"])
         first_send = bot.calls[0] if bot.calls else None
-        check("first delivery: Waveframe badge applied once via FSInputFile",
-              len(badge_calls) == 1 and first_send is not None
+        check("first delivery: static badge+outro applied once via FSInputFile",
+              len(combined_calls) == 1 and first_send is not None
               and first_send[2].startswith("FSInputFile:"),
               f"calls={bot.calls}")
         check("first delivery: user badge NOT called (Waveframe only)",
               user_calls == [], f"user_calls={user_calls}")
-        check("first delivery: outro applied once after the badge",
-              len(outro_calls) == 1, f"outro_calls={outro_calls}")
         check("first delivery: badged file_id stored as processed final",
               row.get("processed_file_id") == "badged-fid-1"
               and row.get("file_id") == "badged-fid-1",
@@ -943,15 +934,15 @@ async def main():
         check("second delivery: uses stored processed_file_id, no re-badge",
               len(bot.calls) == n_calls + 1
               and bot.calls[-1][2] == "badged-fid-1"
-              and len(badge_calls) == 1,
-              f"calls={bot.calls[-1:]} badge_calls={len(badge_calls)}")
+              and len(combined_calls) == 1,
+              f"calls={bot.calls[-1:]} combined_calls={len(combined_calls)}")
 
         # badge failure -> raw URL fallback + file_id capture, then reuse
         def boom_badge(src, out):
-            badge_calls.append((src, out))
+            combined_calls.append((src, out))
             raise RuntimeError("ffmpeg down")
 
-        mw.apply_waveframe_badge = boom_badge
+        mw.apply_waveframe_badge_and_outro = boom_badge
         clip2 = sarch.get_clip_by_unique("feed:tg:ehsaspaak:117099")
         sarch.set_clip_status(clip2["id"], "active")
         sarch.move_clip(clip2["id"], "love", "express")
@@ -964,19 +955,18 @@ async def main():
               and row2.get("last_error") == "badge_failed"
               and not row2.get("processed_file_id"),
               f"got file_id={row2.get('file_id')!r} err={row2.get('last_error')!r}")
-        n_badge = len(badge_calls)
+        n_badge = len(combined_calls)
         cb4 = FakeCallback(f"sarch:play:{clip2['id']}:love:express:0", bot2)
         await play_h(cb4, cfg, FakeState())
         check("badge failure: next delivery reuses stored raw file_id",
               bot2.calls[-1][2] == "raw-fid-1"
-              and len(badge_calls) == n_badge,
+              and len(combined_calls) == n_badge,
               f"calls={bot2.calls[-1:]}")
         check("badge failure: user badge still NOT called",
               user_calls == [], f"user_calls={user_calls}")
     finally:
-        mw.apply_waveframe_badge = real_wave
+        mw.apply_waveframe_badge_and_outro = real_combined
         mw.apply_user_badge = real_user
-        mw.overlay_outro = real_outro
 
     # --- T8: queue analysis uses source_url (no get_file) ---------------
     async def fake_identify(data):
@@ -1227,6 +1217,20 @@ async def main():
         "عشق دوستت دارم دلتنگی", "دلتنگی دلم تنگ", "", "")
     check("gate: best=4 margin=0 -> still no suggestion",
           (c0, s0) == (None, None) and sc0 == 4, f"got {(c0, s0, sc0)}")
+    # Morning greetings (user report 2026-11-07): a "صبح بخیر" clip
+    # with a romantic background song must NEVER auto-suggest love —
+    # the greeting text is the theme, the song is incidental. With no
+    # seed it stays queued; with a verified occasion/calendar seed the
+    # unanimous title decides occasion/calendar.
+    g, gs, gsc, _rg = sarch.suggest_subcategory(
+        "عشق دوستت دارم عاشقانه", "صبح بخیر عزیزم", "love", "express")
+    check("greeting: 'صبح بخیر' + romantic song, no seed -> no suggestion",
+          (g, gs) == (None, None), f"got {(g, gs, gsc)}")
+    g2, gs2, gsc2, _rg2 = sarch.suggest_subcategory(
+        "عشق دوستت دارم عاشقانه", "صبح بخیر عزیزم", "love", "express",
+        "occasion", "calendar")
+    check("greeting: same + occasion/calendar seed -> occasion/calendar",
+          (g2, gs2) == ("occasion", "calendar"), f"got {(g2, gs2, gsc2)}")
     # Title scoring: a thematic song title alone can carry the score.
     async def _title_identify(data):
         return ("تولدت مبارک", "خواننده")

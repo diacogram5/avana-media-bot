@@ -781,7 +781,7 @@ async def main():
     import app.bot.motion_watermark as _mw
     _real_badge = _mw.apply_waveframe_badge
 
-    def _fast_badge(src, out):
+    def _fast_badge(src, out, **kwargs):
         shutil.copyfile(src, out)
         return "mocked-badge"
     _mw.apply_waveframe_badge = _fast_badge
@@ -829,6 +829,7 @@ async def main():
     import app.bot.motion_watermark as _mw2
     _real_badge2 = _mw2.apply_waveframe_badge
     _real_outro2 = _mw2.overlay_outro
+    _real_combined2 = _mw2.apply_waveframe_badge_and_outro
     _real_refresh = feed.refresh_aparat_file_link
 
     def _fast_copy(src, out):
@@ -836,6 +837,7 @@ async def main():
         return "mocked"
     _mw2.apply_waveframe_badge = _fast_copy
     _mw2.overlay_outro = _fast_copy
+    _mw2.apply_waveframe_badge_and_outro = _fast_copy
     _refresh_calls = []
     _fresh_url = "file://" + str(REF_CLIP)
 
@@ -896,6 +898,7 @@ async def main():
     finally:
         _mw2.apply_waveframe_badge = _real_badge2
         _mw2.overlay_outro = _real_outro2
+        _mw2.apply_waveframe_badge_and_outro = _real_combined2
         feed.refresh_aparat_file_link = _real_refresh
 
     fails = [r for r in RESULTS if not r[1]]

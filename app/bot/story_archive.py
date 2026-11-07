@@ -213,7 +213,7 @@ SUBCAT_KEYWORDS: dict[tuple[str, str], list[str]] = {
     ("occasion", "anniversary"): ["سالگرد"],
     ("occasion", "valentine"): ["روز عشق", "ولنتاین"],
     ("occasion", "parents"): ["مادر", "پدر", "روز مادر", "روز پدر"],
-    ("occasion", "calendar"): ["عید", "نوروز", "یلدا", "مبارک"],
+    ("occasion", "calendar"): ["عید", "نوروز", "یلدا", "مبارک", "صبح بخیر", "صبحت بخیر"],
     ("deep", "pride"): ["غرور", "مغرور"],
     ("deep", "silence"): ["سکوت", "ساکت"],
     ("deep", "indifferent"): ["بی‌تفاوت", "بی تفاوت", "برام مهم نیست"],
@@ -1202,17 +1202,55 @@ def register_story_archive_handlers(router) -> None:
                 await callback.message.answer(txt, reply_markup=kb)
             return
         kb = clip_nav_kb(cat, clip["id"])
+        # Immediate feedback (2026-11-07 user order): the pick is
+        # instant but the delivery (download + badge + upload) can
+        # take a minute, and until now the user stared at a silent
+        # chat. Show that the bot is working, then remove the note
+        # once the clip arrives (or reuse it for the failure text).
+        wait_msg = None
+        try:
+            wait_msg = await callback.message.answer(
+                "⏳ در حال آماده‌سازی کلیپ…")
+        except Exception:
+            wait_msg = None
+        try:
+            await callback.bot.send_chat_action(
+                callback.message.chat.id, "upload_video")
+        except Exception:
+            pass
+
+        async def _say(text: str) -> None:
+            # Prefer reusing the waiting note; fall back to a new msg.
+            if wait_msg is not None:
+                try:
+                    await wait_msg.edit_text(text)
+                    return
+                except Exception:
+                    pass
+            await callback.message.answer(text)
+
+        _t0 = time.time()
         res = await deliver_clip(callback.bot, callback.message.chat.id,
                                  clip, reply_markup=kb)
+        _log.info("sarch deliver: cat=%s clip=%s sub=%s mode=%s "
+                  "processed=%s res=%s ms=%d",
+                  cat, clip["id"], clip.get("subcategory"),
+                  clip.get("mode"), bool(clip.get("processed_file_id")),
+                  res, int((time.time() - _t0) * 1000))
         if res == "ok":
             mark_seen(uid, clip["file_unique_id"])
+            if wait_msg is not None:
+                try:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
         elif res == "gone":
-            await callback.message.answer(
+            await _say(
                 "🗑 این کلیپ از کانال منبع حذف شده. یکی دیگر را امتحان کنید 👇")
         elif res == "blocked":
-            await callback.message.answer("🔒 فوروارد این کلیپ محدود شده است.")
+            await _say("🔒 فوروارد این کلیپ محدود شده است.")
         else:
-            await callback.message.answer("❌ ارسال ناموفق بود؛ لطفاً دوباره تلاش کنید.")
+            await _say("❌ ارسال ناموفق بود؛ لطفاً دوباره تلاش کنید.")
 
 
     # Callback prefix: sarch:  (story: is the Pixabay module — untouched)
@@ -1832,7 +1870,9 @@ def register_story_archive_handlers(router) -> None:
 
                 def _run():
                     from .motion_watermark import apply_waveframe_badge
-                    return apply_waveframe_badge(src, out)
+                    # Static badge (2026-11-07 user order): fixed,
+                    # transparent interior, no motion.
+                    return apply_waveframe_badge(src, out, animated=False)
 
                 info = await loop.run_in_executor(None, _run)
                 _log.info("waveframe applied: %s", info)
@@ -1870,8 +1910,8 @@ def register_story_archive_handlers(router) -> None:
                                  reply_markup=None) -> str:
         """First delivery of a feed clip (web source, no stored final).
 
-        Download from source_url -> apply the Waveframe badge once +
-        AVANO MEDIA end bumper on the final 2.5s (portrait clips) ->
+        Download from source_url -> static Waveframe badge + AVANO MEDIA
+        end bumper on the final 2.5s (portrait clips) in ONE encode ->
         send -> store the resulting file_id as the processed final, so
         later deliveries are instant file_id sends. On badge failure,
         fall back to sending the raw public URL and capture its file_id.
@@ -1931,23 +1971,14 @@ def register_story_archive_handlers(router) -> None:
                     raise RuntimeError(f"feed download failed: {_e}")
 
                 def _run():
-                    # Final order 2026-11-06: the MAIN watermark is the
-                    # Waveframe badge (HQ, 28% opacity); the AVANO MEDIA
-                    # end bumper is overlaid on the final 2.5s for
-                    # portrait clips (overlay_outro copies the file
-                    # unchanged otherwise). An outro failure must not
-                    # lose the badged file — fall back to it.
+                    # Single pass (2026-11-07): static badge + outro in
+                    # ONE encode. The old path ran two full re-encodes
+                    # (badge, then outro) — on the free tier that is
+                    # what made first deliveries take minutes.
                     from .motion_watermark import (
-                        apply_waveframe_badge, overlay_outro)
-                    apply_waveframe_badge(src, out)
-                    final = os.path.join(tmpd, "final.mp4")
-                    try:
-                        overlay_outro(out, final)
-                        return final
-                    except Exception as e:
-                        _log.warning("outro failed (%s); sending badged "
-                                     "file without it", e)
-                        return out
+                        apply_waveframe_badge_and_outro)
+                    apply_waveframe_badge_and_outro(src, out)
+                    return out
 
                 _final = await loop.run_in_executor(None, _run)
                 from aiogram.types import FSInputFile

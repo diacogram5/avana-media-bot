@@ -417,6 +417,86 @@ def build_waveframe_badge(video_w, eq_ratios=None, scale=1.0, ss=1.0):
     return base
 
 
+def build_static_badge(video_w, ss=1.0):
+    """Static Avano badge (user order 2026-11-07): a fixed TV-bug, no motion.
+
+    Same design language as the Waveframe badge (chamfered pill outline,
+    neon glow ring, 'A' monogram plaque, '@AvanoMediaBot' wordmark) but:
+    - the pill's inner layer is TRANSPARENT: no glass gradient body, no
+      drop shadow, no sheen — the video shows through the badge, so it
+      never covers the subject;
+    - NO animation: no EQ bars (their whole purpose was motion), no
+      entrance zoom, no light sweep, no float — it sits fixed
+      bottom-right for the whole clip;
+    - the width is content-driven (plaque + wordmark + margins) instead
+      of a fixed 0.47 * video width, so the badge is much smaller while
+      the wordmark keeps the same font size (same legibility as before).
+    The wordmark carries a dark stroke so the white text stays readable
+    over bright video. The badge is rasterized at ss x its on-screen
+    size; the caller downscales it with LANCZOS.
+    """
+    bh = int(video_w * 0.104 * ss)
+    pad = int(44 * ss)
+    ch = int(bh * 0.30)
+    # wordmark metrics first: the width follows the content
+    tf = ImageFont.truetype(FONT_PATH, int(bh * 0.255))
+    spacing = max(1, int(bh * 0.022))
+    widths = [tf.getlength(ch_) for ch_ in TEXT]
+    total = sum(widths) + spacing * (len(TEXT) - 1)
+    # monogram plaque geometry (same as the Waveframe badge)
+    m = int(bh * 0.31)
+    ox, oy = pad, pad
+    mcx, mcy = ox + int(bh * 0.55), oy + bh // 2
+    mc = int(m * 0.45)
+    x_div = mcx + m + int(bh * 0.20)
+    x0 = x_div + int(bh * 0.20)
+    bw = int(x0 + total + int(bh * 0.25) - ox)
+    aw, ah = bw + pad * 2, bh + pad * 2
+    pts = _chamfer_points(ox, oy, ox + bw, oy + bh, ch)
+    base = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    # outer neon glow ring + thin outline: the only pill frame now that
+    # the body is transparent
+    glow_pts = _chamfer_points(ox - int(5 * ss), oy - int(5 * ss),
+                               ox + bw + int(5 * ss), oy + bh + int(5 * ss),
+                               ch + int(5 * ss))
+    gl = Image.new("RGBA", (aw, ah), (0, 0, 0, 0))
+    ImageDraw.Draw(gl).line(glow_pts + [glow_pts[0]],
+                            fill=(110, 255, 185, 65),
+                            width=max(1, int(8 * ss)), joint="curve")
+    base = Image.alpha_composite(base, gl.filter(
+        ImageFilter.GaussianBlur(int(7 * ss))))
+    d = ImageDraw.Draw(base)
+    d.line(pts + [pts[0]], fill=(212, 255, 232, 160),
+           width=max(1, int(2 * ss)), joint="curve")
+    # monogram plaque (kept: the brand mark)
+    mpts = _chamfer_points(mcx - m, mcy - m, mcx + m, mcy + m, mc)
+    mdisc = _vgrad(m * 2, m * 2, (56, 132, 116, 255), (24, 70, 62, 255))
+    mmask = Image.new("L", (m * 2, m * 2), 0)
+    ImageDraw.Draw(mmask).polygon(
+        [(x - (mcx - m), y - (mcy - m)) for x, y in mpts], fill=255)
+    base.paste(mdisc, (mcx - m, mcy - m), mmask)
+    d = ImageDraw.Draw(base)
+    d.line(mpts + [mpts[0]], fill=(215, 255, 232, 175),
+           width=max(1, int(2 * ss)), joint="curve")
+    af = ImageFont.truetype(DEJAVU_BOLD, int(m * 1.02))
+    ab = af.getbbox("A")
+    d.text((mcx - (ab[0] + ab[2]) / 2, mcy - (ab[1] + ab[3]) / 2),
+           "A", font=af, fill=(230, 255, 242, 255))
+    # divider
+    d.line([x_div, oy + int(bh * 0.27), x_div, oy + bh - int(bh * 0.27)],
+           fill=(190, 255, 220, 75), width=max(1, int(1 * ss)))
+    # wordmark with a dark stroke (readable over bright video)
+    tb = tf.getbbox(TEXT)
+    sy = mcy - (tb[1] + tb[3]) / 2
+    x = x0
+    _stroke = max(1, int(bh * 0.02))
+    for ch_, wch in zip(TEXT, widths):
+        d.text((x, sy), ch_, font=tf, fill=(242, 255, 248, 255),
+               stroke_width=_stroke, stroke_fill=(8, 26, 22, 255))
+        x += wch + spacing
+    return base
+
+
 def _waveframe_frame(video_w, t, alpha, ss=1.0):
     """One animation frame of the living badge at time t (seconds).
 
@@ -489,18 +569,24 @@ def _audio_args_for(in_path):
 
 
 def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
-                          animated=True, fps=WAVEFRAME_FPS):
-    """Apply the Avano Waveframe corner badge for the whole clip.
+                          animated=False, fps=WAVEFRAME_FPS):
+    """Apply the Avano badge for the whole clip.
 
-    animated=True (default): the living edition — EQ pulses like real audio,
-    cinematic ease-out entrance, light sweep across the glass every 7s and a
-    gentle float. animated=False: the original static badge.
-    Quality (2026-11-06 real-test fix): the badge is rasterized at 2x its
-    on-screen size (WAVEFRAME_SS) and downscaled with LANCZOS in the
-    overlay chain, so the wordmark and edges stay sharp after the
-    re-encode; the on-screen size stays 0.47 * video width. Encode is
-    CRF 18 (preset veryfast). Audio is preserved (AAC copied, other
-    codecs re-encoded to AAC, silent sources stay silent).
+    Default (animated=False, user order 2026-11-07): the STATIC badge —
+    fixed bottom-right, transparent pill interior, no EQ motion, no
+    entrance zoom, no light sweep, no float. One badge PNG is built
+    and overlaid in a single encode. Quality: the badge is rasterized
+    at 2x its on-screen size (WAVEFRAME_SS) and downscaled with
+    LANCZOS in the overlay chain, so the wordmark and edges stay sharp
+    after the re-encode; the on-screen width is content-driven
+    (plaque + wordmark + margins, ~0.36-0.39 * video width — much
+    smaller than the old 0.47 * width living badge). Encode is CRF 18
+    (preset veryfast). Audio is preserved (AAC copied, other codecs
+    re-encoded to AAC, silent sources stay silent).
+
+    animated=True keeps the legacy living edition (per-frame EQ pulse,
+    entrance, sweep, float) — expensive: a PNG per frame plus the same
+    encode. It is no longer used by any delivery path.
     """
     dur, W, H = probe(in_path)
     ss = WAVEFRAME_SS
@@ -523,7 +609,7 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
                       "-i", os.path.join(td, "f%04d.png")]
         else:
             badge_path = os.path.join(td, "waveframe.png")
-            badge = build_waveframe_badge(W, ss=ss)
+            badge = build_static_badge(W, ss=ss)
             badge.save(badge_path)
             aw2, ah2 = badge.size
             aw, ah = aw2 // ss, ah2 // ss
@@ -548,7 +634,8 @@ def apply_waveframe_badge(in_path, out_path, alpha=WAVEFRAME_ALPHA,
 
     return {"duration": round(dur, 2), "size": [W, H],
             "badge": [aw, ah], "position": [x, y], "alpha": alpha,
-            "animated": animated, "style": "waveframe-fixed"}
+            "animated": animated,
+            "style": "waveframe-static" if not animated else "waveframe-fixed"}
 
 
 OUTRO_ASSET = os.path.join(os.path.dirname(__file__), "..", "assets",
@@ -601,6 +688,69 @@ def overlay_outro(in_path, out_path, outro_path=None):
     return {"applied": True, "duration": round(dur, 2), "size": [W, H],
             "outro_start": round(start, 2),
             "outro": os.path.basename(outro)}
+
+
+def apply_waveframe_badge_and_outro(in_path, out_path,
+                                    alpha=WAVEFRAME_ALPHA):
+    """Single-pass static badge + outro (user order 2026-11-07).
+
+    The old feed path ran TWO full re-encodes per clip (badge, then
+    outro) — on the free tier that is what made first deliveries take
+    minutes. This does both overlays in ONE ffmpeg run with ONE
+    encode: the static badge for the whole clip plus the AVANO MEDIA
+    end bumper on the final 2.5s (portrait clips only, same rule as
+    overlay_outro). Non-portrait / too-short / missing-asset clips get
+    the badge-only pass. Audio is preserved like the badge path.
+    Returns the same info dict as apply_waveframe_badge plus 'outro'.
+    """
+    dur, W, H = probe(in_path)
+    ss = WAVEFRAME_SS
+    portrait = (H > W and dur >= OUTRO_DUR + 1.0
+                and os.path.exists(OUTRO_ASSET))
+    with tempfile.TemporaryDirectory() as td:
+        badge_path = os.path.join(td, "waveframe.png")
+        badge = build_static_badge(W, ss=ss)
+        badge.save(badge_path)
+        aw2, ah2 = badge.size
+        aw, ah = aw2 // ss, ah2 // ss
+        mx = int(W * 0.06)
+        x, y = W - aw - mx, int(H * 0.90) - ah
+        badge_fc = (
+            f"[1:v]scale=iw/{ss}:ih/{ss}:flags=lanczos,format=rgba,"
+            f"colorchannelmixer=aa={alpha},"
+            "fade=t=in:st=0:d=0.5:alpha=1[wm];"
+            f"[0:v][wm]overlay=x={x}:y={y}"
+        )
+        if portrait:
+            start = dur - OUTRO_DUR
+            fc = (
+                badge_fc + "[b];"
+                f"[2:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
+                f"format=yuv420p[ov];"
+                f"[b][ov]overlay=enable='gte(t,{start:.2f})':eof_action=pass,"
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+            )
+            inputs = ["-i", in_path, "-loop", "1", "-t", f"{dur:.2f}",
+                      "-i", badge_path,
+                      "-itsoffset", f"{start:.2f}", "-i", OUTRO_ASSET]
+        else:
+            fc = (
+                badge_fc + ","
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
+            )
+            inputs = ["-i", in_path, "-loop", "1", "-t", f"{dur:.2f}",
+                      "-i", badge_path]
+        cmd = ["ffmpeg", "-v", "error", "-y", *inputs,
+               "-filter_complex", fc, "-map", "[v]",
+               *_audio_args_for(in_path),
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+               "-movflags", "+faststart", "-shortest", out_path]
+        subprocess.run(cmd, check=True)
+    return {"duration": round(dur, 2), "size": [W, H],
+            "badge": [aw, ah], "position": [x, y], "alpha": alpha,
+            "animated": False, "style": "waveframe-static",
+            "outro": portrait}
 
 
 # ------------------------------------------------------- user badge (v3) ---
