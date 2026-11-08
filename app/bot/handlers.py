@@ -1327,17 +1327,6 @@ def _looks_like_video(data: bytes) -> bool:
     return head[4:8] == b"ftyp" or head[:4] == b"\x00\x00\x00\x18"
 
 
-def _looks_like_video_file(path: str) -> bool:
-    """Magic-byte check on a file path (same ftyp rule as
-    _looks_like_video, without reading the whole file into RAM)."""
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(16)
-    except Exception:
-        return False
-    return _looks_like_video(head)
-
-
 def _looks_like_audio(data: bytes) -> bool:
     """Magic-byte check for audio bytes (mp4/m4a container, MP3, WAV,
     AAC ADTS) — never trusts extensions or content-type alone."""
@@ -1365,9 +1354,8 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     instead of running the four-strategy resolver a second time.
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
-    from aiogram.types import FSInputFile
+    from aiogram.types import BufferedInputFile
 
-    import os as _os
     import time as _time
     try:
         if resolved is not None:
@@ -1398,44 +1386,26 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         # downloading only the video URL yields a SILENT file. Fetch
         # both and mux to one MP4 (falls back to video-only when the
         # audio stream is missing — the healthy path is preserved).
-        # Phase 2: fetch_merged_video returns a FILE PATH (streamed to
-        # disk, never held in RAM); this call owns the file + its temp
-        # dir and deletes both once the send is done (or failed).
-        video_path, _has_audio = await fetch_merged_video(
+        data, _has_audio = await fetch_merged_video(
             video_url, audio_url, max_mb=max_mb, req_id=req_id)
     except Exception:
         return None
     _timing.log_stage(log, "link_stage", req_id, t_req, "download", _t_dl,
-                      bytes=_os.path.getsize(video_path) if video_path else 0,
-                      has_audio=_has_audio)
-    if not video_path:
+                      bytes=len(data or b""), has_audio=_has_audio)
+    if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
         return None
-    try:
-        if _os.path.getsize(video_path) > max_mb * 1024 * 1024 \
-                or not _looks_like_video_file(video_path):
-            return None
-        _t_send = _time.perf_counter()
-        sent = await send_video(
-            message, FSInputFile(video_path, filename="video.mp4"),
-            caption=t("m_link_video_dl", ulang))
-        _timing.log_stage(log, "link_stage", req_id, t_req, "send_video",
-                          _t_send)
-        if sent is not None:
-            _track(conn, message, sent)
-            # Pass the reel's separate audio-stream URL so the one-click
-            # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
-            # directly (cheaper than re-extracting from the merged video).
-            await _attach_identify_button(message, conn, sent,
-                                          audio_url=audio_url)
-        return sent
-    finally:
-        # The merged file lives in a temp dir owned by this call.
-        try:
-            import os as _os2
-            import shutil as _sh2
-            _sh2.rmtree(_os2.path.dirname(video_path), ignore_errors=True)
-        except Exception:
-            pass
+    _t_send = _time.perf_counter()
+    sent = await send_video(
+        message, BufferedInputFile(data, filename="video.mp4"),
+        caption=t("m_link_video_dl", ulang))
+    _timing.log_stage(log, "link_stage", req_id, t_req, "send_video", _t_send)
+    if sent is not None:
+        _track(conn, message, sent)
+        # Pass the reel's separate audio-stream URL so the one-click
+        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
+        # directly (cheaper than re-extracting from the merged video).
+        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
+    return sent
 
 
 def _forward_channel(message) -> str:
@@ -1730,13 +1700,13 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     if cached_result is not None:
         result = cached_result
     try:
-        # Phase 2: background pre-compute (spawned at resolve-done, while
-        # the video was downloading). A bank hit answers instantly; a
-        # bank miss reuses the already-extracted 12 s slice so the tap
-        # pays only the API calls — no audio re-download, no re-extract,
-        # no audible re-check (the slice exists only if ffmpeg extracted
-        # real audio). _identify_audio still validates + re-banks (cheap)
-        # and then runs the APIs.
+        # Phase 2 batch 2: background pre-compute (spawned AFTER the video
+        # was sent, never concurrent with the download/mux). A bank hit
+        # answers instantly; a bank miss reuses the already-extracted 12 s
+        # slice so the tap pays only the API calls — no audio re-download,
+        # no re-extract, no audible re-check (the slice exists only if
+        # ffmpeg extracted real audio). _identify_audio still validates +
+        # re-banks (cheap) and then runs the APIs.
         _pre = _bg_precompute_get(audio_url) \
             if (result is None and audio_url) else None
         if _pre is not None and _pre.get("status") == "bank_hit":
@@ -2194,15 +2164,17 @@ def _link_needs_file_card(outcome, cause: str = "", lang: str = "fa") -> str:
     return card
 
 
-# --- background identify pre-compute (Phase 2, 2026-11-07) ----------------
-# At resolve-done ONE light task runs CONCURRENTLY with the video
-# download+send: extract the 12 s slice from the reel's audio URL and
-# match it against the exclusive bank. The result is cached ~10 min so
-# a tap on «🎵 شناسایی موسیقی» answers from the cache (bank hit) or
-# pays only the API calls on the already-extracted slice (bank miss).
-# The full _identify_link_audio engine is deliberately NOT run here:
-# it downloads the whole audio file and burns Shazam/AudD/ACRCloud
-# calls for users who never tap identify.
+# --- background identify pre-compute (Phase 2 batch 2, 2026-11-08) -------
+# Spawned ONLY AFTER the video is sent (post-send, never at resolve-done,
+# never concurrent with the download/mux — Render is 0.1 CPU, so the
+# extract must not compete with the ffmpeg mux). ONE light task: extract
+# the 12 s slice from the reel's audio URL and match it against the
+# exclusive bank. The result is cached ~10 min so a tap on
+# «🎵 شناسایی موسیقی» answers from the cache (bank hit) or pays only the
+# API calls on the already-extracted slice (bank miss). The full
+# _identify_link_audio engine is deliberately NOT run here: it downloads
+# the whole audio file and burns Shazam/AudD/ACRCloud calls for users who
+# never tap identify.
 # Guardrails (prototype P4): max 1 background identify per chat (a new
 # link cancels the previous pending one); extract timeout 30 s (60 s
 # total incl. semaphore wait); the bank step is one Turso read plus a
@@ -2845,34 +2817,68 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
         bank_token=bank_tok, own_media=own_media, config=config)
 
 
+_FULLSONG_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
+
+
+def _fullsong_key(chat_id, title: str, artist: str) -> tuple[int, str, str]:
+    return (chat_id or 0, (title or "").strip().lower(),
+            (artist or "").strip().lower())
+
+
+def _spawn_fullsong_task(key, coro_factory) -> bool:
+    """Spawn a full-song delivery task, at most one in flight per key.
+
+    A repeat tap reuses the in-flight task — the file is never sent
+    twice. The coroutine is built only when a new task really spawns.
+    Returns True when a new task was spawned."""
+    try:
+        prev = _FULLSONG_TASKS.get(key)
+        if prev is not None and not prev.done():
+            return False
+        task = asyncio.create_task(coro_factory())
+        _FULLSONG_TASKS[key] = task
+
+        def _done(_t, _k=key):
+            if _FULLSONG_TASKS.get(_k) is _t:
+                _FULLSONG_TASKS.pop(_k, None)
+
+        task.add_done_callback(_done)
+        return True
+    except Exception:
+        return False
+
+
+def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
+                             own_media, bank_token, query, ulang) -> bool:
+    """Spawn the background full-version delivery for an identified
+    song (guarded: one in flight per (chat, title, artist))."""
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    return _spawn_fullsong_task(
+        _fullsong_key(chat_id, title, artist),
+        lambda: _deliver_fullsong_bg(message, conn, title, artist, config,
+                                     kb, own_media, bank_token, query, ulang))
+
+
+
 async def _send_professional_song_card(message, conn, title: str, artist: str, bot_id: str = "",
                                        bank_token: str | None = None,
                                        own_media: tuple[str, str] | None = None,
                                        config=None):
     """One clean card for an identified song.
 
-    Delivery order (full-version-first):
-    1. The FULL same-version file from existing sources, sent as a real
-       Telegram audio message (never a document, never a short preview).
-    2. Only if no full version exists: the user's own media re-sent as a
-       clearly-labelled replacement.
-    3. Otherwise an honest "full version not found" message with the
-       similar-songs and bank buttons. A short catalog preview is never
-       presented as the song.
+    Decoupled delivery (2026-11-08): the result card (title + artist +
+    pro buttons) is sent IMMEDIATELY, then the full-version lookup runs
+    in a background task so a slow source can never delay the answer
+    by 30 s. The background task sends the full file (cached file_id
+    first, then the adapters, then the bank), the user's own media as a
+    labelled replacement, or the honest "full version not found"
+    message. A short catalog preview is never presented as the song.
 
     - Exact catalog match (version-aware) -> the card keeps the pro
       buttons (heart / lyrics / add-to-playlist). Never a nearest song.
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     query = f"{title} {artist}".strip()
-    # FAST FIRST: show the identification immediately (~10s), then search for
-    # the full version. The user sees progress instead of 30s of silence.
-    try:
-        await _answer(message, conn,
-                      t("h_song_identified_searching", ulang).format(
-                          title=title, artist=artist))
-    except Exception:
-        pass
     engine = SearchEngine([ITunesProvider(entity="song"), DeezerProvider()])
     try:
         results, _ = await smart_search(engine, query, limit=10)
@@ -2887,209 +2893,265 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
         own_media=own_media)
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
-    # (Argument order is (artist, title); a swapped call silently searched
-    # the wrong query and never found anything.)
-    #
-    # Requirement #3: Check Telegram file_id cache first. If this song was
-    # previously sent by the bot, reuse the file_id instead of re-downloading.
-    # This is instant and saves bandwidth.
-    import time as _time
-    _t_start = _time.time()
-    _cache_hit = False
+    # DECOUPLED (2026-11-08): the identification IS the answer — the
+    # card goes out NOW with the pro buttons. The full-version delivery
+    # runs in the background (at most one in flight per song) and must
+    # never delay this card.
     try:
-        from .file_cache import get_cached_file_id, store_file_id
-        _cached_fid = get_cached_file_id(conn, artist, title)
-        if _cached_fid:
-            _cache_hit = True
+        await _answer(message, conn,
+                      t("h_song_identified", ulang).format(
+                          title=title, artist=artist),
+                      reply_markup=kb)
+    except Exception:
+        pass
+    _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
+                             own_media, bank_token, query, ulang)
+    return
+
+
+async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
+                               own_media, bank_token, query, ulang):
+    """Background full-version delivery for an identified song.
+
+    Runs the EXISTING lookup chain (cached file_id fast path first,
+    then find_full_song_file_v2, then the bank) and sends the audio
+    with the existing caption/keyboard, the user's own media as a
+    labelled replacement, or the honest no-full message. The result
+    card was already sent by _send_professional_song_card — this task
+    only delivers the file. Fire-and-forget: never raises.
+    """
+    _wait_msg = None
+
+    async def _drop_wait():
+        nonlocal _wait_msg
+        if _wait_msg is not None:
+            try:
+                await _wait_msg.delete()
+            except Exception:
+                pass
+            _wait_msg = None
+
+    try:
+        # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
+        # (Argument order is (artist, title); a swapped call silently searched
+        # the wrong query and never found anything.)
+        #
+        # Requirement #3: Check Telegram file_id cache first. If this song was
+        # previously sent by the bot, reuse the file_id instead of re-downloading.
+        # This is instant and saves bandwidth.
+        import time as _time
+        _t_start = _time.time()
+        _cache_hit = False
+        try:
+            from .file_cache import get_cached_file_id, store_file_id
+            _cached_fid = get_cached_file_id(conn, artist, title)
+            if _cached_fid:
+                _cache_hit = True
+                try:
+                    sent = await message.answer_audio(
+                        _cached_fid,
+                        caption=t("h_song_full_caption", ulang).format(
+                            label=t("m_full_duration_long", ulang),
+                            title=title, artist=artist),
+                        title=title, performer=artist,
+                        reply_markup=kb)
+                    if sent is not None:
+                        _track(conn, message, sent)
+                        _t_ms = int((_time.time() - _t_start) * 1000)
+                        log_event(log, "fullsong", stage="sent_cached",
+                                  title=title[:40], ms=_t_ms)
+                        # Speed measurement (Requirement #7)
+                        try:
+                            conn.execute(
+                                "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
+                                ("send", _t_ms, int(_time.time())))
+                            conn.commit()
+                        except:
+                            pass
+                        return
+                except Exception:
+                    # Cached file_id invalid, fall through to normal flow
+                    # and invalidate the cache entry
+                    try:
+                        from .file_cache import invalidate_file
+                        invalidate_file(conn, artist, title)
+                    except:
+                        pass
+        except Exception:
+            pass
+        # Background delivery: the result card was already sent —
+        # this message only marks the wait for the full version.
+        try:
+            _wait_msg = await message.answer(t("h_song_sending_full", ulang))
+        except Exception:
+            _wait_msg = None
+        from ..search.adapters import find_full_song_file_v2
+        full = None
+        try:
+            full = await find_full_song_file_v2(artist, title)
+        except Exception:
+            full = None
+        if full:
             try:
                 sent = await message.answer_audio(
-                    _cached_fid,
+                    BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     caption=t("h_song_full_caption", ulang).format(
                         label=t("m_full_duration_long", ulang),
                         title=title, artist=artist),
                     title=title, performer=artist,
+                    duration=int(full["duration_sec"]),
                     reply_markup=kb)
                 if sent is not None:
                     _track(conn, message, sent)
-                    _t_ms = int((_time.time() - _t_start) * 1000)
-                    log_event(log, "fullsong", stage="sent_cached",
-                              title=title[:40], ms=_t_ms)
-                    # Speed measurement (Requirement #7)
+                    log_event(log, "fullsong", stage="sent",
+                              title=title[:40], bytes=len(full["data"]))
+                    # Requirement #3: Store the Telegram file_id for future reuse.
+                    # This avoids re-downloading and re-uploading the same file.
                     try:
-                        conn.execute(
-                            "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
-                            ("send", _t_ms, int(_time.time())))
-                        conn.commit()
+                        _fid = None
+                        if sent.audio:
+                            _fid = sent.audio.file_id
+                        if _fid:
+                            store_file_id(conn, artist, title, _fid, "audio",
+                                          len(full["data"]), full["duration_sec"],
+                                          full.get("source", ""))
+                        # Speed measurement (Requirement #7): cache miss
+                        _t_ms = int((_time.time() - _t_start) * 1000)
+                        try:
+                            conn.execute(
+                                "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 0, ?, ?)",
+                                ("send", _t_ms, int(_time.time())))
+                            conn.commit()
+                        except:
+                            pass
                     except:
                         pass
+                    return
+            except Exception as exc:
+                # NEVER silent: log the real error so delivery failures are visible
+                log_event(log, "fullsong", stage="send_failed",
+                          title=title[:40],
+                          error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        # 1b) BANK: indexed channel audio (forwarded files) by title/artist.
+        # The bank is a real source in the chain, not a separate button.
+        if not full:
+            try:
+                from ..features.bank import search_bank_by_text
+                hit = search_bank_by_text(conn, title, artist)
+                if hit and hit.get("file_id"):
+                    log_event(log, "bank_text", stage="found",
+                              title=title[:40], channel=hit.get("channel", "")[:20])
+                    sent = await message.answer_audio(
+                        hit["file_id"],
+                        caption=t("h_song_full_caption", ulang).format(
+                            label=t("m_full_duration_long", ulang),
+                            title=title, artist=artist),
+                        reply_markup=kb)
+                    if sent is not None:
+                        _track(conn, message, sent)
+                        return
+                elif hit:
+                    log_event(log, "bank_text", stage="no_file_id",
+                              title=title[:40])
+            except Exception:
+                pass
+        if full:
+            dur = full["duration_sec"]
+            label = (t("h_song_dur", ulang).format(dur=f"{int(dur // 60)}:{int(dur % 60):02d}") if dur < 90
+                     else t("m_full_duration_long", ulang))
+            # Real MP3 delivery via the unified pipeline: genuine conversion
+            # when needed, honest probed bitrate, proper AUDIO message.
+            # Telegram's Bot API upload limit is 50 MB.
+            full_data = full["data"] or b""
+            sent = None
+            if full_data and len(full_data) <= 50 * 1024 * 1024:
+                sent = await send_music(
+                    message, full_data, title, artist,
+                    caption=t("h_song_full_caption", ulang).format(label=label, title=title, artist=artist),
+                    reply_markup=kb, duration=int(dur) if dur else None)
+            if sent is not None:
+                _track(conn, message, sent)
+                return
+        # 2) No full file: the user's own media as a labelled replacement (if any).
+        # Kept button-free and minimal; the 🔎 second search belongs to the
+        # not-identified flows (media/link not-found), where it is offered.
+        if own_media is not None:
+            kind, file_id = own_media
+            cap = t("m_identified_clip_audio", ulang)
+            try:
+                if kind == "video":
+                    # The caption promises an audio file, so one must really
+                    # be sent: extract the video's own audio to a real,
+                    # validated MP3. Only when extraction is impossible does
+                    # the video go back — with a caption that says exactly
+                    # that (the old code re-sent the video while claiming an
+                    # audio file had been sent).
+                    data = None
+                    try:
+                        tg_file = await message.bot.get_file(file_id)
+                        buf = io.BytesIO()
+                        await message.bot.download_file(tg_file.file_path, buf)
+                        data = buf.getvalue()
+                    except Exception:
+                        data = None
+                    sent = await _extract_and_send_clip_audio(
+                        message, conn, data or b"", caption=cap)
+                    if sent is None:
+                        sent = await send_video(
+                            message, file_id,
+                            caption=t("m_identified_no_audio_resend", ulang))
+                elif kind == "voice":
+                    sent = await message.answer_voice(file_id, caption=cap)
+                else:
+                    sent = await send_song_audio(
+                        message, file_id, title, artist, caption=cap)
+                if sent is not None:
+                    _track(conn, message, sent)
                     return
             except Exception:
-                # Cached file_id invalid, fall through to normal flow
-                # and invalidate the cache entry
-                try:
-                    from .file_cache import invalidate_file
-                    invalidate_file(conn, artist, title)
-                except:
-                    pass
+                pass
+        # 3) Honest "full version not found" + more-search options. A short
+        # preview is never presented as the song. If Spotify is configured,
+        # attach the official Spotify link as an honest alternative.
+        more_kb_rows = list(kb.inline_keyboard)
+        more_kb_rows.append([InlineKeyboardButton(
+            text=t("similar_songs", ulang), callback_data=_cb_query(query))])
+        spotify_url = ""
+        if config is not None and getattr(config, "spotify_client_id", ""):
+            try:
+                from ..search.spotify import search_tracks as _sp_search
+                _sp = await _sp_search(
+                    f"{artist} {title}".strip(),
+                    config.spotify_client_id, config.spotify_client_secret or "",
+                    limit=1)
+                if _sp and _sp[0].get("spotify_url"):
+                    # title sanity: must match, never a wrong song's link
+                    from ..search.youtube_full import _title_ok as _sp_ok
+                    if _sp_ok(_sp[0]["title"], "", artist, title):
+                        spotify_url = _sp[0]["spotify_url"]
+            except Exception:
+                spotify_url = ""
+        if spotify_url:
+            more_kb_rows.append([InlineKeyboardButton(
+                text="🎧 Spotify", url=spotify_url)])
+        if bank_token:
+            more_kb_rows.append([InlineKeyboardButton(
+                text=t("m_bank_search_btn", ulang),
+                callback_data=f"bank:search:{bank_token}")])
+        await _drop_wait()
+        await _answer(message, conn,
+                      t("h_song_no_full", ulang).format(title=title, artist=artist),
+                      reply_markup=InlineKeyboardMarkup(inline_keyboard=more_kb_rows))
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        pass
-    from ..search.adapters import find_full_song_file_v2
-    full = None
-    try:
-        full = await find_full_song_file_v2(artist, title)
-    except Exception:
-        full = None
-    if full:
+        # Fire-and-forget: log, never raise into the event loop.
         try:
-            sent = await message.answer_audio(
-                BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
-                caption=t("h_song_full_caption", ulang).format(
-                    label=t("m_full_duration_long", ulang),
-                    title=title, artist=artist),
-                title=title, performer=artist,
-                duration=int(full["duration_sec"]),
-                reply_markup=kb)
-            if sent is not None:
-                _track(conn, message, sent)
-                log_event(log, "fullsong", stage="sent",
-                          title=title[:40], bytes=len(full["data"]))
-                # Requirement #3: Store the Telegram file_id for future reuse.
-                # This avoids re-downloading and re-uploading the same file.
-                try:
-                    _fid = None
-                    if sent.audio:
-                        _fid = sent.audio.file_id
-                    if _fid:
-                        store_file_id(conn, artist, title, _fid, "audio",
-                                      len(full["data"]), full["duration_sec"],
-                                      full.get("source", ""))
-                    # Speed measurement (Requirement #7): cache miss
-                    _t_ms = int((_time.time() - _t_start) * 1000)
-                    try:
-                        conn.execute(
-                            "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 0, ?, ?)",
-                            ("send", _t_ms, int(_time.time())))
-                        conn.commit()
-                    except:
-                        pass
-                except:
-                    pass
-                return
-        except Exception as exc:
-            # NEVER silent: log the real error so delivery failures are visible
-            log_event(log, "fullsong", stage="send_failed",
-                      title=title[:40],
-                      error=f"{type(exc).__name__}: {str(exc)[:200]}")
-    # 1b) BANK: indexed channel audio (forwarded files) by title/artist.
-    # The bank is a real source in the chain, not a separate button.
-    if not full:
-        try:
-            from ..features.bank import search_bank_by_text
-            hit = search_bank_by_text(conn, title, artist)
-            if hit and hit.get("file_id"):
-                log_event(log, "bank_text", stage="found",
-                          title=title[:40], channel=hit.get("channel", "")[:20])
-                sent = await message.answer_audio(
-                    hit["file_id"],
-                    caption=t("h_song_full_caption", ulang).format(
-                        label=t("m_full_duration_long", ulang),
-                        title=title, artist=artist),
-                    reply_markup=kb)
-                if sent is not None:
-                    _track(conn, message, sent)
-                    return
-            elif hit:
-                log_event(log, "bank_text", stage="no_file_id",
-                          title=title[:40])
+            log_event(log, "fullsong", stage="bg_error", title=title[:40])
         except Exception:
             pass
-    if full:
-        dur = full["duration_sec"]
-        label = (t("h_song_dur", ulang).format(dur=f"{int(dur // 60)}:{int(dur % 60):02d}") if dur < 90
-                 else t("m_full_duration_long", ulang))
-        # Real MP3 delivery via the unified pipeline: genuine conversion
-        # when needed, honest probed bitrate, proper AUDIO message.
-        # Telegram's Bot API upload limit is 50 MB.
-        full_data = full["data"] or b""
-        sent = None
-        if full_data and len(full_data) <= 50 * 1024 * 1024:
-            sent = await send_music(
-                message, full_data, title, artist,
-                caption=t("h_song_full_caption", ulang).format(label=label, title=title, artist=artist),
-                reply_markup=kb, duration=int(dur) if dur else None)
-        if sent is not None:
-            _track(conn, message, sent)
-            return
-    # 2) No full file: the user's own media as a labelled replacement (if any).
-    # Kept button-free and minimal; the 🔎 second search belongs to the
-    # not-identified flows (media/link not-found), where it is offered.
-    if own_media is not None:
-        kind, file_id = own_media
-        cap = t("m_identified_clip_audio", ulang)
-        try:
-            if kind == "video":
-                # The caption promises an audio file, so one must really
-                # be sent: extract the video's own audio to a real,
-                # validated MP3. Only when extraction is impossible does
-                # the video go back — with a caption that says exactly
-                # that (the old code re-sent the video while claiming an
-                # audio file had been sent).
-                data = None
-                try:
-                    tg_file = await message.bot.get_file(file_id)
-                    buf = io.BytesIO()
-                    await message.bot.download_file(tg_file.file_path, buf)
-                    data = buf.getvalue()
-                except Exception:
-                    data = None
-                sent = await _extract_and_send_clip_audio(
-                    message, conn, data or b"", caption=cap)
-                if sent is None:
-                    sent = await send_video(
-                        message, file_id,
-                        caption=t("m_identified_no_audio_resend", ulang))
-            elif kind == "voice":
-                sent = await message.answer_voice(file_id, caption=cap)
-            else:
-                sent = await send_song_audio(
-                    message, file_id, title, artist, caption=cap)
-            if sent is not None:
-                _track(conn, message, sent)
-                return
-        except Exception:
-            pass
-    # 3) Honest "full version not found" + more-search options. A short
-    # preview is never presented as the song. If Spotify is configured,
-    # attach the official Spotify link as an honest alternative.
-    more_kb_rows = list(kb.inline_keyboard)
-    more_kb_rows.append([InlineKeyboardButton(
-        text=t("similar_songs", ulang), callback_data=_cb_query(query))])
-    spotify_url = ""
-    if config is not None and getattr(config, "spotify_client_id", ""):
-        try:
-            from ..search.spotify import search_tracks as _sp_search
-            _sp = await _sp_search(
-                f"{artist} {title}".strip(),
-                config.spotify_client_id, config.spotify_client_secret or "",
-                limit=1)
-            if _sp and _sp[0].get("spotify_url"):
-                # title sanity: must match, never a wrong song's link
-                from ..search.youtube_full import _title_ok as _sp_ok
-                if _sp_ok(_sp[0]["title"], "", artist, title):
-                    spotify_url = _sp[0]["spotify_url"]
-        except Exception:
-            spotify_url = ""
-    if spotify_url:
-        more_kb_rows.append([InlineKeyboardButton(
-            text="🎧 Spotify", url=spotify_url)])
-    if bank_token:
-        more_kb_rows.append([InlineKeyboardButton(
-            text=t("m_bank_search_btn", ulang),
-            callback_data=f"bank:search:{bank_token}")])
-    await _answer(message, conn,
-                  t("h_song_no_full", ulang).format(title=title, artist=artist),
-                  reply_markup=InlineKeyboardMarkup(inline_keyboard=more_kb_rows))
+    finally:
+        await _drop_wait()
 
 
 def _openai_ready(conn, config) -> tuple[str, bool]:
@@ -3707,10 +3769,6 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         # page fetches and resolve time).
         _resolved = None
         if outcome.kind == "instagram":
-            # NOTE: no local `import time as _time` here — the module
-            # already imports it (line 36) and a local import would make
-            # _time function-local, breaking the _time uses above with
-            # UnboundLocalError (live bug in cf1360cd, found 2026-11-07).
             _rt = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
@@ -3721,14 +3779,6 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             _timing.log_stage(log, "link_stage", _req_id, _t_req, "resolve",
                               _rt,
                               strategy=_resolved[3] if _resolved else "error")
-        # Phase 2: spawn the identify pre-compute NOW (at resolve-done),
-        # concurrently with the video download+send below — not after it.
-        # One light task (12 s extract + bank match, result cached
-        # ~10 min); it never blocks the send coroutine.
-        if _resolved is not None and _resolved[0]:
-            _cid = getattr(getattr(message, "chat", None), "id", None) \
-                or getattr(getattr(message, "from_user", None), "id", None)
-            _spawn_bg_precompute(_resolved[0], _cid, conn, _req_id)
         # SPEED: Time the video send stage.
         import time as _ptime
         _vs = _ptime.perf_counter()
@@ -3784,6 +3834,19 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                         pass
                     _timing.log_stage(log, "link_stage", _req_id, _t_req,
                                       "cache_store", _t_store)
+        except Exception:
+            pass
+        # Phase 2 batch 2 (2026-11-08): background identify pre-compute,
+        # spawned ONLY AFTER the video is sent — never at resolve-done,
+        # never concurrent with the download/mux (Render is 0.1 CPU).
+        # One light task (12 s extract + bank match, cached ~10 min) so
+        # a tap on «🎵 شناسایی موسیقی» answers from the cache.
+        # Fire-and-forget: never blocks, never messages.
+        try:
+            _cid = getattr(getattr(message, "chat", None), "id", None) \
+                or getattr(getattr(message, "from_user", None), "id", None)
+            if _resolved is not None and _resolved[0]:
+                _spawn_bg_precompute(_resolved[0], _cid, conn, _req_id)
         except Exception:
             pass
         _timing.log_total(log, "link_stage", _req_id, _t_req, "sent",
@@ -4606,6 +4669,11 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
     in-memory fullsong cache for instant repeat delivery. If no full
     version is found, falls back to the extracted audio from the user's
     own video (own_media) — the song itself, not just "not found".
+
+    Decoupled (2026-11-08): the callback is answered at once and the
+    lookup runs in a background task, guarded by the same one-in-flight
+    rule as the automatic delivery — a tap while the file is already
+    being delivered never starts a second lookup or a second send.
     """
     ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
     key = callback.data[8:]
@@ -4616,85 +4684,103 @@ async def download_full_callback(callback, conn: sqlite3.Connection, config: Con
     await callback.answer(t("m_downloading", ulang))
     title = result["title"]
     artist = result.get("artist", "")
+    _chat_id = getattr(getattr(callback.message, "chat", None), "id", None)
+    _spawn_fullsong_task(
+        _fullsong_key(_chat_id, title, artist),
+        lambda: _download_full_bg(callback, conn, config, title, artist,
+                                  result))
+    return
+
+
+async def _download_full_bg(callback, conn, config, title, artist, result):
+    """Background body of download_full_callback (moved verbatim):
+    full-version lookup, then the extracted-audio fallback, then the
+    honest no-full message. Fire-and-forget: never raises."""
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
     try:
-        from ..search.adapters import find_full_song_file_v2
-        full = await find_full_song_file_v2(artist, title)
+        try:
+            from ..search.adapters import find_full_song_file_v2
+            full = await find_full_song_file_v2(artist, title)
+        except Exception:
+            full = None
+        if full and full.get("data"):
+            try:
+                sent = await callback.message.answer_audio(
+                    BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
+                    title=title, performer=artist,
+                    duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
+                    caption=t("h_song_full_caption", ulang).format(
+                        label=t("m_full_duration_long", ulang), title=title, artist=artist))
+                if sent is not None:
+                    try:
+                        adminfeat.track(conn, callback.from_user.id,
+                                        callback.message.chat.id, sent.message_id)
+                    except Exception:
+                        pass
+                return
+            except Exception:
+                pass
+        # Fallback: send the extracted audio from the user's own video
+        # (the song itself, labelled as extracted — not a fake "full version").
+        own_media = result.get("own_media")
+        if own_media:
+            media_type, file_id = own_media
+            try:
+                import io as _io
+                import subprocess as _sp
+                import tempfile as _tf
+                import os as _os
+                bot = callback.bot
+                tg_file = await bot.get_file(file_id)
+                # Download the video file into memory
+                buf = _io.BytesIO()
+                await bot.download_file(tg_file.file_path, buf)
+                video_bytes = buf.getvalue()
+                if video_bytes:
+                    # Extract audio with ffmpeg (available on Render)
+                    with _tf.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+                        vf.write(video_bytes)
+                        vpath = vf.name
+                    apath = vpath + ".m4a"
+                    try:
+                        _timing.run(["ffmpeg", "-y", "-i", vpath, "-vn",
+                                     "-c:a", "aac", "-b:a", "128k", apath],
+                                    logger=log,
+                                    capture_output=True, timeout=30)
+                        if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
+                            with open(apath, "rb") as af:
+                                audio_bytes = af.read()
+                            sent = await callback.message.answer_audio(
+                                BufferedInputFile(audio_bytes,
+                                                  filename=f"{title}.m4a"),
+                                title=title, performer=artist,
+                                caption=t("m_extracted_audio_caption", ulang).format(
+                                    title=title, artist=artist))
+                            if sent is not None:
+                                try:
+                                    adminfeat.track(conn, callback.from_user.id,
+                                                    callback.message.chat.id,
+                                                    sent.message_id)
+                                except Exception:
+                                    pass
+                            return
+                    finally:
+                        try:
+                            _os.unlink(vpath)
+                        except Exception:
+                            pass
+                        try:
+                            _os.unlink(apath)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        await callback.message.answer(t("m_identified_no_full", ulang).format(
+            title=title, artist=artist))
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        full = None
-    if full and full.get("data"):
-        try:
-            sent = await callback.message.answer_audio(
-                BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
-                title=title, performer=artist,
-                duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
-                caption=t("h_song_full_caption", ulang).format(
-                    label=t("m_full_duration_long", ulang), title=title, artist=artist))
-            if sent is not None:
-                try:
-                    adminfeat.track(conn, callback.from_user.id,
-                                    callback.message.chat.id, sent.message_id)
-                except Exception:
-                    pass
-            return
-        except Exception:
-            pass
-    # Fallback: send the extracted audio from the user's own video
-    # (the song itself, labelled as extracted — not a fake "full version").
-    own_media = result.get("own_media")
-    if own_media:
-        media_type, file_id = own_media
-        try:
-            import io as _io
-            import subprocess as _sp
-            import tempfile as _tf
-            import os as _os
-            bot = callback.bot
-            tg_file = await bot.get_file(file_id)
-            # Download the video file into memory
-            buf = _io.BytesIO()
-            await bot.download_file(tg_file.file_path, buf)
-            video_bytes = buf.getvalue()
-            if video_bytes:
-                # Extract audio with ffmpeg (available on Render)
-                with _tf.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
-                    vf.write(video_bytes)
-                    vpath = vf.name
-                apath = vpath + ".m4a"
-                try:
-                    _timing.run(["ffmpeg", "-y", "-i", vpath, "-vn",
-                                 "-c:a", "aac", "-b:a", "128k", apath],
-                                logger=log,
-                                capture_output=True, timeout=30)
-                    if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
-                        with open(apath, "rb") as af:
-                            audio_bytes = af.read()
-                        sent = await callback.message.answer_audio(
-                            BufferedInputFile(audio_bytes,
-                                              filename=f"{title}.m4a"),
-                            title=title, performer=artist,
-                            caption=t("m_extracted_audio_caption", ulang).format(
-                                title=title, artist=artist))
-                        if sent is not None:
-                            try:
-                                adminfeat.track(conn, callback.from_user.id,
-                                                callback.message.chat.id,
-                                                sent.message_id)
-                            except Exception:
-                                pass
-                        return
-                finally:
-                    try:
-                        _os.unlink(vpath)
-                    except Exception:
-                        pass
-                    try:
-                        _os.unlink(apath)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    await callback.message.answer(t("m_identified_no_full", ulang).format(
-        title=title, artist=artist))
+        pass
 
 
 _COPY_TEXT_LIMIT = 240  # Bot API CopyTextButton.text allows 1-256 chars

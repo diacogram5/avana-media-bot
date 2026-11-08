@@ -270,7 +270,7 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
 async def fetch_merged_video(video_url: str, audio_url: str | None = None,
                              timeout: int = 40,
                              max_mb: int = 50,
-                             req_id: str | None = None) -> tuple[str, bool]:
+                             req_id: str | None = None) -> tuple[bytes, bool]:
     """Download an Instagram DASH video stream and, when available, its
     separate audio stream, then mux both into a single MP4 with ffmpeg.
 
@@ -279,128 +279,90 @@ async def fetch_merged_video(video_url: str, audio_url: str | None = None,
     This helper fixes that at the single point where the sent video is
     built.
 
-    Phase 2 (2026-11-07, V6 design — prototype-verified): each stream is
-    downloaded by its own fresh client (as before) but STREAMED in 64KB
-    chunks straight to a temp file on disk — the full file is NEVER held
-    in RAM (the old code held video + audio + merged bytes at once,
-    ~100-150MB for a 50MB file on a 512MB instance). The mux copies
-    BOTH streams (`-c:v copy -c:a copy`, no audio re-encode — DASH audio
-    is already AAC) with `-movflags +faststart`.
-
-    Returns (path, has_audio). ``path`` is the merged MP4 on disk (or
-    the video-only file when there is no audio stream); the CALLER owns
-    it and must delete the file and its parent temp dir after sending.
-    Returns ("", False) when the video stream cannot be fetched. The
-    download NEVER fails because of the audio step: a missing/unreachable
-    audio stream or a failed mux falls back to the video-only file
-    (previous behavior), so the healthy video path is preserved.
+    Returns (bytes, has_audio). The download NEVER fails because of the
+    audio step: a missing/unreachable audio stream or a failed mux falls
+    back to the video-only bytes (previous behavior), so the healthy
+    video path is preserved.
     """
     import asyncio as _asyncio
-    import os as _os
-    import shutil as _sh
     import tempfile as _tf
     import time as _time
 
     headers = {"User-Agent": "Mozilla/5.0",
                "Referer": "https://www.instagram.com/"}
     t0 = _time.time()
-    tmp = _tf.mkdtemp(prefix="avano_ig_")
-    vp, ap, op = (f"{tmp}/v.mp4", f"{tmp}/a.m4a", f"{tmp}/out.mp4")
 
-    def _cleanup() -> None:
-        try:
-            _sh.rmtree(tmp, ignore_errors=True)
-        except Exception:
-            pass
-
-    async def _dl(url: str, path: str) -> int:
-        """Stream one stream to disk. Returns bytes written, 0 on any
-        failure or when the stream exceeds max_mb (aborts early)."""
+    async def _dl(url: str) -> bytes:
+        """Download one stream. Returns b"" on any failure."""
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("GET", url,
-                                         headers=headers) as resp:
-                    resp.raise_for_status()
-                    total = 0
-                    with open(path, "wb") as fh:
-                        async for chunk in resp.aiter_bytes(65536):
-                            if not chunk:
-                                continue
-                            total += len(chunk)
-                            if total > max_mb * 1024 * 1024:
-                                return 0
-                            fh.write(chunk)
-                    return total
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.content
+                if data and len(data) <= max_mb * 1024 * 1024:
+                    return data
         except httpx.HTTPStatusError as exc:
             # 2026-11-08: a 429 here means Render's IP is blocked on
             # the CDN too — log the status so it is reported at once.
             log_event(log, "instagram_merge", stage="stream_download",
                       status=exc.response.status_code,
                       ms=int((_time.time() - t0) * 1000))
-            return 0
         except Exception:
-            return 0
+            pass
+        return b""
 
     # Download video and audio IN PARALLEL (they're independent streams).
     # Sequential download was the 35s bottleneck.
     if audio_url:
-        video_bytes, audio_bytes = await _asyncio.gather(
-            _dl(video_url, vp), _dl(audio_url, ap))
+        video_data, audio_data = await asyncio.gather(
+            _dl(video_url), _dl(audio_url))
     else:
-        video_bytes = await _dl(video_url, vp)
-        audio_bytes = 0
+        video_data = await _dl(video_url)
+        audio_data = b""
 
-    if not video_bytes:
+    if not video_data:
         log_event(log, "instagram_merge", stage="video_download",
                   ms=int((_time.time() - t0) * 1000), error="empty_or_failed")
-        _cleanup()
-        return "", False
+        return b"", False
 
-    if not audio_bytes:
-        # No audio stream: return the video file as-is (silent-video
-        # behavior). The caller owns the file + temp dir.
-        try:
-            _os.unlink(ap)
-        except Exception:
-            pass
-        return vp, False
+    if not audio_data:
+        # No audio stream: return video only (silent-video behavior).
+        return video_data, False
 
-    def _mux() -> str:
-        r = _timing.run(
-            ["ffmpeg", "-y", "-v", "error",
-             "-i", vp, "-i", ap,
-             "-c:v", "copy", "-c:a", "copy",
-             "-shortest", "-movflags", "+faststart", op],
-            req_id=req_id, logger=log, stage="ffmpeg_mux",
-            capture_output=True, timeout=120)
-        if r.returncode != 0 or not _os.path.exists(op):
-            return ""
-        # Validate: the muxed file must really carry an audio stream.
-        p = _timing.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type", "-of", "csv=p=0", op],
-            req_id=req_id, logger=log,
-            capture_output=True, timeout=30)
-        types = p.stdout.decode(errors="replace")
-        if "audio" not in types or "video" not in types:
-            return ""
-        return op
+    def _mux() -> bytes:
+        with _tf.TemporaryDirectory() as tmp:
+            vp, ap, op = (f"{tmp}/v.mp4", f"{tmp}/a.m4a", f"{tmp}/out.mp4")
+            open(vp, "wb").write(video_data)
+            open(ap, "wb").write(audio_data)
+            r = _timing.run(
+                ["ffmpeg", "-y", "-v", "error",
+                 "-i", vp, "-i", ap,
+                 "-c:v", "copy", "-c:a", "copy",
+                 "-shortest", "-movflags", "+faststart", op],
+                req_id=req_id, logger=log, stage="ffmpeg_mux",
+                capture_output=True, timeout=120)
+            if r.returncode != 0 or not __import__("os").path.exists(op):
+                return b""
+            # Validate: the muxed file must really carry an audio stream.
+            p = _timing.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "stream=codec_type", "-of", "csv=p=0", op],
+                req_id=req_id, logger=log,
+                capture_output=True, timeout=30)
+            types = p.stdout.decode(errors="replace")
+            if "audio" not in types or "video" not in types:
+                return b""
+            return open(op, "rb").read()
 
     try:
         merged = await _asyncio.to_thread(_mux)
     except Exception as exc:
         log_event(log, "instagram_merge", stage="mux",
                   ms=int((_time.time() - t0) * 1000), error=str(exc)[:80])
-        merged = ""
+        merged = b""
     if merged:
         log_event(log, "instagram_merge", stage="done",
                   ms=int((_time.time() - t0) * 1000),
-                  bytes=_os.path.getsize(merged), has_audio=True)
-        # Drop the intermediates; the caller owns the merged file.
-        for _p in (vp, ap):
-            try:
-                _os.unlink(_p)
-            except Exception:
-                pass
+                  bytes=len(merged), has_audio=True)
         return merged, True
-    return vp, False
+    return video_data, False
