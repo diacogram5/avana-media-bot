@@ -59,6 +59,23 @@ def max_rss_kb() -> int:
         return 0
 
 
+def rss_kb() -> int:
+    """Current resident memory of this process (Linux: kilobytes).
+
+    STEP 2 (2026-11-08): the high-water mark (max_rss_kb) never drops,
+    so per-stage RAM needs the live VmRSS from /proc/self/status.
+    Stdlib only, never raises.
+    """
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+
 def log_stage(logger, event: str, req_id, t_req_start, stage: str,
               t_stage_start=None, **extra) -> None:
     """One structured stage line: ms for this stage + total since start."""
@@ -68,7 +85,7 @@ def log_stage(logger, event: str, req_id, t_req_start, stage: str,
                     if t_req_start is not None else None)
         ms = (int((now - t_stage_start) * 1000)
               if t_stage_start is not None else total_ms)
-        fields = {"stage": stage, "ms": ms}
+        fields = {"stage": stage, "ms": ms, "rss_kb": rss_kb()}
         if req_id is not None:
             fields["req_id"] = req_id
         if total_ms is not None:
@@ -96,6 +113,7 @@ def log_total(logger, event: str, req_id, t_req_start, status: str,
                   "ms": total_ms, "total_ms": total_ms, "status": status,
                   "uptime_seconds": round(uptime_seconds(), 1),
                   "cpu_count": cpu_count(), "max_rss_kb": max_rss_kb(),
+                  "rss_kb": rss_kb(),
                   "turso_queries": count, "turso_total_ms": turso_ms}
         if headline_total:
             fields[headline_total] = total_ms

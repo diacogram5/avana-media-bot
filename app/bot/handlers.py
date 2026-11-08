@@ -1348,6 +1348,16 @@ def _looks_like_video(data: bytes) -> bool:
     return head[4:8] == b"ftyp" or head[:4] == b"\x00\x00\x00\x18"
 
 
+def _looks_like_video_file(path: str) -> bool:
+    """Magic-byte check on the first 16 bytes of a file on disk (STEP 2:
+    the video lives on disk now, never in RAM)."""
+    try:
+        with open(path, "rb") as f:
+            return _looks_like_video(f.read(16))
+    except Exception:
+        return False
+
+
 def _looks_like_audio(data: bytes) -> bool:
     """Magic-byte check for audio bytes (mp4/m4a container, MP3, WAV,
     AAC ADTS) — never trusts extensions or content-type alone."""
@@ -1375,8 +1385,9 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     instead of running the four-strategy resolver a second time.
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
-    from aiogram.types import BufferedInputFile
+    from aiogram.types import FSInputFile
 
+    import os as _os
     import time as _time
     try:
         if resolved is not None:
@@ -1404,24 +1415,46 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         return None
     _t_dl = _time.perf_counter()
     max_mb = getattr(config, "max_file_mb", 50) if config is not None else 50
+    _video_path: str | None = None
+    _tmpdir = None
     try:
         from ..services.instagram import fetch_merged_video
         # Instagram DASH serves video and audio as SEPARATE streams:
         # downloading only the video URL yields a SILENT file. Fetch
         # both and mux to one MP4 (falls back to video-only when the
         # audio stream is missing — the healthy path is preserved).
-        data, _has_audio = await fetch_merged_video(
+        # STEP 2: the file lives on DISK (streamed, never in RAM);
+        # RapidAPI/crawler progressive files skip the mux entirely.
+        _video_path, _has_audio, _tmpdir = await fetch_merged_video(
             video_url, audio_url, max_mb=max_mb, req_id=req_id)
     except Exception:
         return None
+    _size = 0
+    try:
+        _size = _os.path.getsize(_video_path) if _video_path else 0
+    except Exception:
+        _size = 0
     _timing.log_stage(log, "link_stage", req_id, t_req, "download", _t_dl,
-                      bytes=len(data or b""), has_audio=_has_audio)
-    if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
+                      bytes=_size, has_audio=_has_audio)
+    if not _video_path or _size > max_mb * 1024 * 1024 \
+            or not _looks_like_video_file(_video_path):
+        try:
+            if _tmpdir is not None:
+                _tmpdir.cleanup()
+        except Exception:
+            pass
         return None
     _t_send = _time.perf_counter()
-    sent = await send_video(
-        message, BufferedInputFile(data, filename="video.mp4"),
-        caption=t("m_link_video_dl", ulang))
+    try:
+        sent = await send_video(
+            message, FSInputFile(_video_path, filename="video.mp4"),
+            caption=t("m_link_video_dl", ulang))
+    finally:
+        try:
+            if _tmpdir is not None:
+                _tmpdir.cleanup()
+        except Exception:
+            pass
     _timing.log_stage(log, "link_stage", req_id, t_req, "send_video", _t_send)
     if sent is not None:
         _track(conn, message, sent)

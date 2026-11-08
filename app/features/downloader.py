@@ -665,15 +665,22 @@ def _filename(url: str, content_type: str) -> str:
 
 
 async def _send_file(message: types.Message, job: dict, data: bytes,
-                   lang: str = "fa") -> str:
-    """Send the downloaded bytes via the unified media pipeline; return
-    the Telegram file_id for caching."""
+                   lang: str = "fa", path: str | None = None) -> str:
+    """Send the downloaded file via the unified media pipeline; return
+    the Telegram file_id for caching. ``path`` (STEP 2) sends a file
+    already on disk via FSInputFile — no bytes held in RAM; ``data``
+    keeps the old bytes path for the other download branches."""
     from ..bot.media_send import send_music, send_video
     ctype = job.get("content_type", "unknown")
     name = _filename(job.get("result_url") or job.get("url", ""), ctype)
     if ctype == "video":
-        sent = await send_video(
-            message, BufferedInputFile(data, filename=name))
+        if path is not None:
+            from aiogram.types import FSInputFile
+            sent = await send_video(
+                message, FSInputFile(path, filename=name))
+        else:
+            sent = await send_video(
+                message, BufferedInputFile(data, filename=name))
         if sent is None:
             raise _TransientError(RETRY_LATER)
         return sent.video.file_id
@@ -735,21 +742,34 @@ async def run_job(message: types.Message, conn: sqlite3.Connection,
             # Instagram DASH: video and audio are separate streams; mux both
             # so the downloaded file is not silent. Falls back to the plain
             # download when there is no separate audio URL.
+            # STEP 2: the merged file lives on DISK (streamed, never in
+            # RAM); the temp dir is deleted after the file is sent.
             _audio_url = job.get("audio_url") or ""
+            _vpath: str | None = None
+            _vtmp = None
             if _audio_url and job.get("content_type") == "video":
                 from ..services.instagram import fetch_merged_video
-                data, _ = await fetch_merged_video(
+                _vpath, _, _vtmp = await fetch_merged_video(
                     download_url, _audio_url,
                     max_mb=min(config.max_file_mb, 50))
-                if not data:
+                if not _vpath:
                     raise _TransientError(RETRY_LATER)
+                data = None
             else:
                 data = await _download_bytes(download_url, limit, _prog)
             update_job(conn, job_id, stage="saving", progress=90)
             await _refresh_status(message, conn, job_id)
             job = get_job(conn, job_id)
             lang = user_lang_or_default(conn, job.get("user_id"))
-            file_id = await _send_file(message, job, data, lang)
+            try:
+                file_id = await _send_file(message, job, data, lang,
+                                           path=_vpath)
+            finally:
+                try:
+                    if _vtmp is not None:
+                        _vtmp.cleanup()
+                except Exception:
+                    pass
             update_job(conn, job_id, status="ready", stage="done",
                        progress=100, result_file_id=file_id)
             await _refresh_status(message, conn, job_id)
