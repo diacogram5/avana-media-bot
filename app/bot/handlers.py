@@ -156,6 +156,17 @@ LYRICS_CACHE: dict[str, tuple[str, str, str]] = {}
 # Translations shown: (key, lang) -> translated text.
 TRANSLATIONS: dict[tuple[str, str], str] = {}
 
+# HOTFIX 2026-11-08: LYRICS_CACHE had no cap/TTL (slow unbounded leak).
+# Cap at 200 entries, FIFO eviction on insert.
+LYRICS_CACHE_MAX = 200
+
+
+def _lyrics_cache_put(key: str, value: tuple[str, str, str]) -> None:
+    """Store a lyrics entry, evicting the oldest first when at the cap."""
+    if key not in LYRICS_CACHE and len(LYRICS_CACHE) >= LYRICS_CACHE_MAX:
+        LYRICS_CACHE.pop(next(iter(LYRICS_CACHE)), None)
+    LYRICS_CACHE[key] = value
+
 
 def _user_lang(conn, user_id: int | None) -> str:
     """UI language for a user: stored preference, Persian default.
@@ -4716,7 +4727,7 @@ async def _lyrics_text_for(key: str, conn) -> tuple[str, str, str] | None:
         lyrics = None
     if not lyrics:
         return None
-    LYRICS_CACHE[key] = (result["title"], result.get("artist", ""), lyrics)
+    _lyrics_cache_put(key, (result["title"], result.get("artist", ""), lyrics))
     return LYRICS_CACHE[key]
 
 
@@ -4743,7 +4754,7 @@ async def lyrics_callback(callback, conn: sqlite3.Connection, config: Config):
             q = result["title"] + (f" - {result['artist']}" if result.get("artist") else "")
             await callback.message.answer(lyrics_not_found_text(q))
         return
-    LYRICS_CACHE[key] = (result["title"], result.get("artist", ""), lyrics)
+    _lyrics_cache_put(key, (result["title"], result.get("artist", ""), lyrics))
     kb = _lyrics_card_kb(key, result["title"], result.get("artist", ""),
                          lyrics, conn, config, ulang)
     header = t("h_lyrics_head", ulang).format(
@@ -5062,7 +5073,7 @@ async def _run_lyrics_search(message: Message, conn, text: str, config):
         await _del_lyr_searching()
         return
     key = profeat.remember_result(title, artist, "", "")
-    LYRICS_CACHE[key] = (title, artist, lyrics)
+    _lyrics_cache_put(key, (title, artist, lyrics))
     kb = _lyrics_card_kb(key, title, artist, lyrics, conn, config, ulang)
     header = f"📝 متن آهنگ «{title}»" + (f" — {artist}" if artist else "")
     src = f"\nمنبع: {source}" if source else ""

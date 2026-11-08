@@ -53,7 +53,7 @@ _UA = {"User-Agent": "Mozilla/5.0 (compatible; AvanoMediaBot/1.0)"}
 # Render restarts clear it; correctness never depends on it.
 _CACHE: dict[str, tuple[bytes, str, float, str, float]] = {}
 _CACHE_TTL = 30 * 60
-_CACHE_MAX = 3
+_CACHE_MAX = 1  # HOTFIX 2026-11-08: was 3 (up to 90MB of song bytes in RAM)
 
 _FILE_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:mp3|m4a)", re.IGNORECASE)
 
