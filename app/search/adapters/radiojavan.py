@@ -115,7 +115,8 @@ class RadioJavanAdapter(SourceAdapter):
         return FileResult(
             data=data, ext="m4a", duration_sec=duration,
             source="radiojavan", bitrate_kbps=256,
-            title=best.title or title, artist=best.artist or artist)
+            title=best.title or title, artist=best.artist or artist,
+            url=dl, size=len(data))
 
     async def search(self, artist: str, title: str) -> FileResult | None:
         try:

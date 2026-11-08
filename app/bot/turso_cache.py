@@ -77,6 +77,15 @@ def _get_conn():
                 expires_at INTEGER NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS song_file_cache (
+                cache_key TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                file_type TEXT,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
         conn.commit()
         _turso_conn = conn
         _turso_ok = True
@@ -145,6 +154,67 @@ def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30
         return True
     except Exception as e:
         _log.debug("turso_cache: store failed: %s", e)
+        return False
+
+
+def _song_key(artist: str, title: str) -> str:
+    """Cache key for a song (same shape as file_cache._cache_key)."""
+    return f"song:{artist.strip().lower()}|{title.strip().lower()}"
+
+
+def get_song_file_id(artist: str, title: str, req_id: str | None = None) -> str | None:
+    """Get a cached song file_id from persistent Turso cache. None if miss/error."""
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        key = _song_key(artist, title)
+        _tq = time.perf_counter()
+        cur = conn.execute(
+            "SELECT file_id, expires_at FROM song_file_cache WHERE cache_key = ?",
+            (key,))
+        _timing.note_turso(req_id, "song_file_cache.get",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
+        row = cur.fetchone()
+        if not row:
+            return None
+        file_id, expires_at = row[0], row[1]
+        if int(expires_at) < int(time.time()):
+            # Expired - delete
+            try:
+                conn.execute("DELETE FROM song_file_cache WHERE cache_key = ?", (key,))
+                conn.commit()
+            except Exception:
+                pass
+            return None
+        return file_id
+    except Exception as e:
+        _log.debug("turso_cache: get_song_file_id failed: %s", e)
+        return None
+
+
+def store_song_file_id(artist: str, title: str, file_id: str, file_type: str = "audio",
+                       ttl_days: int = 7, req_id: str | None = None) -> bool:
+    """Store a song file_id in persistent Turso cache. Returns True if stored."""
+    conn = _get_conn()
+    if not conn:
+        return False
+    try:
+        key = _song_key(artist, title)
+        now = int(time.time())
+        expires = now + (ttl_days * 86400)
+        _tq = time.perf_counter()
+        conn.execute("""
+            INSERT OR REPLACE INTO song_file_cache
+            (cache_key, file_id, file_type, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (key, file_id, file_type, expires, now))
+        _timing.note_turso(req_id, "song_file_cache.store",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.debug("turso_cache: store_song_file_id failed: %s", e)
         return False
 
 

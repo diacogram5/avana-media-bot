@@ -202,6 +202,8 @@ class PersianMusicAdapter(SourceAdapter):
                     bitrate_kbps=128,
                     title=title,
                     artist=artist,
+                    url=mp3_url,
+                    size=len(data),
                 )
 
         # Try title-only first (WP API handles single terms better),
@@ -244,6 +246,8 @@ class PersianMusicAdapter(SourceAdapter):
                             bitrate_kbps=128,
                             title=title,
                             artist=artist,
+                            url=mp3_url,
+                            size=len(data),
                         )
                 except Exception as e:
                     log.debug("persian_music site %s failed: %s", site["name"], e)

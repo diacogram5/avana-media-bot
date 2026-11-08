@@ -2992,6 +2992,42 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         pass
         except Exception:
             pass
+        # 1a) PERSISTENT Turso song cache: survives Render restarts (the
+        # local bot.db cache above is wiped on every restart). Same
+        # file_id fast path, then refresh the local cache.
+        try:
+            from .turso_cache import get_song_file_id as _turso_song_get
+            _turso_fid = _turso_song_get(artist, title)
+            if _turso_fid:
+                try:
+                    sent = await message.answer_audio(
+                        _turso_fid,
+                        caption=t("h_song_full_caption", ulang).format(
+                            label=t("m_full_duration_long", ulang),
+                            title=title, artist=artist),
+                        title=title, performer=artist,
+                        reply_markup=kb)
+                    if sent is not None:
+                        _track(conn, message, sent)
+                        _t_ms = int((_time.time() - _t_start) * 1000)
+                        log_event(log, "fullsong", stage="sent_cached",
+                                  title=title[:40], ms=_t_ms, turso=True)
+                        try:
+                            store_file_id(conn, artist, title, _turso_fid, "audio")
+                        except Exception:
+                            pass
+                        try:
+                            conn.execute(
+                                "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
+                                ("send", _t_ms, int(_time.time())))
+                            conn.commit()
+                        except:
+                            pass
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Background delivery: the result card was already sent —
         # this message only marks the wait for the full version.
         try:
@@ -3006,6 +3042,47 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             full = None
         if full:
             try:
+                # Direct-URL send: when the adapter knows a public URL and
+                # the size is under Telegram's 20 MB URL limit, Telegram
+                # fetches the file itself — Render never uploads the bytes.
+                # Any failure falls back to the bytes path below.
+                _full_url = full.get("url")
+                _full_size = full.get("size")
+                if _full_url and isinstance(_full_size, int) and _full_size < 20 * 1024 * 1024:
+                    try:
+                        sent = await message.answer_audio(
+                            _full_url,
+                            caption=t("h_song_full_caption", ulang).format(
+                                label=t("m_full_duration_long", ulang),
+                                title=title, artist=artist),
+                            title=title, performer=artist,
+                            duration=int(full["duration_sec"]),
+                            reply_markup=kb)
+                        if sent is not None:
+                            _track(conn, message, sent)
+                            log_event(log, "fullsong", stage="sent_url",
+                                      title=title[:40],
+                                      source=full.get("source", "")[:40],
+                                      bytes=_full_size)
+                            try:
+                                _fid = sent.audio.file_id if sent.audio else None
+                                if _fid:
+                                    store_file_id(conn, artist, title, _fid, "audio",
+                                                  _full_size, full["duration_sec"],
+                                                  full.get("source", ""))
+                                    try:
+                                        from .turso_cache import store_song_file_id as _turso_song_store
+                                        _turso_song_store(artist, title, _fid, "audio")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        log_event(log, "fullsong", stage="sent_url_failed",
+                                  title=title[:40],
+                                  source=full.get("source", "")[:40],
+                                  bytes=_full_size)
                 sent = await message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     caption=t("h_song_full_caption", ulang).format(
@@ -3028,6 +3105,11 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             store_file_id(conn, artist, title, _fid, "audio",
                                           len(full["data"]), full["duration_sec"],
                                           full.get("source", ""))
+                            try:
+                                from .turso_cache import store_song_file_id as _turso_song_store
+                                _turso_song_store(artist, title, _fid, "audio")
+                            except Exception:
+                                pass
                         # Speed measurement (Requirement #7): cache miss
                         _t_ms = int((_time.time() - _t_start) * 1000)
                         try:

@@ -26,6 +26,8 @@ class FileResult:
     bitrate_kbps: int = 0
     title: str = ""
     artist: str = ""
+    url: str | None = None   # direct public file URL, if the adapter knows one
+    size: int | None = None  # file size in bytes (known after download)
 
 
 @dataclass

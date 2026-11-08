@@ -40,7 +40,7 @@ def _fullsong_cache_key(artist: str, title: str) -> str:
 
 
 async def find_full_song_file_v2(artist: str, title: str) -> dict | None:
-    """Return {"data","ext","duration_sec","source"} or None.
+    """Return {"data","ext","duration_sec","source","url","size"} or None.
 
     Same contract as find_full_song_file, but via parallel adapters.
     Checks in-memory cache first for instant repeat delivery.
@@ -70,7 +70,8 @@ async def find_full_song_file_v2(artist: str, title: str) -> dict | None:
     if not res:
         return None
     out = {"data": res.data, "ext": res.ext,
-           "duration_sec": res.duration_sec, "source": res.source}
+           "duration_sec": res.duration_sec, "source": res.source,
+           "url": res.url, "size": res.size}
     # Cache it (evict oldest if full)
     if key not in _FULLSONG_CACHE:
         if len(_FULLSONG_CACHE_ORDER) >= _FULLSONG_CACHE_MAX:
