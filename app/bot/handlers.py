@@ -3238,22 +3238,26 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                 _full_url = full.get("url")
                 _full_size = full.get("size")
                 if _full_url and isinstance(_full_size, int) and _full_size < 20 * 1024 * 1024:
+                    _url_t0 = _time.perf_counter()
                     try:
-                        sent = await message.answer_audio(
-                            _full_url,
-                            caption=t("h_song_full_caption", ulang).format(
-                                label=_fullsong_duration_label(
-                                    full["duration_sec"], ulang),
-                                title=title, artist=artist),
-                            title=title, performer=artist,
-                            duration=int(full["duration_sec"]),
-                            reply_markup=kb)
+                        sent = await asyncio.wait_for(
+                            message.answer_audio(
+                                _full_url,
+                                caption=t("h_song_full_caption", ulang).format(
+                                    label=_fullsong_duration_label(
+                                        full["duration_sec"], ulang),
+                                    title=title, artist=artist),
+                                title=title, performer=artist,
+                                duration=int(full["duration_sec"]),
+                                reply_markup=kb),
+                            timeout=8.0)
                         if sent is not None:
                             _track(conn, message, sent)
                             log_event(log, "fullsong", stage="sent_url",
                                       title=title[:40],
                                       source=full.get("source", "")[:40],
-                                      bytes=_full_size)
+                                      bytes=_full_size,
+                                      ms=int((_time.perf_counter() - _url_t0) * 1000))
                             try:
                                 _fid = sent.audio.file_id if sent.audio else None
                                 if _fid:
@@ -3274,11 +3278,19 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             except Exception:
                                 pass
                             return
+                    except asyncio.TimeoutError:
+                        log_event(log, "fullsong", stage="sent_url_failed",
+                                  title=title[:40],
+                                  source=full.get("source", "")[:40],
+                                  bytes=_full_size,
+                                  reason="timeout",
+                                  ms=int((_time.perf_counter() - _url_t0) * 1000))
                     except Exception:
                         log_event(log, "fullsong", stage="sent_url_failed",
                                   title=title[:40],
                                   source=full.get("source", "")[:40],
-                                  bytes=_full_size)
+                                  bytes=_full_size,
+                                  ms=int((_time.perf_counter() - _url_t0) * 1000))
                 sent = await message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     caption=t("h_song_full_caption", ulang).format(

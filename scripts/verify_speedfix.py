@@ -8,6 +8,9 @@ Cases:
   S4  URL send raises -> falls back to bytes path; no URL string in logs.
   S5  URL with size >= 20 MB -> URL never attempted, bytes path used.
   S6  Turso unconfigured: miss falls through to the bytes path unchanged.
+  S7  8s URL timeout: a URL send sleeping >8s falls back to bytes with
+      sent_url_failed reason=timeout and an ms field; a fast URL send logs
+      sent_url with an ms field; no-URL dict uses the bytes path unchanged.
 
 Run: python3 scripts/verify_speedfix.py ; exit 0 = all PASS.
 """
@@ -17,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -273,7 +277,7 @@ class _FakeMessage:
     str_mode / bytes_mode: "ok" (return sent) or "raise" (raise RuntimeError).
     """
 
-    def __init__(self, str_mode="ok", bytes_mode="ok"):
+    def __init__(self, str_mode="ok", bytes_mode="ok", str_delay=0.0):
         self.message_id = 1
         self.from_user = SimpleNamespace(id=572595158, username="testuser",
                                          first_name="Test", last_name=None, is_bot=False)
@@ -281,6 +285,7 @@ class _FakeMessage:
         self.bot = SimpleNamespace()
         self.str_mode = str_mode
         self.bytes_mode = bytes_mode
+        self.str_delay = str_delay
         self.audio_calls: list[tuple[str, object]] = []
         self.answers: list[str] = []
 
@@ -291,6 +296,8 @@ class _FakeMessage:
     async def answer_audio(self, audio, **kw):
         if isinstance(audio, str):
             self.audio_calls.append(("str", audio))
+            if self.str_delay:
+                await asyncio.sleep(self.str_delay)
             if self.str_mode == "raise":
                 raise RuntimeError("telegram fetch failed")
             return _FakeSent(file_id="URL_SENT_ID")
@@ -362,6 +369,18 @@ async def _deliver(msg, conn, find_result, title=_TITLE, artist=_ARTIST,
 
 def _log_has(stage: str) -> bool:
     return any(f'"stage": "{stage}"' in line for line in LOG_LINES)
+
+
+def _log_line(stage: str) -> str:
+    for line in LOG_LINES:
+        if f'"stage": "{stage}"' in line:
+            return line
+    return ""
+
+
+def _log_ms(stage: str) -> int | None:
+    m = re.search(r'"ms":\s*(\d+)', _log_line(stage))
+    return int(m.group(1)) if m else None
 
 
 def _url_in_logs() -> bool:
@@ -490,6 +509,69 @@ async def main():
               file_cache_mod.get_cached_file_id(conn, _ARTIST, _TITLE) == "BYTES_FILE_ID")
     except Exception as exc:
         check("S6 Turso-miss fall-through", False, f"{type(exc).__name__}: {exc}")
+
+
+    # ---- S7: 8s URL timeout ----------------------------------------------
+    # S7a: URL send sleeping 9s must time out at 8s and fall back to bytes.
+    # NOTE: the fixture mp3 must be tagged with the same title passed to
+    # _deliver, or the bug-fix tag check rejects it before any send.
+    _T7a = "Test Song Timeout"
+    try:
+        LOG_LINES.clear()
+        _turso_on()
+        msg = _FakeMessage(str_mode="ok", bytes_mode="ok", str_delay=9.0)
+        conn = _make_conn()
+        n = await _deliver(msg, conn,
+                           _full_dict(url=_URL, size=1_000_000, title=_T7a),
+                           title=_T7a)
+        kinds = [k for k, _ in msg.audio_calls]
+        check("S7a slow URL send falls back to bytes path", kinds == ["str", "bytes"],
+              f"kinds={kinds}")
+        check("S7a timeout logs sent_url_failed", _log_has("sent_url_failed"))
+        check("S7a timeout failure carries reason=timeout",
+              '"reason": "timeout"' in _log_line("sent_url_failed"),
+              _log_line("sent_url_failed")[:200])
+        _ms = _log_ms("sent_url_failed")
+        check("S7a timeout ms field present and >= 7s (full 8s waited)",
+              _ms is not None and _ms >= 7000, f"ms={_ms}")
+        check("S7a no URL string in any log line", not _url_in_logs())
+    except Exception as exc:
+        check("S7a URL timeout fallback", False, f"{type(exc).__name__}: {exc}")
+
+    # S7b: fast URL send logs sent_url with an ms field (< 8s).
+    _T7b = "Test Song Fast URL"
+    try:
+        LOG_LINES.clear()
+        msg = _FakeMessage(str_mode="ok", bytes_mode="ok")
+        conn = _make_conn()
+        n = await _deliver(msg, conn,
+                           _full_dict(url=_URL, size=1_000_000, title=_T7b),
+                           title=_T7b)
+        kinds = [k for k, _ in msg.audio_calls]
+        check("S7b fast URL send uses URL only", kinds == ["str"], f"kinds={kinds}")
+        check("S7b fast URL send logs sent_url", _log_has("sent_url"))
+        _ms = _log_ms("sent_url")
+        check("S7b sent_url carries ms < 8000", _ms is not None and _ms < 8000,
+              f"ms={_ms}")
+        check("S7b no URL string in any log line", not _url_in_logs())
+    except Exception as exc:
+        check("S7b fast URL send ms field", False, f"{type(exc).__name__}: {exc}")
+
+    # S7c: no-URL dict uses the bytes path unchanged (Turso on).
+    _T7c = "Test Song No URL"
+    try:
+        LOG_LINES.clear()
+        msg = _FakeMessage()
+        conn = _make_conn()
+        n = await _deliver(msg, conn, _full_dict(title=_T7c), title=_T7c)
+        kinds = [k for k, _ in msg.audio_calls]
+        check("S7c no-URL dict uses bytes path only", kinds == ["bytes"],
+              f"kinds={kinds}")
+        check("S7c no sent_url line without a URL", not _log_has("sent_url"))
+        check("S7c no sent_url_failed line without a URL",
+              not _log_has("sent_url_failed"))
+    except Exception as exc:
+        check("S7c no-URL bytes path", False, f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
