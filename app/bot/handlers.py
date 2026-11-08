@@ -1327,6 +1327,17 @@ def _looks_like_video(data: bytes) -> bool:
     return head[4:8] == b"ftyp" or head[:4] == b"\x00\x00\x00\x18"
 
 
+def _looks_like_video_file(path: str) -> bool:
+    """Magic-byte check on a file path (same ftyp rule as
+    _looks_like_video, without reading the whole file into RAM)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except Exception:
+        return False
+    return _looks_like_video(head)
+
+
 def _looks_like_audio(data: bytes) -> bool:
     """Magic-byte check for audio bytes (mp4/m4a container, MP3, WAV,
     AAC ADTS) — never trusts extensions or content-type alone."""
@@ -1354,8 +1365,9 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     instead of running the four-strategy resolver a second time.
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
-    from aiogram.types import BufferedInputFile
+    from aiogram.types import FSInputFile
 
+    import os as _os
     import time as _time
     try:
         if resolved is not None:
@@ -1386,26 +1398,44 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         # downloading only the video URL yields a SILENT file. Fetch
         # both and mux to one MP4 (falls back to video-only when the
         # audio stream is missing — the healthy path is preserved).
-        data, _has_audio = await fetch_merged_video(
+        # Phase 2: fetch_merged_video returns a FILE PATH (streamed to
+        # disk, never held in RAM); this call owns the file + its temp
+        # dir and deletes both once the send is done (or failed).
+        video_path, _has_audio = await fetch_merged_video(
             video_url, audio_url, max_mb=max_mb, req_id=req_id)
     except Exception:
         return None
     _timing.log_stage(log, "link_stage", req_id, t_req, "download", _t_dl,
-                      bytes=len(data or b""), has_audio=_has_audio)
-    if not data or len(data) > max_mb * 1024 * 1024 or not _looks_like_video(data):
+                      bytes=_os.path.getsize(video_path) if video_path else 0,
+                      has_audio=_has_audio)
+    if not video_path:
         return None
-    _t_send = _time.perf_counter()
-    sent = await send_video(
-        message, BufferedInputFile(data, filename="video.mp4"),
-        caption=t("m_link_video_dl", ulang))
-    _timing.log_stage(log, "link_stage", req_id, t_req, "send_video", _t_send)
-    if sent is not None:
-        _track(conn, message, sent)
-        # Pass the reel's separate audio-stream URL so the one-click
-        # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
-        # directly (cheaper than re-extracting from the merged video).
-        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
-    return sent
+    try:
+        if _os.path.getsize(video_path) > max_mb * 1024 * 1024 \
+                or not _looks_like_video_file(video_path):
+            return None
+        _t_send = _time.perf_counter()
+        sent = await send_video(
+            message, FSInputFile(video_path, filename="video.mp4"),
+            caption=t("m_link_video_dl", ulang))
+        _timing.log_stage(log, "link_stage", req_id, t_req, "send_video",
+                          _t_send)
+        if sent is not None:
+            _track(conn, message, sent)
+            # Pass the reel's separate audio-stream URL so the one-click
+            # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
+            # directly (cheaper than re-extracting from the merged video).
+            await _attach_identify_button(message, conn, sent,
+                                          audio_url=audio_url)
+        return sent
+    finally:
+        # The merged file lives in a temp dir owned by this call.
+        try:
+            import os as _os2
+            import shutil as _sh2
+            _sh2.rmtree(_os2.path.dirname(video_path), ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _forward_channel(message) -> str:
@@ -1700,6 +1730,25 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     if cached_result is not None:
         result = cached_result
     try:
+        # Phase 2: background pre-compute (spawned at resolve-done, while
+        # the video was downloading). A bank hit answers instantly; a
+        # bank miss reuses the already-extracted 12 s slice so the tap
+        # pays only the API calls — no audio re-download, no re-extract,
+        # no audible re-check (the slice exists only if ffmpeg extracted
+        # real audio). _identify_audio still validates + re-banks (cheap)
+        # and then runs the APIs.
+        _pre = _bg_precompute_get(audio_url) \
+            if (result is None and audio_url) else None
+        if _pre is not None and _pre.get("status") == "bank_hit":
+            result = AudioIdResult(status="identified",
+                                   title=_pre.get("title", ""),
+                                   artist=_pre.get("artist", ""))
+        elif _pre is not None and _pre.get("status") == "bank_miss" \
+                and _pre.get("slice"):
+            data = _pre["slice"]
+            result = await _identify_audio(
+                data, "clip.wav", config, conn, cache_url_key=audio_url,
+                req_id=_req_id, t_req=_t_req)
         if result is None:
             # For link-fetched videos the sent file is the video-ONLY stream:
             # identify the reel's real audio from its separate audio URL.
@@ -2145,27 +2194,225 @@ def _link_needs_file_card(outcome, cause: str = "", lang: str = "fa") -> str:
     return card
 
 
-async def _bg_identify_link(outcome, config, conn, resolved):
-    """Background identify for link flow (competitor's model).
+# --- background identify pre-compute (Phase 2, 2026-11-07) ----------------
+# At resolve-done ONE light task runs CONCURRENTLY with the video
+# download+send: extract the 12 s slice from the reel's audio URL and
+# match it against the exclusive bank. The result is cached ~10 min so
+# a tap on «🎵 شناسایی موسیقی» answers from the cache (bank hit) or
+# pays only the API calls on the already-extracted slice (bank miss).
+# The full _identify_link_audio engine is deliberately NOT run here:
+# it downloads the whole audio file and burns Shazam/AudD/ACRCloud
+# calls for users who never tap identify.
+# Guardrails (prototype P4): max 1 background identify per chat (a new
+# link cancels the previous pending one); extract timeout 30 s (60 s
+# total incl. semaphore wait); the bank step is one Turso read plus a
+# <=4 ms match loop and is logged with its real ms; ffmpeg runs through
+# the EXISTING story-clips ffmpeg semaphore (story_clips._WM_SEM) so no
+# second heavy ffmpeg runs beside a story-clip pass; the task never
+# blocks the send coroutine (fire-and-forget, all errors swallowed);
+# the result expires after 10 min (a user who never taps pays nothing
+# after that). Replaces _bg_identify_link (full background identify).
+_BG_PRECOMPUTE: dict[str, dict] = {}
+_BG_PRECOMPUTE_TTL = 600  # seconds
+_BG_PRECOMPUTE_MAX = 32  # entries; ~0.5 MB slice each -> <= ~16 MB
+_BG_PRECOMPUTE_TASKS: dict[int, asyncio.Task] = {}
 
-    Runs _identify_link_audio without messaging the user. The result
-    is cached by the identify pipeline (url:audio_url key), so when the
-    user taps «🎵 شناسایی موسیقی», the button handler gets a cache hit
-    and responds instantly. Fire-and-forget: all exceptions swallowed.
-    """
-    _req_id = _timing.new_req_id()
-    _t_req = _time.perf_counter()
-    _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
-                      _t_req)
-    _status = "error"
+
+def _bg_precompute_key(audio_url: str) -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256((audio_url or "").encode()).hexdigest()
+
+
+def _bg_precompute_get(audio_url: str) -> dict | None:
+    """Fresh pre-compute entry for an audio URL, or None (miss/expired)."""
+    if not audio_url:
+        return None
+    key = _bg_precompute_key(audio_url)
+    ent = _BG_PRECOMPUTE.get(key)
+    if ent is None:
+        return None
+    if _time.time() - ent.get("created_at", 0) > _BG_PRECOMPUTE_TTL:
+        _BG_PRECOMPUTE.pop(key, None)
+        return None
+    return ent
+
+
+def _bg_precompute_put(audio_url: str, entry: dict) -> None:
+    """Store a pre-compute entry (capped; oldest evicted first)."""
+    if not audio_url:
+        return
+    while len(_BG_PRECOMPUTE) >= _BG_PRECOMPUTE_MAX:
+        _BG_PRECOMPUTE.pop(next(iter(_BG_PRECOMPUTE)))
+    entry["created_at"] = _time.time()
+    _BG_PRECOMPUTE[_bg_precompute_key(audio_url)] = entry
+
+
+async def _extract_12s_slice_locked(audio_url: str, tmp_path: str
+                                    ) -> bytes | None:
+    """Spawn ffmpeg (12 s slice) and wait <= 30 s. Never raises."""
     try:
-        _res = await _identify_link_audio(outcome, config, conn,
-                                          resolved=resolved,
-                                          req_id=_req_id, t_req=_t_req)
-        _status = _res[0] if _res else "error"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-v", "error", "-y", "-i", audio_url,
+            "-vn", "-t", "12", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", "-f", "wav", tmp_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+    except Exception:
+        return None
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        with open(tmp_path, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return None
+    if not data or len(data) < 1000:
+        return None
+    return data
+
+
+async def _extract_12s_slice(audio_url: str) -> bytes | None:
+    """ffmpeg: 12 s mono 16 kHz PCM WAV from an audio URL (or a
+    progressive mp4 URL), through the EXISTING story-clips ffmpeg
+    semaphore.
+    Returns the WAV bytes, or None on any failure/timeout. Never raises.
+    The semaphore is acquired BEFORE spawning ffmpeg so the gate is real.
+    """
+    import tempfile as _tf
+    tmp = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        try:
+            from .story_clips import _WM_SEM as _wm_sem
+        except Exception:
+            _wm_sem = None
+        if _wm_sem is not None:
+            async with _wm_sem:
+                return await _extract_12s_slice_locked(audio_url, tmp_path)
+        return await _extract_12s_slice_locked(audio_url, tmp_path)
+    finally:
+        try:
+            import os as _os
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+async def _bg_precompute_link(audio_url: str, chat_id: int, conn,
+                              req_id: str | None = None) -> None:
+    """Background 12 s extract + bank match for one link. Fire-and-forget:
+    never raises (except CancelledError, which is re-raised), never
+    messages. A bank hit is also stored in the url identify cache so the
+    tap's existing pre-check answers instantly."""
+    _req = req_id or _timing.new_req_id()
+    _t_req = _time.perf_counter()
+    _timing.log_stage(log, "identify_stage", _req, _t_req, "receipt",
+                      _t_req)
+    try:
+        if not audio_url or not _XBANK_OK:
+            return
+        try:
+            _slice = await asyncio.wait_for(
+                _extract_12s_slice(audio_url), timeout=60)
+        except asyncio.TimeoutError:
+            _slice = None
+        except Exception:
+            _slice = None
+        if not _slice:
+            _timing.log_stage(log, "identify_stage", _req, _t_req,
+                              "bg_extract", _t_req, ok=False)
+            return
+        _t_fp = _time.perf_counter()
+        try:
+            from .exclusive_bank import fingerprint_bytes as _xb_fp
+            import functools as _ft
+            _dur, _items = await asyncio.get_running_loop().run_in_executor(
+                None, _ft.partial(_xb_fp, _slice, ".wav", req_id=_req))
+        except Exception:
+            _items = None
+        _timing.log_stage(log, "identify_stage", _req, _t_req,
+                          "bg_fingerprint", _t_fp,
+                          items=len(_items or []))
+        if not _items:
+            return
+        _t_bank = _time.perf_counter()
+        _song = None
+        _sim = 0.0
+        try:
+            from .exclusive_bank import (
+                match_sample as _xb_match, _get_conn as _xb_conn)
+            _c = _xb_conn()
+            if _c is not None:
+                _song, _sim = _xb_match(_c, _items, req_id=_req)
+        except Exception:
+            _song, _sim = None, 0.0
+        _timing.log_stage(log, "identify_stage", _req, _t_req, "bg_bank",
+                          _t_bank, matched=_song is not None,
+                          sim=round(_sim, 3))
+        if _song is not None:
+            try:
+                if conn is not None:
+                    dbmod.set_identify_cache(conn, f"url:{audio_url}",
+                                             "identified", _song["title"],
+                                             _song["artist"])
+            except Exception:
+                pass
+            _bg_precompute_put(audio_url, {"status": "bank_hit",
+                                           "title": _song["title"],
+                                           "artist": _song["artist"],
+                                           "slice": _slice})
+        else:
+            _bg_precompute_put(audio_url, {"status": "bank_miss",
+                                           "slice": _slice})
+    except asyncio.CancelledError:
+        raise
     except Exception:
         pass
-    _timing.log_total(log, "identify_stage", _req_id, _t_req, _status)
+    finally:
+        try:
+            _timing.log_total(log, "identify_stage", _req, _t_req,
+                              "bg_done")
+        except Exception:
+            pass
+
+
+def _spawn_bg_precompute(audio_url: str, chat_id: int, conn,
+                         req_id: str | None = None) -> None:
+    """Spawn (max 1 per chat) the background identify pre-compute for a
+    link. A pending task for the same chat is cancelled first. The task
+    removes itself from the registry when done. Never raises."""
+    try:
+        if not audio_url or not chat_id:
+            return
+        prev = _BG_PRECOMPUTE_TASKS.get(chat_id)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        task = asyncio.create_task(
+            _bg_precompute_link(audio_url, chat_id, conn, req_id))
+        _BG_PRECOMPUTE_TASKS[chat_id] = task
+
+        def _done(_t, _cid=chat_id):
+            if _BG_PRECOMPUTE_TASKS.get(_cid) is _t:
+                _BG_PRECOMPUTE_TASKS.pop(_cid, None)
+
+        task.add_done_callback(_done)
+    except Exception:
+        pass
 
 
 async def _identify_link_audio(outcome, config: Config, conn=None,
@@ -3460,6 +3707,10 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
         # page fetches and resolve time).
         _resolved = None
         if outcome.kind == "instagram":
+            # NOTE: no local `import time as _time` here — the module
+            # already imports it (line 36) and a local import would make
+            # _time function-local, breaking the _time uses above with
+            # UnboundLocalError (live bug in cf1360cd, found 2026-11-07).
             _rt = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
@@ -3470,6 +3721,14 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             _timing.log_stage(log, "link_stage", _req_id, _t_req, "resolve",
                               _rt,
                               strategy=_resolved[3] if _resolved else "error")
+        # Phase 2: spawn the identify pre-compute NOW (at resolve-done),
+        # concurrently with the video download+send below — not after it.
+        # One light task (12 s extract + bank match, result cached
+        # ~10 min); it never blocks the send coroutine.
+        if _resolved is not None and _resolved[0]:
+            _cid = getattr(getattr(message, "chat", None), "id", None) \
+                or getattr(getattr(message, "from_user", None), "id", None)
+            _spawn_bg_precompute(_resolved[0], _cid, conn, _req_id)
         # SPEED: Time the video send stage.
         import time as _ptime
         _vs = _ptime.perf_counter()
@@ -3525,15 +3784,6 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                         pass
                     _timing.log_stage(log, "link_stage", _req_id, _t_req,
                                       "cache_store", _t_store)
-        except Exception:
-            pass
-        # NOTE 2026-10-31: Background identify (competitor's model).
-        # Video is sent immediately above. Now identify in BACKGROUND so
-        # when the user taps «🎵 شناسایی موسیقی», the result is cached
-        # and instant. Fire-and-forget: never blocks, never messages.
-        try:
-            import asyncio as _aio
-            _aio.create_task(_bg_identify_link(outcome, config, conn, _resolved))
         except Exception:
             pass
         _timing.log_total(log, "link_stage", _req_id, _t_req, "sent",
