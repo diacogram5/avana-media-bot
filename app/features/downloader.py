@@ -298,7 +298,7 @@ async def _detect_instagram_formats(url: str) -> FormatResult:
     from ..services.instagram import check_instagram_gating, resolve_instagram_media
     try:
         audio_url, video_url, _page_text, _strategy = \
-            await resolve_instagram_media(url)
+            (await resolve_instagram_media(url))[:4]
     except Exception:
         audio_url = video_url = None
     if video_url:

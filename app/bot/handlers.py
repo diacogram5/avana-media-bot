@@ -1310,6 +1310,16 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
             return _INSTAGRAM_GATED
         if sent is not None:
             return sent
+        # (1b) 2026-11-08: a post DETERMINED to have no video (photo,
+        # or carousel without a video item) gets the clear line instead
+        # of the ambiguous video-link card. Unknown type keeps the
+        # generic card — never claim "no video" without evidence.
+        _mt = resolved[4] if resolved is not None and len(resolved) > 4 \
+            else "unknown"
+        if _mt in ("photo", "carousel"):
+            sent = await _answer(message, conn,
+                                 t("m_link_no_video", ulang))
+            return sent
         sent = await _answer(message, conn, text)
         return sent
     elif delivery == "platform_official":
@@ -1359,11 +1369,14 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
     import time as _time
     try:
         if resolved is not None:
-            audio_url, video_url, _page_text, _strategy = resolved
+            audio_url, video_url, _page_text, _strategy = resolved[:4]
         else:
             from ..services.instagram import resolve_instagram_media
-            audio_url, video_url, _page_text, _strategy = \
-                await resolve_instagram_media(outcome.official_url)
+            _r = await resolve_instagram_media(
+                outcome.official_url,
+                chat_id=getattr(getattr(message, "chat", None), "id", None)
+                or getattr(getattr(message, "from_user", None), "id", None))
+            audio_url, video_url, _page_text, _strategy = _r[:4]
     except Exception:
         return None
     if not video_url:
@@ -2409,10 +2422,10 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
     Downloaded bytes are used for fingerprinting; the watchable video
     file (when separately resolvable) is sent to the user by the caller.
 
-    `resolved`: a (audio_url, video_url, page_text, strategy) tuple the
-    caller already obtained — the resolver runs ONCE per link, not once
-    per stage. `conn`: enables the identify cache (url-key pre-check
-    skips the download entirely on repeat links).
+    `resolved`: a (audio_url, video_url, page_text, strategy, media_type)
+    tuple the caller already obtained — the resolver runs ONCE per link,
+    not once per stage. `conn`: enables the identify cache (url-key
+    pre-check skips the download entirely on repeat links).
     """
     import time as _time
     url = outcome.official_url
@@ -2493,13 +2506,13 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
         # link): the send-video stage and this stage used to each run
         # all four page fetches for the same URL.
         if resolved is not None:
-            media_url, _video_url, page_text, strategy = resolved
+            media_url, _video_url, page_text, strategy = resolved[:4]
         else:
             _t_res = _time.perf_counter()
             try:
                 from ..services.instagram import resolve_instagram_media
                 media_url, _video_url, page_text, strategy = \
-                    await resolve_instagram_media(url)
+                    (await resolve_instagram_media(url))[:4]
             except Exception:
                 media_url, _video_url, page_text, strategy = None, None, "", "none"
             _timing.log_stage(log, "identify_stage", req_id, t_req,
@@ -3773,7 +3786,11 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             try:
                 from ..services.instagram import resolve_instagram_media
                 _resolved = await resolve_instagram_media(
-                    outcome.official_url)
+                    outcome.official_url,
+                    chat_id=getattr(getattr(message, "chat", None), "id",
+                                    None)
+                    or getattr(getattr(message, "from_user", None), "id",
+                               None))
             except Exception:
                 _resolved = None
             _timing.log_stage(log, "link_stage", _req_id, _t_req, "resolve",

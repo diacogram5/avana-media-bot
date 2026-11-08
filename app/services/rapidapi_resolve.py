@@ -127,13 +127,15 @@ async def resolve_via_rapidapi(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     client: httpx.AsyncClient | None = None,
-) -> tuple[str | None, str | None, str]:
+) -> tuple[str | None, str | None, str, str]:
     """Resolve one link through RapidAPI /fetch.
 
-    Returns ``(audio_url, video_url, strategy)`` where strategy is always
-    "rapidapi". On any failure (private/deleted/unsupported link, rate
-    limit, transport error) returns ``(None, None, "rapidapi")`` and logs
-    the HTTP status + short detail only. Raises RapidAPIKeyMissing when
+    Returns ``(audio_url, video_url, strategy, media_type)`` where
+    strategy is always "rapidapi" and media_type is "video" | "photo" |
+    "carousel" | "unknown" (see _parse_fetch_response). On any failure
+    (private/deleted/unsupported link, rate limit, transport error)
+    returns ``(None, None, "rapidapi", "unknown")`` and logs the HTTP
+    status + short detail only. Raises RapidAPIKeyMissing when
     RAPIDAPI_KEY is unset — before any network call is made.
 
     For type "video" the single ``download_url`` is returned as BOTH
@@ -169,7 +171,7 @@ async def resolve_via_rapidapi(
                     continue
                 log.warning("rapidapi fetch transport error: %s",
                             type(exc).__name__)
-                return None, None, STRATEGY
+                return None, None, STRATEGY, "unknown"
             if resp.status_code >= 500 and attempt < _MAX_ATTEMPTS:
                 # 5xx: temporary, retry after a second, never billed.
                 await asyncio.sleep(1.0)
@@ -181,7 +183,7 @@ async def resolve_via_rapidapi(
         # Unreachable in practice (loop always returns), kept for safety.
         log.warning("rapidapi fetch transport error: %s",
                     type(last_exc).__name__ if last_exc else "unknown")
-        return None, None, STRATEGY
+        return None, None, STRATEGY, "unknown"
     finally:
         if own_client:
             await client.aclose()
@@ -189,25 +191,39 @@ async def resolve_via_rapidapi(
 
 def _parse_fetch_response(
     resp: httpx.Response, key: str | None
-) -> tuple[str | None, str | None, str]:
-    """Parse one /fetch response. Logs status + detail only — never the key."""
+) -> tuple[str | None, str | None, str, str]:
+    """Parse one /fetch response. Logs status + detail only — never the key.
+
+    Returns (audio_url, video_url, strategy, media_type) where
+    media_type is "video" | "photo" | "carousel" | "unknown":
+    /fetch "video" -> video; "image"/"gif" -> photo; "album" ->
+    carousel (a video item inside an album is still delivered, the
+    post type stays carousel). "unknown" when the response does not
+    determine a type (ok=false, transport, unparseable).
+
+    LOUD (2026-11-08 fix): every outcome leaves EXACTLY ONE log line
+    carrying the reason — no silent (None, None) returns. The 429
+    case logs a single quota/rate-limit warning (the duplicate
+    ok=false info line was removed).
+    """
     try:
         data = resp.json()
     except Exception:
         log.warning("rapidapi fetch: HTTP %s, non-JSON body", resp.status_code)
-        return None, None, STRATEGY
+        return None, None, STRATEGY, "unknown"
     if not isinstance(data, dict):
         log.warning("rapidapi fetch: HTTP %s, unexpected JSON shape",
                     resp.status_code)
-        return None, None, STRATEGY
+        return None, None, STRATEGY, "unknown"
     if not data.get("ok"):
         detail = _redact(str(data.get("detail") or ""), key)
         if resp.status_code == 429:
             log.warning("rapidapi quota/rate-limit: HTTP 429, detail=%s",
                         detail)
+            return None, None, STRATEGY, "unknown"
         log.info("rapidapi fetch: HTTP %s, ok=false, detail=%s",
                  resp.status_code, detail)
-        return None, None, STRATEGY
+        return None, None, STRATEGY, "unknown"
 
     media_type = data.get("type")
     if media_type == "album":
@@ -215,17 +231,21 @@ def _parse_fetch_response(
             if isinstance(item, dict) and item.get("type") == "video" \
                     and item.get("download_url"):
                 dl = item["download_url"]
-                return dl, dl, STRATEGY
+                return dl, dl, STRATEGY, "carousel"
         log.info("rapidapi fetch: album with no video item")
-        return None, None, STRATEGY
-    if media_type != "video":
-        # image / gif / anything else: no audio track to identify.
-        return None, None, STRATEGY
-    dl = data.get("download_url")
-    if not dl:
-        log.info("rapidapi fetch: type=video but no download_url")
-        return None, None, STRATEGY
-    return dl, dl, STRATEGY
+        return None, None, STRATEGY, "carousel"
+    if media_type == "video":
+        dl = data.get("download_url")
+        if not dl:
+            log.info("rapidapi fetch: type=video but no download_url")
+            return None, None, STRATEGY, "video"
+        return dl, dl, STRATEGY, "video"
+    if media_type in ("image", "gif"):
+        # image / gif: a photo post, no audio track to identify.
+        log.info("rapidapi fetch: type=%s, no video", media_type)
+        return None, None, STRATEGY, "photo"
+    log.info("rapidapi fetch: type=%s, no video", media_type)
+    return None, None, STRATEGY, "unknown"
 
 
 __all__ = [

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re as _re
 from urllib.parse import quote
 
@@ -157,35 +158,239 @@ def _base(page_url: str) -> str:
     return (page_url or "").split("?")[0].split("#")[0].rstrip("/") + "/"
 
 
-async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None, str, str]:
-    """Return (audio_url, video_url, page_text, strategy).
+async def _try_rapidapi(page_url: str, page_text: str, _t0: float
+                        ) -> tuple[tuple[str, str, str, str, str] | None, str]:
+    """RapidAPI /fetch fallback (2026-11-08).
 
-    Strategies, in order: "page", "embed", "embed_captioned",
-    "crawler_dash". strategy is "none" when nothing yielded media.
-    page_text is the best title/caption found (for the channel query).
+    Returns (result_or_None, media_type). result is the full resolve
+    5-tuple (audio_url, video_url, page_text, "rapidapi", media_type)
+    on success (or on a shortcode-cache hit). media_type is "video" |
+    "photo" | "carousel" | "unknown" — "unknown" when RapidAPI did not
+    answer with a determinable type (key missing, transport, ok=false).
+    Never raises.
 
-    RapidAPI /fetch is the last-resort fallback when RAPIDAPI_KEY is
-    set in the environment (2026-11-08); without the key the behaviour
-    is exactly as before.
+    Behaviour (unchanged from the inline block it replaces): shortcode
+    cache TTL 900 s, cap 128; quota accounting inside
+    resolve_via_rapidapi (2 credits per reel, 5 per story); 35 s
+    timeout; 1 retry on 5xx / transport only; fail-open. The signed
+    CDN URL is never cached beyond the 15-min shortcode cache.
 
-    - page/embed strategies: the advertised media URL is a progressive
-      .mp4, so it serves as both the watchable video and the audio
-      source for identification.
-    - crawler_dash: the DASH manifest's audio AdaptationSet gives the
-      audio bytes Shazam needs; the video AdaptationSet (best
-      representation) gives the watchable video file to send the user.
+    LOUD (2026-11-08 fix): every failure path logs its reason, so a
+    silent fallback is impossible. Reasons: key-missing (WARNING
+    here); type image/gif, ok=false + detail, transport error (logged
+    inside rapidapi_resolve.py at the point of failure, exactly one
+    line each); any other exception (instagram_resolve_error,
+    "rapidapi:" prefix). Never logs the key or its value.
+    """
+    import time as _time
+    try:
+        from .rapidapi_resolve import (
+            RapidAPIKeyMissing,
+            resolve_via_rapidapi,
+        )
+        _sc = _shortcode(page_url)
+        _hit = _rapidapi_cache.get(_sc) if _sc else None
+        if _hit and (_time.time() - _hit[3]) < _RAPIDAPI_CACHE_TTL:
+            log_event(log, "instagram_resolve",
+                      strategy="rapidapi", cached=True, media_type="video",
+                      ms=int((_time.time() - _t0) * 1000))
+            return (_hit[0], _hit[1], _hit[2] or page_text, "rapidapi",
+                    "video"), "video"
+        try:
+            _ra_audio, _ra_video, _s, _mt = await resolve_via_rapidapi(
+                page_url)
+        except RapidAPIKeyMissing:
+            log.warning("rapidapi key missing — fallback disabled")
+            return None, "unknown"
+        if _ra_audio and _ra_video:
+            if _sc:
+                if len(_rapidapi_cache) >= _RAPIDAPI_CACHE_MAX:
+                    _rapidapi_cache.pop(next(iter(_rapidapi_cache)))
+                _rapidapi_cache[_sc] = (
+                    _ra_audio, _ra_video, page_text, _time.time())
+            log_event(log, "instagram_resolve",
+                      strategy="rapidapi", media_type=_mt,
+                      ms=int((_time.time() - _t0) * 1000))
+            return (_ra_audio, _ra_video, page_text, "rapidapi", _mt), _mt
+        return None, _mt
+    except Exception as exc:
+        log_event(log, "instagram_resolve_error",
+                  error=f"rapidapi:{str(exc)[:80]}")
+        return None, "unknown"
 
-    Diagnostic: every strategy attempt logs one "instagram_resolve_diag"
-    line (HTTP status, response byte length, login-shell / DASH /
-    og:video marker booleans) — log-only, no behaviour change.
+
+def _rapidapi_test_chat_id() -> int | None:
+    """Chat id for which RapidAPI is tried FIRST (2026-11-08).
+
+    Env RAPIDAPI_TEST_CHAT_ID. Unset -> the owner's chat (OWNER_ID env,
+    same source as Config.owner_id) so it is active for the owner as
+    soon as this deploys. "0" disables it. Unparseable -> disabled.
+    Read per call (cheap); never logs the value.
+    """
+    raw = os.environ.get("RAPIDAPI_TEST_CHAT_ID")
+    if raw is None or raw == "":
+        raw = os.environ.get("OWNER_ID", "")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val != 0 else None
+
+
+async def _get_dash_page(client: httpx.AsyncClient, base: str, _t0: float,
+                         cap_s: float = 3.0) -> tuple[int, str, int]:
+    """Crawler fetch with early cutoff + ~3 s cap (2026-11-08 fail-fast).
+
+    Streams the Googlebot page in 16 KB chunks and closes as soon as
+    BOTH DASH URLs (audio + video AdaptationSet BaseURLs) are
+    extractable — the proven Phase 2 cutoff (~40-55% faster in the
+    sandbox). Returns (status, text, nbytes) like _get.
+
+    - Stream completes without both URLs: the accumulated text IS the
+      full page (identical to a full fetch) — no second fetch.
+    - Cap hit (~3 s from resolve start): closes and returns
+      (status, "", nbytes) — no usable page, so the caller moves on;
+      the ms in the diag line shows the cap.
+    - Stream error: one fast _get retry when <1 s elapsed, else
+      (0, "", nbytes). The other strategies + RapidAPI still run.
+    """
+    import asyncio as _asyncio
+    import time as _time
+    _start = _time.time()
+    try:
+        async with client.stream("GET", base, headers=GOOGLEBOT_UA) as resp:
+            status = resp.status_code
+            if status != 200:
+                return status, "", 0
+            buf = bytearray()
+            _scanned = {"sets": -1}
+
+            async def _read() -> bool:
+                async for chunk in resp.aiter_bytes(16384):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    n_sets = buf.count(b"AdaptationSet")
+                    if n_sets >= 2 and n_sets != _scanned["sets"]:
+                        _scanned["sets"] = n_sets
+                        text = bytes(buf).decode("utf-8", errors="replace")
+                        if (extract_dash_audio_url(text)
+                                and extract_dash_video_url(text)):
+                            return True
+                return False
+
+            try:
+                _found = await _asyncio.wait_for(
+                    _read(),
+                    timeout=max(0.1, cap_s - (_time.time() - _t0)))
+            except TimeoutError:
+                # Cap hit: no usable page in budget — caller moves on.
+                return status, "", len(buf)
+            text = bytes(buf).decode("utf-8", errors="replace")
+            return status, text, len(buf)
+    except Exception:
+        # Stream error: one fast full-fetch retry, else give up (the
+        # other strategies + RapidAPI still run).
+        if _time.time() - _start < 1.0:
+            try:
+                return await _get(client, base, GOOGLEBOT_UA)
+            except Exception:
+                pass
+        return 0, "", 0
+
+
+async def resolve_instagram_media(
+        page_url: str, chat_id: int | None = None
+) -> tuple[str | None, str | None, str, str, str]:
+    """Return (audio_url, video_url, page_text, strategy, media_type).
+
+    media_type is "video" | "photo" | "carousel" | "unknown": RapidAPI's
+    /fetch type is the authority (video -> video; image/gif -> photo;
+    album -> carousel); the anonymous strategies can only ever return
+    video (a DASH manifest / media URL) or "unknown".
+
+    Order (2026-11-08, reordered): (0) test-chat first try — when
+    chat_id matches RAPIDAPI_TEST_CHAT_ID (default OWNER_ID), RapidAPI
+    is tried FIRST, before any anonymous strategy; (1) crawler_dash
+    FIRST among anonymous strategies (streamed with early cutoff,
+    capped at ~3 s from resolve start); (2) on crawler HTTP 429,
+    RapidAPI IMMEDIATELY (page/embed/embed_captioned skipped); (3)
+    page, embed, embed_captioned — when page returns a login shell,
+    the two middle strategies are SKIPPED (logged as skipped, reason
+    login_shell); (4) RapidAPI at the end — skipped when the type is
+    already determined (photo/carousel cannot become a video);
+    (5) "none".
+
+    A determined no-video type short-circuits the resolve to
+    ("none", media_type) as soon as it is known — the owner's photo
+    path finishes in ~1.5 s instead of ~10 s. A transient failure
+    (media_type "unknown") still runs the full chain.
+
+    Each attempt logs instagram_resolve_diag (status, bytes,
+    login/dash/og_video booleans, ms); every instagram_resolve line
+    carries media_type=... .
     """
     base = _base(page_url)
     page_text = ""
+    media_type = "unknown"
     import time as _time
     _t0 = _time.time()
     try:
         async with httpx.AsyncClient(timeout=_STRATEGY_TIMEOUT,
                                      follow_redirects=True) as client:
+            # (0) Test-chat first try: the owner's chat tries RapidAPI
+            # FIRST, without waiting for a 429.
+            if chat_id is not None and chat_id == _rapidapi_test_chat_id():
+                log_event(log, "instagram_resolve", strategy="rapidapi",
+                          test_chat_first_try=True,
+                          ms=int((_time.time() - _t0) * 1000))
+                _ra, _mt = await _try_rapidapi(page_url, page_text, _t0)
+                if _mt != "unknown":
+                    media_type = _mt
+                if _ra is not None:
+                    return _ra
+                if media_type in ("photo", "carousel"):
+                    # Determined no-video post — no anonymous strategy
+                    # can find a video; stop here (fail-fast).
+                    log_event(log, "instagram_resolve", strategy="none",
+                              media_type=media_type,
+                              ms=int((_time.time() - _t0) * 1000))
+                    return None, None, page_text, "none", media_type
+            # (1) Crawler FIRST: Googlebot UA DASH manifest — the only
+            # anonymous strategy returning media. Streamed with early
+            # cutoff, capped at ~3 s.
+            status, page, nbytes = await _get_dash_page(client, base, _t0)
+            _login, _dash, _og = _diag_markers(page)
+            log_event(log, "instagram_resolve_diag",
+                      strategy="crawler_dash", status=status, bytes=nbytes,
+                      login=_login, dash=_dash, og_video=_og,
+                      ms=int((_time.time() - _t0) * 1000))
+            # (2) Crawler 429 -> RapidAPI IMMEDIATELY (skip the
+            # other anonymous strategies).
+            if status == 429:
+                _ra, _mt = await _try_rapidapi(page_url, page_text, _t0)
+                if _mt != "unknown":
+                    media_type = _mt
+                if _ra is not None:
+                    return _ra
+                if media_type in ("photo", "carousel"):
+                    log_event(log, "instagram_resolve", strategy="none",
+                              media_type=media_type,
+                              ms=int((_time.time() - _t0) * 1000))
+                    return None, None, page_text, "none", media_type
+            if page:
+                if not page_text:
+                    page_text = extract_page_text(page)
+                audio_url = extract_dash_audio_url(page)
+                video_url = extract_dash_video_url(page)
+                if audio_url or video_url:
+                    log_event(log, "instagram_resolve",
+                              strategy="crawler_dash", media_type="video",
+                              ms=int((_time.time() - _t0) * 1000))
+                    return audio_url, video_url, page_text, \
+                        "crawler_dash", "video"
+            # (3) page, embed, embed_captioned — embed variants
+            # skipped when page returns a login shell (fail-fast).
             for name, url, headers in (
                 ("page", base, DESKTOP_UA),
                 ("embed", base + "embed/", DESKTOP_UA),
@@ -204,67 +409,36 @@ async def resolve_instagram_media(page_url: str) -> tuple[str | None, str | None
                 media_url = extract_media_url(page)
                 if media_url:
                     log_event(log, "instagram_resolve", strategy=name,
+                              media_type="video",
                               ms=int((_time.time() - _t0) * 1000))
-                    return media_url, media_url, page_text, name
-            # Last resort: crawler view embeds the DASH manifest with
-            # separate audio/video streams.
-            status, page, nbytes = await _get(client, base, GOOGLEBOT_UA)
-            _login, _dash, _og = _diag_markers(page)
-            log_event(log, "instagram_resolve_diag",
-                      strategy="crawler_dash", status=status, bytes=nbytes,
-                      login=_login, dash=_dash, og_video=_og,
-                      ms=int((_time.time() - _t0) * 1000))
-            if page:
-                if not page_text:
-                    page_text = extract_page_text(page)
-                audio_url = extract_dash_audio_url(page)
-                video_url = extract_dash_video_url(page)
-                if audio_url or video_url:
-                    log_event(log, "instagram_resolve",
-                              strategy="crawler_dash",
-                              ms=int((_time.time() - _t0) * 1000))
-                    return audio_url, video_url, page_text, "crawler_dash"
-            # RapidAPI fallback (2026-11-08): only when the four
-            # anonymous strategies all failed AND RAPIDAPI_KEY is set.
-            # Fail-open: no key (or any API failure) leaves the
-            # behaviour exactly as before (strategy "none"). The
-            # signed CDN URL is never cached beyond the 15-min
-            # shortcode cache — it expires.
-            try:
-                from .rapidapi_resolve import (
-                    RapidAPIKeyMissing,
-                    resolve_via_rapidapi,
-                )
-                _sc = _shortcode(page_url)
-                _hit = _rapidapi_cache.get(_sc) if _sc else None
-                if _hit and (_time.time() - _hit[3]) < _RAPIDAPI_CACHE_TTL:
-                    log_event(log, "instagram_resolve",
-                              strategy="rapidapi", cached=True,
-                              ms=int((_time.time() - _t0) * 1000))
-                    return _hit[0], _hit[1], _hit[2] or page_text, "rapidapi"
-                try:
-                    _ra_audio, _ra_video, _ = await resolve_via_rapidapi(
-                        page_url)
-                except RapidAPIKeyMissing:
-                    _ra_audio = _ra_video = None
-                if _ra_audio and _ra_video:
-                    if _sc:
-                        if len(_rapidapi_cache) >= _RAPIDAPI_CACHE_MAX:
-                            _rapidapi_cache.pop(next(iter(_rapidapi_cache)))
-                        _rapidapi_cache[_sc] = (
-                            _ra_audio, _ra_video, page_text, _time.time())
-                    log_event(log, "instagram_resolve",
-                              strategy="rapidapi",
-                              ms=int((_time.time() - _t0) * 1000))
-                    return _ra_audio, _ra_video, page_text, "rapidapi"
-            except Exception as exc:
-                log_event(log, "instagram_resolve_error",
-                          error=f"rapidapi:{str(exc)[:80]}")
+                    return media_url, media_url, page_text, name, "video"
+                if name == "page" and _login:
+                    # Fail-fast (2026-11-08): a login shell means the
+                    # embed variants return the same shell — skip them.
+                    for _sk in ("embed", "embed_captioned"):
+                        log_event(log, "instagram_resolve_diag",
+                                  strategy=_sk, status="skipped",
+                                  bytes=0, login=False, dash=False,
+                                  og_video=False, skipped=True,
+                                  reason="login_shell",
+                                  ms=int((_time.time() - _t0) * 1000))
+                    break
+            # (4) RapidAPI at the end (as before) — skipped when the
+            # type is already determined (a re-fetch cannot turn a
+            # photo/carousel into a video; transient failures stay
+            # "unknown" and DO retry here).
+            if media_type not in ("photo", "carousel"):
+                _ra, _mt = await _try_rapidapi(page_url, page_text, _t0)
+                if _mt != "unknown":
+                    media_type = _mt
+                if _ra is not None:
+                    return _ra
     except Exception as exc:
         log_event(log, "instagram_resolve_error", error=str(exc)[:100])
     log_event(log, "instagram_resolve", strategy="none",
+              media_type=media_type,
               ms=int((_time.time() - _t0) * 1000))
-    return None, None, page_text, "none"
+    return None, None, page_text, "none", media_type
 
 
 async def fetch_merged_video(video_url: str, audio_url: str | None = None,
