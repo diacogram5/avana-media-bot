@@ -125,10 +125,24 @@ _tables_ready_for: set = set()
 # need fresh data (admin panel, audit, duplicate check) bypass it.
 _LIST_CACHE: list | None = None
 
+# Parsed fingerprint arrays (numpy uint32), keyed by the exact fingerprint
+# string. The identify hot path used to re-parse every stored fingerprint
+# (comma-separated TEXT) on every tap; the parsed arrays are now built
+# once per distinct fingerprint and reused. Bounded (cap 256, clear on
+# overflow) so admin edits can never grow this without limit; cleared
+# together with _LIST_CACHE. Only used on the numpy fast path — the
+# pure-Python path never touches it.
+_FP_ARRAYS: dict = {}
+_FP_ARRAYS_CAP = 256
+
 
 def _invalidate_list_cache() -> None:
     global _LIST_CACHE
     _LIST_CACHE = None
+    # Parsed fingerprint arrays are keyed by the fingerprint string, so a
+    # changed fingerprint is a different key — but clear anyway so a
+    # re-added song never keeps a stale array behind.
+    _FP_ARRAYS.clear()
 
 
 def _get_conn():
@@ -301,12 +315,15 @@ def _bit_similarity(a, b) -> float:
     return tot / (32 * len(a))
 
 
-def best_match(query, stored):
-    """Best sliding-window match of query items inside stored items.
+def _best_match_py(query, stored):
+    """Pure-Python best sliding-window match (reference implementation).
 
     Returns (similarity, offset, matched_items). A short query inside a
     long song aligns at the excerpt's position; the offset is the stored
-    index where the best alignment starts.
+    index where the best alignment starts. This is the original
+    implementation, kept as the fallback when numpy is unavailable and
+    as the correctness reference for the numpy fast path — both must
+    return identical (similarity, offset, matched_items).
     """
     n = len(query)
     if n == 0 or len(stored) < n:
@@ -317,6 +334,140 @@ def best_match(query, stored):
         if sim > best:
             best, boff = sim, off
     return best, boff, n
+
+
+# --- numpy fast path for the sliding-window match (GOAL 2, 2026-11-09) ---
+# Measured: the pure-Python match is the bank stage's bottleneck (~3.7 s
+# on Render free for query 127 items vs a ~1900-item fingerprint — the
+# 0.1-CPU box runs ~225k bin().count() calls per song). numpy is on
+# Render (transitively via essentia) but is NOT a direct dependency, so
+# it is imported LAZILY here and the pure-Python path is the fallback:
+# if numpy is ever missing, matching still works, just slower (fail
+# open). The numpy path computes the EXACT same similarity as
+# _bit_similarity — sim = (32*n - differing_bits) / (32*n) with exact
+# integer differing-bits — and picks the FIRST best offset, like the
+# strict `>` in _best_match_py. Any numpy error falls back to
+# _best_match_py instead of losing a match.
+_NP = None
+_NP_TRIED = False
+
+
+def _numpy():
+    """Lazily imported numpy module, or None when unavailable."""
+    global _NP, _NP_TRIED
+    if not _NP_TRIED:
+        _NP_TRIED = True
+        try:
+            import numpy as _np_mod
+            _NP = _np_mod
+        except Exception:
+            _NP = None
+    return _NP
+
+
+def _to_u32_array(values):
+    """Python ints -> numpy uint32 array, masked to 32 bits exactly like
+    the `& 0xFFFFFFFF` in _bit_similarity (so out-of-range/negative
+    values behave identically on both paths)."""
+    np = _numpy()
+    return np.array([v & 0xFFFFFFFF for v in values], dtype=np.uint32)
+
+
+def _popcount32_np(np, x):
+    """Population count of a uint32 numpy array (SWAR). numpy < 2.0 has
+    no np.bitwise_count, so this is used instead; returns a uint32
+    array of per-element counts in 0..32."""
+    u32 = np.uint32
+    x = x - ((x >> 1) & u32(0x55555555))
+    x = (x & u32(0x33333333)) + ((x >> 2) & u32(0x33333333))
+    x = (x + (x >> 4)) & u32(0x0F0F0F0F)
+    x = x + (x >> 8)
+    x = x + (x >> 16)
+    return x & u32(0x3F)
+
+
+def _best_match_np(np, query_arr, stored_arr):
+    """Vectorized best sliding-window match of uint32 arrays.
+
+    Returns (similarity, offset, matched_items), identical to
+    _best_match_py. All window offsets are scored at once via a
+    strided view (no copy of the stored array); argmin picks the
+    FIRST best offset, matching the strict `>` tie-break.
+    """
+    n = int(len(query_arr))
+    m = int(len(stored_arr))
+    if n == 0 or m < n:
+        return 0.0, -1, 0
+    windows = np.lib.stride_tricks.sliding_window_view(stored_arr, n)
+    diff = np.bitwise_xor(windows, query_arr)
+    bits = _popcount32_np(np, diff).sum(axis=1, dtype=np.uint64)
+    best_off = int(np.argmin(bits))
+    best_bits = int(bits[best_off])
+    sim = (32 * n - best_bits) / (32.0 * n)
+    return sim, best_off, n
+
+
+def _fp_array(fp_str):
+    """Parse a stored fingerprint string to a cached uint32 array.
+
+    Returns None when the string is unparseable (caller skips the song,
+    exactly like the ValueError branch of the old match_against).
+    The empty string parses to an empty array (length check skips it).
+    """
+    if fp_str in _FP_ARRAYS:
+        return _FP_ARRAYS[fp_str]
+    try:
+        vals = [int(x) for x in fp_str.split(",") if x]
+    except ValueError:
+        arr = None
+    else:
+        arr = _to_u32_array(vals)
+    if len(_FP_ARRAYS) >= _FP_ARRAYS_CAP:
+        _FP_ARRAYS.clear()
+    _FP_ARRAYS[fp_str] = arr
+    return arr
+
+
+def best_match(query, stored):
+    """Best sliding-window match of query items inside stored items.
+
+    Returns (similarity, offset, matched_items). A short query inside a
+    long song aligns at the excerpt's position; the offset is the stored
+    index where the best alignment starts. numpy fast path when
+    available, pure-Python reference otherwise — identical results.
+    """
+    n = len(query)
+    if n == 0 or len(stored) < n:
+        return 0.0, -1, 0
+    np = _numpy()
+    if np is not None:
+        try:
+            return _best_match_np(np, _to_u32_array(query),
+                                  _to_u32_array(stored))
+        except Exception:
+            pass
+    return _best_match_py(query, stored)
+
+
+def _match_against_np(np, query_items, songs, min_sim):
+    """match_against on the numpy fast path: the query is converted once
+    and each stored fingerprint comes from the _FP_ARRAYS cache, so a
+    tap costs one vectorized pass per song instead of one Python-level
+    popcount per (offset, item) pair. Same tier gate, same strict `>`
+    best-song tie-break, same (song, sim) / (None, best_sim) returns
+    as the pure-Python body below."""
+    query_arr = _to_u32_array(query_items)
+    best_song, best_sim = None, 0.0
+    for song in songs:
+        stored_arr = _fp_array(song.get("fingerprint") or "")
+        if stored_arr is None or len(stored_arr) < MATCH_MIN_ITEMS:
+            continue
+        sim, _off, _n = _best_match_np(np, query_arr, stored_arr)
+        if sim > best_sim:
+            best_sim, best_song = sim, song
+    if best_song is not None and best_sim >= min_sim:
+        return best_song, best_sim
+    return None, best_sim
 
 
 def match_against(query_items, songs):
@@ -336,6 +487,14 @@ def match_against(query_items, songs):
         if len(query_items) >= need:
             min_sim = sim
             break
+    np = _numpy()
+    if np is not None:
+        try:
+            return _match_against_np(np, query_items, songs, min_sim)
+        except Exception:
+            # Never lose a match to a numpy quirk: fall through to the
+            # proven pure-Python body below.
+            pass
     best_song, best_sim = None, 0.0
     for song in songs:
         try:
