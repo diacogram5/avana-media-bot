@@ -1313,7 +1313,8 @@ async def _send_link_video(message: Message, conn, outcome, config=None,
                           _t_send)
         if sent is not None:
             _track(conn, message, sent)
-            await _attach_identify_button(message, conn, sent)
+            await _attach_identify_button(message, conn, sent,
+                                          link_url=outcome.official_url)
             return sent
         await _answer(message, conn, text)
         return None
@@ -1479,7 +1480,9 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         # Pass the reel's separate audio-stream URL so the one-click
         # «🎵 شناسایی موسیقی» button identifies the reel's REAL audio
         # directly (cheaper than re-extracting from the merged video).
-        await _attach_identify_button(message, conn, sent, audio_url=audio_url)
+        await _attach_identify_button(message, conn, sent,
+                                      audio_url=audio_url,
+                                      link_url=outcome.official_url)
     return sent
 
 
@@ -1577,7 +1580,8 @@ _INSTAGRAM_GATED = "instagram_age_gated"
 def _video_identify_kb(user_id: int, file_id: str, kind: str,
                        label: str | None = None,
                        audio_url: str | None = None,
-                       lang: str = "fa") -> InlineKeyboardMarkup:
+                       lang: str = "fa",
+                       link_url: str | None = None) -> InlineKeyboardMarkup:
     """Build the one-click music-identification button for a video — or,
     with kind="audio" and a «🔄 تلاش مجدد» label, the retry button for an
     audio/voice file whose identification failed.
@@ -1587,19 +1591,23 @@ def _video_identify_kb(user_id: int, file_id: str, kind: str,
     registry entry is keyed by an opaque token; the Telegram file_id is
     resolved server-side on click. ``audio_url`` (link kind only) points
     at the reel's separate audio stream — the callback identifies THOSE
-    bytes, because the sent video file itself is video-only."""
+    bytes, because the sent video file itself is video-only.
+    ``link_url`` is the original sent link (link kind only) so a
+    wrong-song report can name the video it disputes."""
     if label is None:
         label = t("m_identify_music_btn", lang)
     token = secrets.token_hex(8)
     _VIDEO_IDENTIFY[token] = {"user_id": user_id, "file_id": file_id,
-                              "kind": kind, "audio_url": audio_url}
+                              "kind": kind, "audio_url": audio_url,
+                              "link": link_url or ""}
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=label,
                              callback_data=f"vid:id:{token}")]])
 
 
 async def _attach_identify_button(message: Message, conn, sent,
-                                  audio_url: str | None = None) -> None:
+                                  audio_url: str | None = None,
+                                  link_url: str | None = None) -> None:
     """Attach the one-click identification button under a bot-sent video
     message (best effort; the video must have a downloadable file_id)."""
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
@@ -1609,7 +1617,8 @@ async def _attach_identify_button(message: Message, conn, sent,
         if not file_id or not message.from_user:
             return
         kb = _video_identify_kb(message.from_user.id, file_id, "link",
-                                audio_url=audio_url, lang=ulang)
+                                audio_url=audio_url, lang=ulang,
+                                link_url=link_url)
         await sent.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass
@@ -1929,14 +1938,18 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         except Exception:
             _ck = None
         if _ck is not None and _ck["status"] == "identified":
-            log_event(log, "identify_stage", stage="cache_check", ms=0,
-                      req_id=_req_id,
-                      total_ms=int((_time.perf_counter() - _t_req) * 1000),
-                      hit=True, via="url")
-            cached_result = AudioIdResult(status="identified",
-                                          title=_ck["title"],
-                                          artist=_ck["artist"],
-                                          confirmed=True, source="cache")
+            # Batch F: a name the user already rejected for this video
+            # is never re-shown from the cache — fall through to the
+            # live pipeline with the exclusion active.
+            if not _is_rejected(entry, _ck["title"], _ck["artist"]):
+                log_event(log, "identify_stage", stage="cache_check", ms=0,
+                          req_id=_req_id,
+                          total_ms=int((_time.perf_counter() - _t_req) * 1000),
+                          hit=True, via="url")
+                cached_result = AudioIdResult(status="identified",
+                                              title=_ck["title"],
+                                              artist=_ck["artist"],
+                                              confirmed=True, source="cache")
     result = None
     data = b""
     if cached_result is not None:
@@ -1951,7 +1964,9 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         # re-banks (cheap) and then runs the APIs.
         _pre = _bg_precompute_get(audio_url) \
             if (result is None and audio_url) else None
-        if _pre is not None and _pre.get("status") == "bank_hit":
+        if _pre is not None and _pre.get("status") == "bank_hit" \
+                and not _is_rejected(entry, _pre.get("title", ""),
+                                     _pre.get("artist", "")):
             result = AudioIdResult(status="identified",
                                    title=_pre.get("title", ""),
                                    artist=_pre.get("artist", ""),
@@ -1961,7 +1976,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             data = _pre["slice"]
             result = await _identify_audio(
                 data, "clip.wav", config, conn, cache_url_key=audio_url,
-                req_id=_req_id, t_req=_t_req)
+                req_id=_req_id, t_req=_t_req,
+                exclude=entry.get("wrong") or None)
         if result is None:
             # For link-fetched videos the sent file is the video-ONLY stream:
             # identify the reel's real audio from its separate audio URL.
@@ -2004,7 +2020,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             result = await _identify_audio(
                 data, "clip.mp3" if entry.get("kind") == "audio" else "clip.mp4",
                 config, conn, cache_url_key=audio_url,
-                req_id=_req_id, t_req=_t_req)
+                req_id=_req_id, t_req=_t_req,
+                exclude=entry.get("wrong") or None)
         _t_send = _time.perf_counter()
         if result.status == "identified":
             # CONFIRMED name only (confirm fix 2026-11-09): _identify_audio
@@ -2019,7 +2036,14 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 own_media=("video", entry["file_id"]),
                 req_id=_req_id,
                 arm=("video_button", entry["file_id"], data or None,
-                     audio_url or "", ""))
+                     audio_url or "", ""),
+                source=result.source)
+            # Batch F: the video message keeps its identify button and
+            # gains «❌ آهنگ اشتباه» next to it, so the user can dispute
+            # the shown name without waiting for the card. The card
+            # itself carries the same button (same token).
+            await _edit_video_wrong_song_row(callback.message, token, ulang,
+                                             add=True)
         elif result.status in ("unconfirmed", "not_found") \
                 or result.detail == "lookup_error":
             # NOT confirmed (single source, disagreement, no match, or
@@ -2057,11 +2081,342 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                           headline_total="click_to_identify_ms")
 
 
+# --- «❌ آهنگ اشتباه» (batch F, wrong-song re-check) ---------------------------
+# One dispute per video, recorded on the SAME _VIDEO_IDENTIFY registry
+# entry as the identify button (same opaque token, different callback
+# prefix "wrong:"). The entry carries the shown result (last_*) so the
+# handler knows what is disputed, the rejected names ("wrong") so a
+# re-check — and any later normal tap on the same video — never
+# re-shows them, and the attempt count (cap 2 per video).
+_WRONG_SONG_RUNNING: set[str] = set()
+_WRONG_SONG_MAX_ATTEMPTS = 2
+
+
+def _is_rejected(entry: dict, title: str, artist: str) -> bool:
+    """True when (title, artist) is a name the user already rejected
+    for this video. Same normalization as the two-source gate."""
+    if not entry:
+        return False
+    try:
+        from ..search.fullsong_verify import file_identity_matches as _fim
+        return any(_fim(title, artist, _wt, _wa)
+                   for _wt, _wa in (entry.get("wrong") or []))
+    except Exception:
+        return False
+
+
+def _wrong_song_button_data(file_id: str, user_id: int, kind: str,
+                            title: str, artist: str,
+                            source: str = "") -> str | None:
+    """callback_data for the «❌ آهنگ اشتباه» button: "wrong:<token>"
+    for the video's EXISTING identify token (minted when none is
+    registered, exactly like the retry button). Records the shown
+    result on the registry entry so the handler knows the disputed
+    name and its source; initializes the rejected list and the
+    attempt count without resetting them. Returns None only when no
+    token can be minted."""
+    if not file_id or not user_id:
+        return None
+    cb = _find_identify_callback(file_id, user_id, kind)
+    if not cb or not cb.startswith("vid:id:"):
+        return None
+    token = cb.split("vid:id:", 1)[1]
+    entry = _VIDEO_IDENTIFY.get(token)
+    if entry is None:
+        return None
+    entry["last_title"] = title or ""
+    entry["last_artist"] = artist or ""
+    entry["last_source"] = source or ""
+    entry.setdefault("wrong", [])
+    entry.setdefault("attempts", 0)
+    return f"wrong:{token}"
+
+
+async def _edit_video_wrong_song_row(message, token: str, ulang: str,
+                                     add: bool) -> None:
+    """Best-effort: add (or remove) the «❌ آهنگ اشتباه» row under a
+    bot-sent video message, keeping the existing identify row. Never
+    raises; a failed edit leaves the markup as it was."""
+    try:
+        kb = getattr(message, "reply_markup", None)
+        rows = [list(r) for r in (getattr(kb, "inline_keyboard", None) or [])]
+        rows = [r for r in rows
+                if not any(getattr(b, "callback_data", "") == f"wrong:{token}"
+                           for b in r)]
+        if not rows:
+            # No keyboard survived (should not happen — the message
+            # always carries its identify button): rebuild both rows.
+            rows = [[InlineKeyboardButton(
+                text=t("m_identify_music_btn", ulang),
+                callback_data=f"vid:id:{token}")]]
+        if add:
+            rows.append([InlineKeyboardButton(
+                text=t("m_wrong_song_btn", ulang),
+                callback_data=f"wrong:{token}")])
+        await message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception:
+        pass
+
+
+async def _wrong_song_fetch_audio(callback, entry: dict, config,
+                                  req_id: str | None = None,
+                                  t_req=None) -> bytes:
+    """The video's audio for the re-check: the reel's separate audio
+    stream when the registry has one, else the Telegram file — the
+    SAME source the original identification used, so the user never
+    re-sends anything. Returns b"" when neither fetch works (the
+    caller then answers honestly instead of claiming a re-check)."""
+    audio_url = entry.get("audio_url")
+    try:
+        if audio_url:
+            return await _download_link_audio(audio_url, config,
+                                              req_id=req_id, t_req=t_req)
+        _t_dl = _time.perf_counter()
+        tg_file = await callback.bot.get_file(entry["file_id"])
+        buf = io.BytesIO()
+        await callback.bot.download_file(tg_file.file_path, buf)
+        data = buf.getvalue()
+        _timing.log_stage(log, "identify_stage", req_id, t_req,
+                          "download", _t_dl, bytes=len(data or b""))
+        return data or b""
+    except Exception:
+        return b""
+
+
+def _wrong_song_log_and_store(user_id: int, link: str,
+                              wrong_title: str, wrong_artist: str,
+                              wrong_source: str,
+                              new_title: str = "", new_artist: str = "",
+                              new_source: str = "", outcome: str = "",
+                              attempts: int = 0,
+                              req_id: str | None = None) -> None:
+    """One `wrong_song_report` log line + the Turso row (fire-and-
+    forget, AFTER the answer — the store runs in a thread so the
+    Turso round-trip never sits in anyone's waiting time). Never
+    raises; a failed store still leaves the log line."""
+    try:
+        log_event(log, "identify", stage="wrong_song_report",
+                  user_id=user_id, link=(link or "")[:60],
+                  wrong_title=wrong_title, wrong_artist=wrong_artist,
+                  wrong_source=wrong_source, new_title=new_title,
+                  new_artist=new_artist, new_source=new_source,
+                  outcome=outcome, attempts=attempts)
+    except Exception:
+        pass
+    try:
+        from .turso_cache import store_wrong_song_report as _store
+        asyncio.create_task(asyncio.to_thread(
+            _store, user_id, link, wrong_title, wrong_artist,
+            wrong_source, new_title, new_artist, new_source, outcome,
+            req_id))
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("wrong:"))
+async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
+    """«❌ آهنگ اشتباه» under a sent video or a result card (batch F).
+
+    Re-identifies the CACHED audio of that video — the same bytes the
+    original identification used (reel audio URL, else the Telegram
+    file) — with an UNUSED source: the bank is skipped when the
+    disputed result came from it, and every name the user already
+    rejected is excluded at every stage of _identify_audio. A
+    DIFFERENT confirmed name goes through the normal identified flow
+    (instant card + full song); a different single-source name is
+    shown as a «شاید...» lead (never as «شناسایی شد»); anything else
+    is an honest «پیدا نشد» + an invitation to type the name (the
+    normal text search handles it). Cap 2 re-identifies per video.
+    The report (link, wrong result, source, outcome) is logged and
+    stored in Turso AFTER the answer. No automatic follow-up: one
+    tap, one outcome, nothing else is ever sent."""
+    ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
+    token = callback.data.split("wrong:", 1)[1]
+    entry = _VIDEO_IDENTIFY.get(token)
+    if not entry:
+        # The registry is in-memory: after a restart the token is gone.
+        await callback.answer(t("m_req_expired", ulang), show_alert=True)
+        return
+    if entry.get("user_id") != callback.from_user.id:
+        await callback.answer(t("m_not_yours", ulang), show_alert=True)
+        return
+    wrong_title = entry.get("last_title") or ""
+    wrong_artist = entry.get("last_artist") or ""
+    wrong_source = entry.get("last_source") or ""
+    if not wrong_title:
+        # No confirmed result was ever recorded for this token: the
+        # button has nothing to dispute.
+        await callback.answer(t("m_req_expired", ulang), show_alert=True)
+        return
+    if token in _WRONG_SONG_RUNNING:
+        await callback.answer(t("m_wrong_song_checking", ulang))
+        return
+    attempts = int(entry.get("attempts") or 0)
+    if attempts >= _WRONG_SONG_MAX_ATTEMPTS:
+        await callback.answer(t("m_wrong_song_limit", ulang), show_alert=True)
+        await _edit_video_wrong_song_row(callback.message, token, ulang,
+                                         add=False)
+        _wrong_song_log_and_store(
+            callback.from_user.id,
+            entry.get("link") or entry.get("audio_url") or "",
+            wrong_title, wrong_artist, wrong_source,
+            outcome="limit", attempts=attempts)
+        return
+    _WRONG_SONG_RUNNING.add(token)
+    _req_id = _timing.new_req_id()
+    _t_req = _time.perf_counter()
+    _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
+                      _t_req)
+    await callback.answer(t("m_wrong_song_checking", ulang))
+    status_msg = None
+    try:
+        status_msg = await callback.message.answer(
+            t("m_wrong_song_checking", ulang))
+    except Exception:
+        status_msg = None
+    outcome = "error"
+    new_title = new_artist = new_source = ""
+    try:
+        entry["attempts"] = attempts + 1
+        # The disputed name joins the rejected list BEFORE the
+        # re-check, so a second attempt also excludes it.
+        rejected = list(entry.get("wrong") or []) + [(wrong_title, wrong_artist)]
+        entry["wrong"] = rejected
+        data = await _wrong_song_fetch_audio(callback, entry, config,
+                                             req_id=_req_id, t_req=_t_req)
+        if not data or len(data) > config.max_file_mb * 1024 * 1024:
+            raise ValueError("audio unavailable")
+        result = await _identify_audio(
+            data, "clip.mp3" if entry.get("kind") == "audio" else "clip.mp4",
+            config, conn, cache_url_key=entry.get("audio_url") or None,
+            req_id=_req_id, t_req=_t_req,
+            exclude=rejected,
+            skip_bank=(wrong_source == "bank"))
+        _om_kind = "audio" if entry.get("kind") == "audio" else "video"
+        if result.status == "identified":
+            # A DIFFERENT confirmed name (the exclusion guarantees it
+            # differs): the normal identified flow — instant card, then
+            # the full song as one final message.
+            outcome = "different_confirmed"
+            new_title, new_artist, new_source = (
+                result.title, result.artist, result.source)
+            entry["last_title"], entry["last_artist"], entry["last_source"] = (
+                new_title, new_artist, new_source)
+            if status_msg is not None:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            await _send_identified_song(
+                callback.message, conn, result.title, result.artist,
+                config, bot_id=dbmod.get_bot_id(conn, config),
+                own_media=(_om_kind, entry["file_id"]),
+                req_id=_req_id,
+                arm=("video_button", entry["file_id"], data,
+                     entry.get("audio_url") or "", ""),
+                source=result.source)
+        elif result.status == "unconfirmed" and result.title:
+            # A DIFFERENT single-source name: a «شاید...» lead, never a
+            # «شناسایی شد» card. Heart/lyrics/playlist stay available;
+            # the wrong-song button stays too, under the same token.
+            outcome = "different_maybe"
+            new_title, new_artist, new_source = (
+                result.title, result.artist, result.source)
+            entry["last_title"], entry["last_artist"], entry["last_source"] = (
+                new_title, new_artist, new_source)
+            key = profeat.remember_result(
+                result.title, result.artist, "", "",
+                own_media=(_om_kind, entry["file_id"]))
+            is_fav = profeat.is_favorite(conn, callback.from_user.id,
+                                         result.title, result.artist)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
+            _wrong_cb = _wrong_song_button_data(
+                entry["file_id"], callback.from_user.id,
+                entry.get("kind") or "file",
+                result.title, result.artist, result.source)
+            if _wrong_cb:
+                kb.inline_keyboard.append([InlineKeyboardButton(
+                    text=t("m_wrong_song_btn", ulang),
+                    callback_data=_wrong_cb)])
+            maybe_text = t("m_wrong_song_maybe", ulang).format(
+                title=result.title, artist=result.artist)
+            if status_msg is not None:
+                try:
+                    await status_msg.edit_text(maybe_text, reply_markup=kb)
+                except Exception:
+                    await callback.message.answer(maybe_text, reply_markup=kb)
+            else:
+                await callback.message.answer(maybe_text, reply_markup=kb)
+        else:
+            # No different result (not_found, lookup error, or every
+            # source named only rejected songs): honest «پیدا نشد» +
+            # invite the user to type the name — the normal text
+            # search handles it. The searching message becomes the
+            # answer; nothing else is sent.
+            outcome = "not_found"
+            if status_msg is not None:
+                try:
+                    await status_msg.edit_text(
+                        t("m_wrong_song_notfound", ulang))
+                except Exception:
+                    await callback.message.answer(
+                        t("m_wrong_song_notfound", ulang))
+            else:
+                await callback.message.answer(
+                    t("m_wrong_song_notfound", ulang))
+    except Exception:
+        # Audio fetch failed, or the re-check raised: honest error,
+        # never silence, never a guessed name.
+        outcome = "error"
+        if status_msg is not None:
+            try:
+                await status_msg.edit_text(t("m_wrong_song_error", ulang))
+            except Exception:
+                try:
+                    await callback.message.answer(
+                        t("m_wrong_song_error", ulang))
+                except Exception:
+                    pass
+        else:
+            try:
+                await callback.message.answer(
+                    t("m_wrong_song_error", ulang))
+            except Exception:
+                pass
+    finally:
+        _WRONG_SONG_RUNNING.discard(token)
+        _timing.log_total(log, "identify_stage", _req_id, _t_req, outcome,
+                          headline_total="click_to_identify_ms")
+    _wrong_song_log_and_store(
+        callback.from_user.id,
+        entry.get("link") or entry.get("audio_url") or "",
+        wrong_title, wrong_artist, wrong_source,
+        new_title, new_artist, new_source, outcome,
+        attempts=int(entry.get("attempts") or 0), req_id=_req_id)
+
+
 async def _identify_audio(data: bytes, filename: str, config: Config,
                         conn=None, cache_url_key: str | None = None,
-                        req_id: str | None = None, t_req=None) -> AudioIdResult:
+                        req_id: str | None = None, t_req=None,
+                        exclude: list | None = None,
+                        skip_bank: bool = False) -> AudioIdResult:
     """Shazam and AudD run IN PARALLEL; a name counts as identified
     only when TWO sources agree (confirm fix 2026-11-09).
+
+    ``exclude`` (batch F, wrong-song re-check): [(title, artist), ...]
+    the user already rejected for this video. A candidate matching any
+    of them — at the cache, in the bank, at the two-source gate, or as
+    a single-source name — is dropped as if it never answered, and the
+    next-best candidate is considered. When every source named only
+    rejected songs, the result is "not_found" WITHOUT caching (the
+    bytes do have a known identification; caching not_found would hide
+    it from a later normal tap). ``skip_bank`` skips the exclusive-bank
+    stage entirely: the bank is the "used" source when the disputed
+    result came from it, so the re-check consults only Shazam/AudD/
+    ACRCloud. With both unset the behavior is byte-identical to
+    before (all existing paths call without them).
 
     Pipeline stages (each logged with timing; errors carry their stage):
       0. identify cache — sha256 of the input bytes is looked up first;
@@ -2109,6 +2464,27 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         _timing.log_stage(log, "identify_stage", req_id, t_req, stage,
                           t_stage, **extra)
 
+    # Batch F (wrong-song re-check): names the user already rejected
+    # for this video. _excluded_hit records that at least one source
+    # named only rejected songs, so the tail can answer "not_found"
+    # instead of "lookup_error" for the re-check. Defined before
+    # Stage 0 because the cache-hit return is the first exclusion
+    # point.
+    _excluded_hit = [False]
+
+    def _is_excluded(title: str, artist: str) -> bool:
+        """True when (title, artist) is a rejected name. Same
+        normalization as the two-source gate, so a rejected "(Remix)"
+        never slips back in under a plainer spelling."""
+        if not exclude:
+            return False
+        from ..search.fullsong_verify import file_identity_matches as _fim
+        for _ex_t, _ex_a in exclude:
+            if _fim(title, artist, _ex_t, _ex_a):
+                _excluded_hit[0] = True
+                return True
+        return False
+
     t0 = _time.perf_counter()
     _st("input_received", t_req, bytes=len(data or b""), filename=filename)
     if not data:
@@ -2130,12 +2506,21 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # + fingerprint) instead of returning — Shazam is NOT re-run.
     bank_only = False
     if cached is not None:
-        _st("result_sent", t0, status=cached["status"], cached=True)
         if cached["status"] == "identified":
-            return AudioIdResult(status="identified", title=cached["title"],
-                                 artist=cached["artist"], confirmed=True,
-                                 source="cache")
-        bank_only = True
+            if _is_excluded(cached["title"], cached["artist"]):
+                # The cached name is the one the user rejected: never
+                # re-show it — fall through to the live pipeline with
+                # the exclusion still active.
+                _st("result_sent", t0, status="identified", cached=True,
+                    excluded=True)
+            else:
+                _st("result_sent", t0, status="identified", cached=True)
+                return AudioIdResult(status="identified", title=cached["title"],
+                                     artist=cached["artist"], confirmed=True,
+                                     source="cache")
+        else:
+            _st("result_sent", t0, status=cached["status"], cached=True)
+            bank_only = True
 
     def _cache_store(status: str, title: str = "", artist: str = "") -> None:
         # Terminal results only; errors are never cached.
@@ -2201,7 +2586,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                     _c = _xb_conn()
                     if _c is not None:
                         _song, _sim = _xb_match(_c, _items, req_id=req_id)
-                        if _song is not None:
+                        if _song is not None \
+                                and not _is_excluded(_song["title"],
+                                                     _song["artist"]):
                             _st("exclusive_bank", t0,
                                 status="identified", sim=round(_sim, 3),
                                 title=_song["title"], via="raw_fallback")
@@ -2216,6 +2603,10 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                                                  artist=_song["artist"],
                                                  confirmed=True,
                                                  source="bank")
+                        if _song is not None:
+                            _st("exclusive_bank", t0,
+                                status="excluded", sim=round(_sim, 3),
+                                title=_song["title"], via="raw_fallback")
             except Exception:
                 pass
         # Distinct extraction-stage error — never "not_found".
@@ -2226,7 +2617,13 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # it to the exclusive file via _exclusive_song_for. Any bank error
     # fails OPEN: the Shazam -> AudD -> ACRCloud chain runs untouched.
     # `bank_only` (cached not_found) skips that chain after the bank check.
-    if _XBANK_OK:
+    if skip_bank:
+        # Wrong-song re-check: the bank IS the disputed source, so the
+        # re-check consults only the unused sources (Shazam/AudD/
+        # ACRCloud). The skip is logged, never silent.
+        _st("exclusive_bank", _time.perf_counter(), ok=False,
+            reason="skipped_wrong_song")
+    elif _XBANK_OK:
         _t_bank = _time.perf_counter()
         try:
             from .exclusive_bank import (
@@ -2255,7 +2652,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                         reason="bank_unavailable")
                 else:
                     _song, _sim = _xb_match(_xb_c, _xb_items, req_id=req_id)
-                    if _song is not None:
+                    if _song is not None \
+                            and not _is_excluded(_song["title"],
+                                                 _song["artist"]):
                         _st("exclusive_bank", _t_bank,
                             status="identified", sim=round(_sim, 3),
                             title=_song["title"])
@@ -2268,12 +2667,21 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                                              title=_song["title"],
                                              artist=_song["artist"],
                                              confirmed=True, source="bank")
-                    # No match is logged too (with the best similarity and
-                    # the query size): a silent bank check is how the
-                    # 2026-11-07 short-sample failure stayed invisible.
-                    _st("exclusive_bank", _t_bank,
-                        status="no_match", sim=round(_sim, 3),
-                        items=len(_xb_items))
+                    if _song is not None:
+                        # The bank's answer is the name the user already
+                        # disputed: it must not be re-shown, and it is
+                        # not a "no_match" either.
+                        _st("exclusive_bank", _t_bank,
+                            status="excluded", sim=round(_sim, 3),
+                            title=_song["title"])
+                    else:
+                        # No match is logged too (with the best similarity
+                        # and the query size): a silent bank check is how
+                        # the 2026-11-07 short-sample failure stayed
+                        # invisible.
+                        _st("exclusive_bank", _t_bank,
+                            status="no_match", sim=round(_sim, 3),
+                            items=len(_xb_items))
             elif not _xb_fp_failed:
                 _st("exclusive_bank", _t_bank, ok=False,
                     reason="fingerprint_empty")
@@ -2396,11 +2804,15 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             acr = None
         _st("api_acrcloud", t0, status=acr.status if acr is not None else "none")
-    # TWO-SOURCE CONFIRMATION GATE: Shazam + AudD agreement only.
+    # TWO-SOURCE CONFIRMATION GATE: Shazam + AudD agreement only. A
+    # rejected name (batch F) never confirms, even when both sources
+    # still agree on it — the fall-through below lets a DIFFERENT
+    # single-source name surface instead.
     from ..search.fullsong_verify import file_identity_matches as _fim
     if (shazam is not None and shazam.status == "identified"
             and audd is not None and audd.status == "identified"
-            and _fim(shazam.title, shazam.artist, audd.title, audd.artist)):
+            and _fim(shazam.title, shazam.artist, audd.title, audd.artist)
+            and not _is_excluded(shazam.title, shazam.artist)):
         _cache_store("identified", shazam.title, shazam.artist)
         _st("result_sent", t0, status="identified",
             title=shazam.title, artist=shazam.artist,
@@ -2409,14 +2821,15 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                              artist=shazam.artist, confirmed=True,
                              source="shazam+audd")
     # Single-source name (Shazam first — it is the primary): unconfirmed.
+    # A rejected name is skipped at every source: the first
+    # NON-excluded identified candidate wins.
     _single = None
     _single_src = ""
-    if shazam is not None and shazam.status == "identified":
-        _single, _single_src = shazam, "shazam"
-    elif audd is not None and audd.status == "identified":
-        _single, _single_src = audd, "audd"
-    elif acr is not None and acr.status == "identified":
-        _single, _single_src = acr, "acrcloud"
+    for _cand, _src in ((shazam, "shazam"), (audd, "audd"), (acr, "acrcloud")):
+        if _cand is not None and _cand.status == "identified" \
+                and not _is_excluded(_cand.title, _cand.artist):
+            _single, _single_src = _cand, _src
+            break
     if _single is not None:
         _st("result_sent", t0, status="unconfirmed",
             title=_single.title, artist=_single.artist, via=_single_src)
@@ -2426,6 +2839,14 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     if shazam is not None and shazam.status == "not_found":
         _cache_store("not_found")
         _st("result_sent", t0, status="not_found")
+        return AudioIdResult(status="not_found")
+    if _excluded_hit[0]:
+        # Every source named only the rejected song(s): for THIS
+        # re-check nothing different was found. "not_found" — and
+        # deliberately NOT cached (the bytes DO have a known
+        # identification; caching not_found would hide it from a
+        # later normal tap).
+        _st("result_sent", t0, status="not_found", reason="all_excluded")
         return AudioIdResult(status="not_found")
     _st("result_sent", t0, status="error", detail="lookup_error")
     return AudioIdResult(status="error", detail="lookup_error")
@@ -3173,7 +3594,8 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
                                 bot_id: str = "",
                                 own_media: tuple | None = None,
                                 req_id: str | None = None,
-                                arm: tuple | None = None):
+                                arm: tuple | None = None,
+                                source: str = ""):
     """Deliver an identified song: the name card goes out FIRST, then the
     bank check / catalog enrichment / full-version delivery run after the
     card (identify-fix 2026-11-09). `arm` is the _arm_bank_sample
@@ -3182,10 +3604,12 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
     identify entry points (video button, link, direct file/voice).
     Returns the sent card message (or None when the card send failed) —
     the background delivery deletes it when the file is ready (confirm
-    fix 2026-11-09: one final message)."""
+    fix 2026-11-09: one final message). `source` is the identifying
+    source ("bank" | "shazam+audd" | "cache" | "") — the wrong-song
+    button records it so the re-check knows which source was used."""
     return await _send_professional_song_card(
         message, conn, title, artist, bot_id=bot_id,
-        own_media=own_media, config=config, arm=arm)
+        own_media=own_media, config=config, arm=arm, source=source)
 
 
 _FULLSONG_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
@@ -3328,7 +3752,8 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                                        bank_token: str | None = None,
                                        own_media: tuple[str, str] | None = None,
                                        config=None, arm: tuple | None = None,
-                                       exclusive_check: bool = True):
+                                       exclusive_check: bool = True,
+                                       source: str = ""):
     """One clean card for an identified song.
 
     INSTANT CARD (identify-fix 2026-11-09): the name card (title +
@@ -3358,6 +3783,24 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     key = profeat.remember_result(title, artist, "", "", own_media=own_media)
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
+    # Batch F (wrong song): the card for a VIDEO identification also
+    # carries «❌ آهنگ اشتباه» — same token as the video's identify
+    # button, so the dispute resolves to the same video. own_media is
+    # None for catalog results (suggest flow): no video, no button.
+    # The keyboard object is reused by the final audio message, so the
+    # button survives the card replacement.
+    if own_media is not None:
+        try:
+            _wrong_cb = _wrong_song_button_data(
+                own_media[1], message.from_user.id,
+                "audio" if own_media[0] == "audio" else "file",
+                title, artist, source)
+        except Exception:
+            _wrong_cb = None
+        if _wrong_cb:
+            kb.inline_keyboard.append([InlineKeyboardButton(
+                text=t("m_wrong_song_btn", ulang),
+                callback_data=_wrong_cb)])
     # INSTANT CARD: the identification IS the answer — the card goes out
     # NOW with the pro buttons. Nothing slow runs before this line.
     # CONFIRM FIX (2026-11-09): the card is sent ONLY for a confirmed
@@ -4575,7 +5018,8 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                                       "send_video", _t_send)
                     # Attach the identify button (audio_url=None → falls back to Telegram file)
                     try:
-                        await _attach_identify_button(message, conn, _sent)
+                        await _attach_identify_button(message, conn, _sent,
+                                                      link_url=link_url)
                     except Exception:
                         pass
                     _timing.log_total(log, "link_stage", _req_id, _t_req,
@@ -5220,7 +5664,8 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         bot_id=dbmod.get_bot_id(conn, config),
         own_media=(media_kind, media.file_id),
         arm=("file", __import__("hashlib").sha256(data).hexdigest(),
-             data, "", caption))
+             data, "", caption),
+        source=result.source)
 
 
 

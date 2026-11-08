@@ -305,7 +305,8 @@ async def main():
         orig_ident = h._identify_audio
 
         async def _fake_ident(data, filename, config, conn=None,
-                              cache_url_key=None, req_id=None, t_req=None):
+                              cache_url_key=None, req_id=None, t_req=None,
+                              **_kw):  # batch F passes exclude= (ignored here)
             return AudioIdResult(status="unconfirmed", title="Flick Shot!",
                                  artist="Ali Geramy", confirmed=False,
                                  source="shazam")

@@ -142,6 +142,30 @@ def ensure_user_tables(conn) -> None:
     _USER_TABLES_OK = True
 
 
+# Wrong-song reports (batch F, 2026-11-09): one row per tap on
+# «❌ آهنگ اشتباه» — the disputed name + its source, the link, and
+# what the re-check found. Admin analytics only; written
+# fire-and-forget AFTER the answer, never in a waiting path. The
+# store opens its OWN connection per call (never the cached global:
+# the write runs in a background thread, and a connection created
+# on the event-loop thread must not be used from another thread).
+_WRONG_SONG_REPORTS_DDL = """
+    CREATE TABLE IF NOT EXISTS wrong_song_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        link TEXT NOT NULL DEFAULT '',
+        wrong_title TEXT NOT NULL DEFAULT '',
+        wrong_artist TEXT NOT NULL DEFAULT '',
+        wrong_source TEXT NOT NULL DEFAULT '',
+        new_title TEXT NOT NULL DEFAULT '',
+        new_artist TEXT NOT NULL DEFAULT '',
+        new_source TEXT NOT NULL DEFAULT '',
+        outcome TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+    )
+"""
+
+
 def _get_conn():
     """Get or create Turso connection. Returns None if not configured/fails."""
     global _turso_conn, _turso_ok
@@ -188,6 +212,7 @@ def _get_conn():
                 created_at INTEGER NOT NULL
             )
         """)
+        conn.execute(_WRONG_SONG_REPORTS_DDL)
         # Full-song mismatch fix (2026-11-09): the file's own verified
         # identity (ID3 title/artist) + probed duration, stored next to
         # the file_id so a cache hit can be re-checked before send.
@@ -437,3 +462,57 @@ def store_suggest_result(key: str, title: str, artist: str = "", url: str = "",
     except Exception as e:
         _log.debug("turso_cache: store_suggest_result failed: %s", e)
         return False
+
+
+def store_wrong_song_report(user_id: int, link: str,
+                            wrong_title: str, wrong_artist: str,
+                            wrong_source: str,
+                            new_title: str = "", new_artist: str = "",
+                            new_source: str = "", outcome: str = "",
+                            req_id: str | None = None) -> bool:
+    """One row per «❌ آهنگ اشتباه» tap (batch F): the disputed name +
+    its source, the link, and what the re-check found (outcome:
+    "different_confirmed" | "different_maybe" | "not_found" | "error"
+    | "limit"). Admin analytics only. Fail-open, never raises — the
+    caller writes fire-and-forget AFTER the answer, never in a
+    waiting path.
+
+    Opens its OWN connection per call (never the cached global):
+    the write runs in a background thread via asyncio.to_thread, and
+    a connection created on the event-loop thread must not be used
+    from another thread."""
+    url = os.environ.get("TURSO_URL", "").strip()
+    token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if not url or not token:
+        return False
+    try:
+        import libsql_experimental as libsql
+        conn = libsql.connect(url, auth_token=token)
+    except Exception as e:
+        _log.debug("turso_cache: store_wrong_song_report connect failed: %s", e)
+        return False
+    try:
+        now = int(time.time())
+        _tq = time.perf_counter()
+        conn.execute(_WRONG_SONG_REPORTS_DDL)
+        conn.execute("""
+            INSERT INTO wrong_song_reports
+            (user_id, link, wrong_title, wrong_artist, wrong_source,
+             new_title, new_artist, new_source, outcome, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(user_id or 0), (link or "")[:500],
+              wrong_title or "", wrong_artist or "", wrong_source or "",
+              new_title or "", new_artist or "", new_source or "",
+              outcome or "", now))
+        _timing.note_turso(req_id, "wrong_song_reports.store",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.debug("turso_cache: store_wrong_song_report failed: %s", e)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
