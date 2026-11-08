@@ -30,7 +30,7 @@ API_URL = "https://api.audd.io/"
 
 @dataclass
 class AudioIdResult:
-    status: str  # identified | not_found | needs_token | error
+    status: str  # identified | unconfirmed | not_found | needs_token | error
     title: str = ""
     artist: str = ""
     album: str = ""
@@ -40,6 +40,15 @@ class AudioIdResult:
     # Values: "" | silent | undecodable | too_short | lookup_error |
     #         service_error | no_ffmpeg
     detail: str = ""
+    # Two-source confirmation (2026-11-09): status "identified" means
+    # the name is CONFIRMED — the exclusive bank matched, or Shazam and
+    # AudD agreed on the name. A single-source name is returned with
+    # status "unconfirmed" instead and is NEVER shown as "identified".
+    # `source` records which source(s) produced the name (for the log
+    # and the Google-button query): "bank" | "shazam+audd" | "cache" |
+    # "shazam" | "audd" | "acrcloud" | "".
+    confirmed: bool = False
+    source: str = ""
 
 
 def parse_audd_payload(payload: dict) -> AudioIdResult:

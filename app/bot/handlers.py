@@ -1624,7 +1624,9 @@ EXTRACTED_AUDIO_TITLE = t("m_extracted_audio_title")
 
 
 async def _extract_and_send_clip_audio(message, conn, data: bytes,
-                                       caption: str | None = None):
+                                       caption: str | None = None,
+                                       reply_markup=None,
+                                       caption_key: str = ""):
     """Extract a video's own audio to a REAL, validated MP3 and send it
     as «صدای استخراج‌شده از ویدیو».
 
@@ -1640,7 +1642,12 @@ async def _extract_and_send_clip_audio(message, conn, data: bytes,
     bitrate/duration via the unified pipeline. Returns the sent message,
     or None when extraction is impossible (silent/undecodable bytes) —
     the caller then states that honestly instead of claiming delivery.
-    The title is never a guessed song name.
+    The title is never a guessed song name. The extracted file is
+    Avano's own extraction: performer is "Avano" (never "Unknown
+    artist") and the duration is the probed real one (never guessed).
+    A successful send writes one `sent_extracted_audio` log line
+    (bytes + caption key + attached button labels) so the fallback is
+    verifiable in the log.
     """
     try:
         if not data:
@@ -1657,13 +1664,161 @@ async def _extract_and_send_clip_audio(message, conn, data: bytes,
         if not mp3:
             return None
         ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
-        sent = await send_music(message, mp3, t("m_extracted_audio_title", ulang), "",
-                                caption=caption)
+        # show_quality=False: the extracted-audio caption is the user's
+        # exact text (byte-exact per the 2026-11-09 order) — the unified
+        # pipeline must not append a "🔊 MP3 · 96kbps" line to it.
+        sent = await send_music(message, mp3, t("m_extracted_audio_title", ulang),
+                                "Avano", caption=caption,
+                                reply_markup=reply_markup,
+                                show_quality=False)
         if sent is not None:
             _track(conn, message, sent)
+            try:
+                log_event(log, "extract", stage="sent_extracted_audio",
+                          bytes=len(mp3), caption_key=caption_key or "",
+                          buttons=_keyboard_button_texts(reply_markup))
+            except Exception:
+                pass
         return sent
     except Exception:
         return None
+
+
+def _keyboard_button_texts(kb) -> list:
+    """Button labels of an inline keyboard, for the log line only."""
+    texts = []
+    try:
+        for _row in getattr(kb, "inline_keyboard", []) or []:
+            for _b in _row:
+                texts.append(getattr(_b, "text", "") or "")
+    except Exception:
+        pass
+    return texts
+
+
+def _find_identify_callback(file_id: str, user_id: int, kind: str = "file"):
+    """callback_data for re-identifying a video: the EXISTING vid:id
+    token for this file when one is registered, else a fresh token
+    minted by the usual _video_identify_kb — the retry always runs the
+    EXISTING identify flow (same handler, same registry, no cache
+    bypass). Returns None only when no token can be minted."""
+    if not file_id or not user_id:
+        return None
+    for tok, entry in _VIDEO_IDENTIFY.items():
+        if entry.get("file_id") == file_id and entry.get("user_id") == user_id:
+            return f"vid:id:{tok}"
+    try:
+        kb = _video_identify_kb(user_id, file_id, kind)
+        return kb.inline_keyboard[0][0].callback_data
+    except Exception:
+        return None
+
+
+def _extracted_audio_kb(title: str, artist: str, ulang,
+                        token: str | None = None,
+                        file_id: str | None = None,
+                        user_id: int | None = None,
+                        kind: str = "file"):
+    """The two buttons under an extracted-audio message.
+
+    Google search for the best available name (the confirmed name, else
+    the single-source name; OMITTED when no name exists at all — a
+    query is never invented) + retry identification via the video's
+    EXISTING identify button (vid:id:<token>). Never used on an
+    identified/bank send."""
+    import urllib.parse as _up
+    rows = []
+    name = f"{(title or '').strip()} {(artist or '').strip()}".strip()
+    if name:
+        rows.append([InlineKeyboardButton(
+            text=t("m_extracted_google_btn", ulang),
+            url="https://www.google.com/search?q=" + _up.quote_plus(name))])
+    cb = None
+    if token:
+        cb = f"vid:id:{token}"
+    elif file_id and user_id:
+        cb = _find_identify_callback(file_id, user_id, kind)
+    if cb:
+        rows.append([InlineKeyboardButton(
+            text=t("m_extracted_retry_btn", ulang), callback_data=cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def _send_unconfirmed_audio(message, conn, data: bytes,
+                                  title: str = "", artist: str = "",
+                                  ulang: str = "fa",
+                                  token: str | None = None,
+                                  file_id: str | None = None,
+                                  user_id: int | None = None,
+                                  kind: str = "file"):
+    """The unconfirmed identification response: ONLY the clip's own
+    audio with the new caption + Google/retry buttons. No «شناسایی شد»
+    card, no separate text message. Returns the sent message, or None
+    when extraction is impossible (the caller then sends the honest
+    text)."""
+    kb = _extracted_audio_kb(title, artist, ulang, token=token,
+                             file_id=file_id, user_id=user_id, kind=kind)
+    return await _extract_and_send_clip_audio(
+        message, conn, data,
+        caption=t("m_extracted_audio_new", ulang),
+        reply_markup=kb, caption_key="m_extracted_audio_new")
+
+
+async def _send_unconfirmed_media(message, conn, data: bytes,
+                                  title: str = "", artist: str = "",
+                                  ulang: str = "fa",
+                                  media_kind: str = "video",
+                                  file_id: str | None = None,
+                                  user_id: int | None = None):
+    """Unconfirmed response for a directly-sent file. Video: the clip's
+    own extracted audio (new caption + buttons). Audio: the file itself
+    back, with the buttons and NO caption — nothing was extracted from
+    it. Voice/document: no audio send (same coverage as before).
+    Returns the sent message or None."""
+    if media_kind == "video":
+        return await _send_unconfirmed_audio(
+            message, conn, data, title, artist, ulang,
+            file_id=file_id, user_id=user_id, kind="file")
+    if media_kind == "audio":
+        kb = _extracted_audio_kb(title, artist, ulang, file_id=file_id,
+                                 user_id=user_id, kind="audio")
+        sent = await send_song_audio(message, file_id or "", "", "",
+                                     reply_markup=kb)
+        if sent is not None:
+            _track(conn, message, sent)
+        return sent
+    return None
+
+
+def _final_audio_caption(title: str, artist: str, ulang,
+                         duration_sec: float = 0, quality: str = "",
+                         extra: str = "") -> str:
+    """Caption of the ONE final message for a confirmed song: the
+    «شناسایی شد» card text, plus the file's real duration and quality
+    info (and the bank marker for exclusive files). The card text is
+    the caption — a text message cannot be edited into an audio
+    message, so the card is deleted and this audio is sent instead."""
+    text = t("h_song_identified", ulang).format(title=title, artist=artist)
+    label = _fullsong_duration_label(duration_sec, ulang)
+    if label:
+        text += label
+    if extra:
+        text += "\n" + extra
+    if quality:
+        text += "\n🎧 " + quality
+    return text
+
+
+async def _delete_card(card_msg) -> None:
+    """Best-effort delete of the instant name card after its file was
+    sent as the one final message. Never raises; a failed delete
+    leaves the card in place (the file is already sent)."""
+    if card_msg is None:
+        return
+    try:
+        await card_msg.delete()
+    except Exception:
+        pass
 
 
 async def _answer_identify_clip_fallback(message, conn, config, data: bytes,
@@ -1751,7 +1906,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                       hit=True, via="url")
             cached_result = AudioIdResult(status="identified",
                                           title=_ck["title"],
-                                          artist=_ck["artist"])
+                                          artist=_ck["artist"],
+                                          confirmed=True, source="cache")
     result = None
     data = b""
     if cached_result is not None:
@@ -1769,7 +1925,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         if _pre is not None and _pre.get("status") == "bank_hit":
             result = AudioIdResult(status="identified",
                                    title=_pre.get("title", ""),
-                                   artist=_pre.get("artist", ""))
+                                   artist=_pre.get("artist", ""),
+                                   confirmed=True, source="bank")
         elif _pre is not None and _pre.get("status") == "bank_miss" \
                 and _pre.get("slice"):
             data = _pre["slice"]
@@ -1821,35 +1978,37 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 req_id=_req_id, t_req=_t_req)
         _t_send = _time.perf_counter()
         if result.status == "identified":
-            # Cache-hit path has no bytes in hand: arm the bank sample
-            # from the audio URL (arm_sample downloads it) so the 🔎
-            # button is still offered, exactly as on a fresh identify.
-            _tok = await _arm_bank_sample(conn, config, "video_button",
-                                          entry["file_id"], data or None,
-                                          audio_url or "", "")
+            # CONFIRMED name only (confirm fix 2026-11-09): _identify_audio
+            # returns "identified" solely for a bank match or a
+            # Shazam+AudD agreement. The name card goes out FIRST — the
+            # bank sample is armed AFTER the card (the cache-hit path
+            # arms from the audio URL, which downloads it, and must
+            # never delay the answer).
             await _send_identified_song(
                 callback.message, conn, result.title, result.artist,
                 config, bot_id=dbmod.get_bot_id(conn, config),
-                bank_tok=_tok,
                 own_media=("video", entry["file_id"]),
-                req_id=_req_id)
-        elif result.status == "not_found":
-            await _answer_identify_clip_fallback(
-                callback.message, conn, config, data, entry["file_id"])
-        elif result.detail == "lookup_error":
-            # Decodable, audible bytes — only the lookup service failed.
-            # The extract fallback still applies; the message stays
-            # honest about the error (never "not found"). A retry button
-            # is offered because a lookup error may be transient.
-            retry_rows = _video_identify_kb(
-                callback.from_user.id, entry["file_id"],
-                entry.get("kind") or "file",
-                label=t("m_retry", ulang),
-                audio_url=entry.get("audio_url")).inline_keyboard
-            await _answer_identify_clip_fallback(
-                callback.message, conn, config, data, entry["file_id"],
-                headline_key="m_identify_error",
-                extra_rows=retry_rows)
+                req_id=_req_id,
+                arm=("video_button", entry["file_id"], data or None,
+                     audio_url or "", ""))
+        elif result.status in ("unconfirmed", "not_found") \
+                or result.detail == "lookup_error":
+            # NOT confirmed (single source, disagreement, no match, or
+            # lookup error): NO «شناسایی شد» card at all — ONLY the
+            # clip's own audio with the new caption + Google/retry
+            # buttons. The retry reuses THIS button's token, so it runs
+            # the existing identify flow on the same video.
+            sent = await _send_unconfirmed_audio(
+                callback.message, conn, data, result.title, result.artist,
+                ulang, token=token)
+            if sent is None:
+                # Extraction impossible: the honest line (existing text).
+                _head = ("m_identify_error"
+                         if result.detail == "lookup_error"
+                         else "m_identify_head_notfound")
+                await callback.message.answer(
+                    t("h_clip_audio_failed", ulang).format(
+                        head=t(_head, ulang)))
         else:
             # Distinct extraction/lookup causes — never one generic line.
             _detail_msg = {
@@ -1872,12 +2031,15 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
 async def _identify_audio(data: bytes, filename: str, config: Config,
                         conn=None, cache_url_key: str | None = None,
                         req_id: str | None = None, t_req=None) -> AudioIdResult:
-    """Shazam signature first (no token), AudD with a token as fallback.
+    """Shazam and AudD run IN PARALLEL; a name counts as identified
+    only when TWO sources agree (confirm fix 2026-11-09).
 
     Pipeline stages (each logged with timing; errors carry their stage):
       0. identify cache — sha256 of the input bytes is looked up first;
          a hit returns the stored terminal result with no download and no
-         lookup. Only identified/not_found are ever stored; errors never.
+         lookup. Only CONFIRMED identified results (bank match or
+         Shazam+AudD agreement) and not_found are ever stored; errors
+         never. A stored "identified" is confirmed by invariant.
       1. input validation gate — the extracted audio must be decodable,
          non-silent and of sane duration, else a distinct extraction
          error is returned (never "not_found"). Validation keeps its
@@ -1890,6 +2052,13 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
          never decode). A sliced window that fails to decode only yields
          "error", never a false match. A catalog result is never
          involved here, so nothing can be mislabelled as identified.
+         Shazam and AudD run CONCURRENTLY (asyncio.gather); AudD no
+         longer waits for Shazam to fail. The name is "identified" only
+         when Shazam AND AudD AGREE on title/artist (same normalization
+         as the tag guard: file_identity_matches). A single source
+         (Shazam-only, AudD-only, ACRCloud-only) or a disagreement
+         returns "unconfirmed" with the best single-source name — the
+         callers never show an «شناسایی شد» card for it.
 
     `conn`: when given, the audio-hash cache is consulted and terminal
     results are stored (under the content hash, and under
@@ -1935,7 +2104,8 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         _st("result_sent", t0, status=cached["status"], cached=True)
         if cached["status"] == "identified":
             return AudioIdResult(status="identified", title=cached["title"],
-                                 artist=cached["artist"])
+                                 artist=cached["artist"], confirmed=True,
+                                 source="cache")
         bank_only = True
 
     def _cache_store(status: str, title: str = "", artist: str = "") -> None:
@@ -2014,7 +2184,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                                          _song["artist"])
                             return AudioIdResult(status="identified",
                                                  title=_song["title"],
-                                                 artist=_song["artist"])
+                                                 artist=_song["artist"],
+                                                 confirmed=True,
+                                                 source="bank")
             except Exception:
                 pass
         # Distinct extraction-stage error — never "not_found".
@@ -2065,7 +2237,8 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                         _cache_store("identified", _song["title"], _song["artist"])
                         return AudioIdResult(status="identified",
                                              title=_song["title"],
-                                             artist=_song["artist"])
+                                             artist=_song["artist"],
+                                             confirmed=True, source="bank")
                     # No match is logged too (with the best similarity and
                     # the query size): a silent bank check is how the
                     # 2026-11-07 short-sample failure stayed invisible.
@@ -2101,39 +2274,48 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
               sizes=[len(w[1]) if w[1] is not None else len(w[0])
                      for w in windows],
               wav_reused=wav is not None)
-    shazam = None
-    _t_shazam = _time.perf_counter()
-    for i, (probe, prepared) in enumerate(windows):
-        t0 = _time.perf_counter()
-        try:
-            candidate = await identify_bytes_shazam(probe,
-                                                    prepared_wav=prepared,
-                                                    req_id=req_id)
-            log_event(log, "identify_stage", stage="lookup_response",
-                      req_id=req_id,
-                      total_ms=int((_time.perf_counter() - t_req) * 1000),
-                      window=i, ms=int((_time.perf_counter() - t0) * 1000),
-                      status=candidate.status if candidate else "none")
-        except Exception as exc:
-            log_event(log, "identify_stage", stage="lookup_error",
-                      req_id=req_id,
-                      total_ms=int((_time.perf_counter() - t_req) * 1000),
-                      window=i,
-                      error=f"{type(exc).__name__}: {str(exc)[:120]}")
-            candidate = None
-        if candidate is not None:
-            shazam = candidate
-            if candidate.status == "identified":
-                break
-    _st("api_shazam", _t_shazam,
-        status=shazam.status if shazam is not None else "none",
-        windows=len(windows))
-    if shazam is not None and shazam.status == "identified":
-        _cache_store("identified", shazam.title, shazam.artist)
-        _st("result_sent", t0, status="identified",
-            title=shazam.title, artist=shazam.artist)
-        return AudioIdResult(status="identified", title=shazam.title, artist=shazam.artist)
-    if config.audd_token:
+    # Stage 2 (confirm fix 2026-11-09): Shazam and AudD run IN PARALLEL
+    # (asyncio.gather) — AudD no longer waits for Shazam to fail, so a
+    # second opinion always exists. A name is CONFIRMED only when the
+    # exclusive bank matched (returned above) or Shazam AND AudD AGREE
+    # on title/artist (same normalization as the tag guard:
+    # file_identity_matches — lowercase, strip, bracketed-suffix
+    # insensitive, Persian/Arabic char normalization). A single source
+    # (Shazam-only, AudD-only, ACRCloud-only) or a disagreement returns
+    # "unconfirmed" with the best single-source name — the callers
+    # never show an «شناسایی شد» card for it, only the extracted audio.
+    # ACRCloud is not configured (user order) — its block is untouched
+    # except that it can only ever produce an unconfirmed single-source
+    # name now, never an "identified" return.
+    async def _run_shazam_windows():
+        _shazam = None
+        for i, (probe, prepared) in enumerate(windows):
+            t0 = _time.perf_counter()
+            try:
+                candidate = await identify_bytes_shazam(probe,
+                                                        prepared_wav=prepared,
+                                                        req_id=req_id)
+                log_event(log, "identify_stage", stage="lookup_response",
+                          req_id=req_id,
+                          total_ms=int((_time.perf_counter() - t_req) * 1000),
+                          window=i, ms=int((_time.perf_counter() - t0) * 1000),
+                          status=candidate.status if candidate else "none")
+            except Exception as exc:
+                log_event(log, "identify_stage", stage="lookup_error",
+                          req_id=req_id,
+                          total_ms=int((_time.perf_counter() - t_req) * 1000),
+                          window=i,
+                          error=f"{type(exc).__name__}: {str(exc)[:120]}")
+                candidate = None
+            if candidate is not None:
+                _shazam = candidate
+                if candidate.status == "identified":
+                    break
+        return _shazam
+
+    async def _run_audd():
+        if not config.audd_token:
+            return None
         t0 = _time.perf_counter()
         try:
             audd = await identify_bytes(data, filename, config.audd_token)
@@ -2142,21 +2324,31 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="audd", ms=int((_time.perf_counter() - t0) * 1000),
                       status=audd.status if audd else "none")
+            return audd
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
                       req_id=req_id,
                       total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="audd",
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
-            audd = None
-        _st("api_audd", t0, status=audd.status if audd is not None else "none")
-        if audd is not None and audd.status == "identified":
-            _cache_store("identified", audd.title, audd.artist)
-            _st("result_sent", t0, status="identified",
-                title=audd.title, artist=audd.artist)
-            return audd
-    # ACRCloud as third fallback (150M tracks, MENA coverage, sped-up tolerant)
-    if config.acrcloud_host and config.acrcloud_key and config.acrcloud_secret:
+            return None
+
+    _t_shazam = _time.perf_counter()
+    shazam, audd = await asyncio.gather(_run_shazam_windows(), _run_audd())
+    _st("api_shazam", _t_shazam,
+        status=shazam.status if shazam is not None else "none",
+        windows=len(windows))
+    _st("api_audd", _t_shazam,
+        status=audd.status if audd is not None else "none")
+    # ACRCloud as third fallback (150M tracks, MENA coverage, sped-up tolerant).
+    # Runs only when neither Shazam nor AudD identified — the same
+    # condition as before (the old sequential chain only ever reached
+    # it after both failed). It can only add a single-source name.
+    acr = None
+    if (shazam is None or shazam.status != "identified") \
+            and (audd is None or audd.status != "identified") \
+            and config.acrcloud_host and config.acrcloud_key \
+            and config.acrcloud_secret:
         t0 = _time.perf_counter()
         try:
             acr = await identify_acrcloud(
@@ -2175,11 +2367,33 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             acr = None
         _st("api_acrcloud", t0, status=acr.status if acr is not None else "none")
-        if acr is not None and acr.status == "identified":
-            _cache_store("identified", acr.title, acr.artist)
-            _st("result_sent", t0, status="identified",
-                title=acr.title, artist=acr.artist)
-            return acr
+    # TWO-SOURCE CONFIRMATION GATE: Shazam + AudD agreement only.
+    from ..search.fullsong_verify import file_identity_matches as _fim
+    if (shazam is not None and shazam.status == "identified"
+            and audd is not None and audd.status == "identified"
+            and _fim(shazam.title, shazam.artist, audd.title, audd.artist)):
+        _cache_store("identified", shazam.title, shazam.artist)
+        _st("result_sent", t0, status="identified",
+            title=shazam.title, artist=shazam.artist,
+            confirmed=True, via="shazam+audd")
+        return AudioIdResult(status="identified", title=shazam.title,
+                             artist=shazam.artist, confirmed=True,
+                             source="shazam+audd")
+    # Single-source name (Shazam first — it is the primary): unconfirmed.
+    _single = None
+    _single_src = ""
+    if shazam is not None and shazam.status == "identified":
+        _single, _single_src = shazam, "shazam"
+    elif audd is not None and audd.status == "identified":
+        _single, _single_src = audd, "audd"
+    elif acr is not None and acr.status == "identified":
+        _single, _single_src = acr, "acrcloud"
+    if _single is not None:
+        _st("result_sent", t0, status="unconfirmed",
+            title=_single.title, artist=_single.artist, via=_single_src)
+        return AudioIdResult(status="unconfirmed", title=_single.title,
+                             artist=_single.artist, confirmed=False,
+                             source=_single_src)
     if shazam is not None and shazam.status == "not_found":
         _cache_store("not_found")
         _st("result_sent", t0, status="not_found")
@@ -2613,6 +2827,14 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                                            req_id=req_id, t_req=t_req)
             if result.status == "identified":
                 return ("identified", result.title, result.artist, False, page_text, data)
+            if result.status == "unconfirmed":
+                # Single-source name: no card. Carry the name + bytes so
+                # the caller sends only the extracted audio (with the
+                # Google button for this name). The AudD-URL fallback
+                # below is the same engine on the same audio — it adds
+                # nothing for confirmation.
+                return ("unconfirmed", result.title, result.artist, False,
+                        page_text, data)
             if result.status in ("not_found", "error"):
                 fetched = (result.status, data)
     if config.audd_token:
@@ -2625,7 +2847,12 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                           _t_audd,
                           status=result.status if result is not None else "none")
         if result is not None and result.status == "identified":
-            return ("identified", result.title, result.artist, False, page_text, b"")
+            # Single-source AudD (URL): unconfirmed — no card, only the
+            # extracted audio. The fetched bytes (when any) ride along
+            # so the caller can extract from them.
+            _heard = fetched[1] if fetched is not None else b""
+            return ("unconfirmed", result.title, result.artist, False,
+                    page_text, _heard)
     if fetched is not None:
         # The media was fetched but not identified (or the lookup
         # failed): carry the real status and the bytes so the bank
@@ -2673,12 +2900,13 @@ async def _answer_link_identify_result(message, conn, config, outcome,
     """Answer the link-identify stages after ``_identify_link_audio``.
 
     The extract-fallback guarantee lives here: when media bytes were
-    heard (a reachable video with an audio track) but Shazam/AudD found
-    nothing or the lookup errored, the video's own audio is extracted
-    to a real, validated MP3 and sent before the honest message — never
-    skipped just because no full-version MP3 exists in the sources.
-    The plain video-download path (``_send_link_video``) is untouched
-    and stays independent of identification.
+    heard (a reachable video with an audio track) but the name was NOT
+    confirmed (single source, disagreement, no match, lookup error),
+    ONLY the video's own audio is sent — a real, validated MP3 with
+    the new caption + Google/retry buttons, never a «شناسایی شد» card
+    and never a second honest text. The plain video-download path
+    (``_send_link_video``) is untouched and stays independent of
+    identification.
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     import json as _json
@@ -2696,11 +2924,11 @@ async def _answer_link_identify_result(message, conn, config, outcome,
             _json.dumps({"title": title, "artist": artist}, ensure_ascii=False))
         # Arm the bank sample too: if the catalog card later proves
         # unusable, the second search can still run on this audio.
-        _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
-                                      heard or None, media_hint, page_text)
+        # (Armed AFTER the card, inside _send_identified_song.)
         await _send_identified_song(message, conn, title, artist, config,
                                     bot_id=dbmod.get_bot_id(conn, config),
-                                    bank_tok=_tok)
+                                    arm=("link", outcome.official_url,
+                                         heard or None, media_hint, page_text))
     elif needs_file:
         _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                       heard or None, media_hint, page_text)
@@ -2730,27 +2958,38 @@ async def _answer_link_identify_result(message, conn, config, outcome,
         # now on the page's advertised text; it stays silent unless
         # it has a real post to show (no public nag).
         await _run_link_channel_stage(message, conn, config, page_text)
-    elif status == "error":
-        # The media was fetched but the lookup failed: an honest
-        # error line, never "not found", with the bank armed on the
-        # real bytes when any were heard — plus the extract fallback.
-        _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
-                                      heard or None, media_hint, page_text)
+    elif status in ("unconfirmed", "not_found", "error"):
+        # NOT confirmed (single source, disagreement, no match, or
+        # lookup error): NO «شناسایی شد» card — ONLY the clip's own
+        # audio with the new caption + Google/retry buttons. The retry
+        # reuses the video's existing identify token when one is
+        # registered for the sent video. The channel stage still runs
+        # on the page text (a different input, not the identification
+        # answer). When nothing was heard / extraction fails, the
+        # existing honest text is sent instead (edge case — the user
+        # must get something), with the same Google/retry buttons and
+        # no bank button.
+        _vid_fid = None
+        try:
+            _vid = getattr(video_msg, "video", None) \
+                or getattr(video_msg, "audio", None)
+            _vid_fid = getattr(_vid, "file_id", None) if _vid else None
+        except Exception:
+            _vid_fid = None
+        sent = None
         if heard:
-            await _extract_and_send_clip_audio(message, conn, heard)
-        await _answer(message, conn, t("link_identify_error", ulang),
-                      reply_markup=_notfound_result_kb(_tok, page_text, ulang))
-        await _run_link_channel_stage(message, conn, config, page_text)
-    else:
-        # not_found with heard bytes: extract the video's own audio to
-        # a real MP3 first, then the honest message with the
-        # similar-songs + bank shortcuts.
-        _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
-                                      heard or None, media_hint, page_text)
-        if heard:
-            await _extract_and_send_clip_audio(message, conn, heard)
-        await _answer(message, conn, t("link_stage_not_found", ulang),
-                      reply_markup=_notfound_result_kb(_tok, page_text, ulang))
+            sent = await _send_unconfirmed_audio(
+                message, conn, heard, title, artist, ulang,
+                file_id=_vid_fid, user_id=message.from_user.id, kind="link")
+        if sent is None:
+            _kb = _extracted_audio_kb(title, artist, ulang,
+                                      file_id=_vid_fid,
+                                      user_id=message.from_user.id,
+                                      kind="link")
+            _text_key = ("link_identify_error" if status == "error"
+                         else "link_stage_not_found")
+            await _answer(message, conn, t(_text_key, ulang),
+                          reply_markup=_kb)
         await _run_link_channel_stage(message, conn, config, page_text)
 
 
@@ -2810,7 +3049,10 @@ def _exclusive_song_for(title: str, artist: str):
         return None
 
 
-async def _send_exclusive_song(message, song) -> bool:
+async def _send_exclusive_song(message, song, card_msg=None, kb=None,
+                               title: str | None = None,
+                               artist: str | None = None,
+                               ulang: str = "fa") -> bool:
     """Send an exclusive-bank song's full file with the exclusive card.
 
     Sends the PREPARED version's stored Telegram file_id when one is
@@ -2821,10 +3063,31 @@ async def _send_exclusive_song(message, song) -> bool:
     the user, not fall through to a public search. Returns True on
     success; False only when every stored version failed (caller falls
     back to the catalog card).
+
+    CONFIRM FIX (2026-11-09): when the instant name card was sent
+    (card_msg), the file REPLACES it — the audio is sent FIRST with the
+    card text as its caption (identified line + real duration + the
+    bank marker + measured bitrate) and the card's buttons, then the
+    card is deleted: ONE final message. Without a card the old
+    exclusive card text is kept. A failed send leaves the card in
+    place (the caller then falls back to the catalog delivery).
     """
     from .exclusive_bank import (exclusive_card_text, inc_download,
                                  delivery_candidates)
-    caption = exclusive_card_text(song)
+    if card_msg is not None:
+        if song.get("ready_file_id"):
+            _kbps = int(song.get("ready_bitrate_kbps")
+                        or song.get("bitrate_kbps") or 0)
+        else:
+            _kbps = int(song.get("bitrate_kbps") or 0)
+        _quality = f"کیفیت واقعی: {_kbps}kbps" if _kbps else ""
+        caption = _final_audio_caption(
+            title if title is not None else song.get("title", ""),
+            artist if artist is not None else song.get("artist", ""),
+            ulang, duration_sec=song.get("duration_sec") or 0,
+            quality=_quality, extra="💎 نسخه کامل اختصاصی آوانو")
+    else:
+        caption = exclusive_card_text(song)
     _cands = delivery_candidates(song)
     sent = None
     _last_err = None
@@ -2833,12 +3096,13 @@ async def _send_exclusive_song(message, song) -> bool:
             if song.get("cover_file_id"):
                 try:
                     sent = await message.answer_audio(
-                        fid, caption=caption,
+                        fid, caption=caption, reply_markup=kb,
                         thumbnail=song["cover_file_id"])
                 except Exception:
                     sent = None
             if sent is None:
-                sent = await message.answer_audio(fid, caption=caption)
+                sent = await message.answer_audio(fid, caption=caption,
+                                                  reply_markup=kb)
             if sent is not None:
                 break
         except Exception as e:
@@ -2856,25 +3120,32 @@ async def _send_exclusive_song(message, song) -> bool:
             inc_download(_c, song["id"])
     except Exception:
         pass
+    if card_msg is not None:
+        await _delete_card(card_msg)
     return True
 
 
 async def _send_identified_song(message, conn, title: str, artist: str, config,
-                                bot_id: str = "", bank_tok: str = "",
+                                bot_id: str = "",
                                 own_media: tuple | None = None,
-                                req_id: str | None = None):
-    """Deliver an identified song: exclusive-bank file first, else the
-    catalog card. One routing point for all three identify entry points
-    (video button, link, direct file/voice)."""
-    song = _exclusive_song_for(title, artist)
-    if song is not None and await _send_exclusive_song(message, song):
-        return
-    await _send_professional_song_card(
+                                req_id: str | None = None,
+                                arm: tuple | None = None):
+    """Deliver an identified song: the name card goes out FIRST, then the
+    bank check / catalog enrichment / full-version delivery run after the
+    card (identify-fix 2026-11-09). `arm` is the _arm_bank_sample
+    argument tuple (kind, seed, data, url, clue) — the sample is armed
+    after the card, never before it. One routing point for all three
+    identify entry points (video button, link, direct file/voice).
+    Returns the sent card message (or None when the card send failed) —
+    the background delivery deletes it when the file is ready (confirm
+    fix 2026-11-09: one final message)."""
+    return await _send_professional_song_card(
         message, conn, title, artist, bot_id=bot_id,
-        bank_token=bank_tok, own_media=own_media, config=config)
+        own_media=own_media, config=config, arm=arm)
 
 
 _FULLSONG_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
+_AFTER_CARD_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
 
 
 def _fullsong_key(chat_id, title: str, artist: str) -> tuple[int, str, str]:
@@ -2906,64 +3177,163 @@ def _spawn_fullsong_task(key, coro_factory) -> bool:
 
 
 def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
-                             own_media, bank_token, query, ulang) -> bool:
+                             own_media, bank_token, query, ulang,
+                             card_msg=None) -> bool:
     """Spawn the background full-version delivery for an identified
     song (guarded: one in flight per (chat, title, artist))."""
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     return _spawn_fullsong_task(
         _fullsong_key(chat_id, title, artist),
         lambda: _deliver_fullsong_bg(message, conn, title, artist, config,
-                                     kb, own_media, bank_token, query, ulang))
+                                     kb, own_media, bank_token, query, ulang,
+                                     card_msg=card_msg))
+
+
+async def _after_card_delivery(message, conn, title, artist, config, kb,
+                               own_media, bank_token, query, ulang, key, arm,
+                               exclusive_check: bool = True, card_msg=None):
+    """After-card work for an identified song (identify-fix 2026-11-09).
+
+    Runs in the background, AFTER the name card is already with the
+    user — nothing here can delay the answer. Order:
+    1) arm the bank sample (was before the card; now after it);
+    2) exclusive-bank check: a bank song's stored file IS the full
+       version — send it and stop (no catalog enrichment, no separate
+       full-song lookup, so a bank song is never sent twice);
+    3) otherwise spawn the full-version background delivery AND enrich
+       the stored card result with the catalog match (smart_search runs
+       here, after the card — its iTunes/Deezer calls can no longer
+       delay the name). The card itself is never edited: its keyboard
+       has no catalog element (heart/lyrics/playlist only).
+    Fire-and-forget: never raises.
+    """
+    try:
+        if arm is not None:
+            try:
+                bank_token = await _arm_bank_sample(conn, config, *arm) or bank_token
+            except Exception:
+                pass
+        if exclusive_check:
+            song = _exclusive_song_for(title, artist)
+            if song is not None and await _send_exclusive_song(
+                    message, song, card_msg=card_msg, kb=kb,
+                    title=title, artist=artist, ulang=ulang):
+                return
+        _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
+                                 own_media, bank_token, query, ulang,
+                                 card_msg=card_msg)
+        # Catalog enrichment (moved verbatim from the card path): the
+        # match's url/preview_url feed the heart/playlist buttons.
+        try:
+            engine = SearchEngine([ITunesProvider(entity="song"), DeezerProvider()])
+            try:
+                results, _ = await smart_search(engine, query, limit=10)
+            except Exception:
+                results = []
+            dbmod.record_search(conn, message.from_user.id, query, ok=bool(results))
+            match = match_identified_song(results, title, artist)
+            if match:
+                url = (getattr(match, "url", "") or "")
+                preview = (getattr(match, "preview_url", "") or "")
+                if key in profeat.RESULTS:
+                    profeat.RESULTS[key]["url"] = url
+                    profeat.RESULTS[key]["preview_url"] = preview
+                try:
+                    from .turso_cache import store_suggest_result
+                    store_suggest_result(key, title, artist, url, preview)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+def _spawn_after_card_delivery(message, conn, title, artist, config, kb,
+                               own_media, bank_token, query, ulang, key, arm,
+                               exclusive_check: bool = True,
+                               card_msg=None) -> bool:
+    """Spawn the after-card background task (at most one in flight per
+    (chat, title, artist)); a repeat tap reuses the in-flight task."""
+    try:
+        task_key = _fullsong_key(
+            getattr(getattr(message, "chat", None), "id", None), title, artist)
+        prev = _AFTER_CARD_TASKS.get(task_key)
+        if prev is not None and not prev.done():
+            return False
+        task = asyncio.create_task(_after_card_delivery(
+            message, conn, title, artist, config, kb,
+            own_media, bank_token, query, ulang, key, arm, exclusive_check,
+            card_msg=card_msg))
+        _AFTER_CARD_TASKS[task_key] = task
+
+        def _done(_t, _k=task_key):
+            if _AFTER_CARD_TASKS.get(_k) is _t:
+                _AFTER_CARD_TASKS.pop(_k, None)
+
+        task.add_done_callback(_done)
+        return True
+    except Exception:
+        return False
 
 
 
 async def _send_professional_song_card(message, conn, title: str, artist: str, bot_id: str = "",
                                        bank_token: str | None = None,
                                        own_media: tuple[str, str] | None = None,
-                                       config=None):
+                                       config=None, arm: tuple | None = None,
+                                       exclusive_check: bool = True):
     """One clean card for an identified song.
 
-    Decoupled delivery (2026-11-08): the result card (title + artist +
-    pro buttons) is sent IMMEDIATELY, then the full-version lookup runs
-    in a background task so a slow source can never delay the answer
-    by 30 s. The background task sends the full file (cached file_id
-    first, then the adapters, then the bank), the user's own media as a
-    labelled replacement, or the honest "full version not found"
-    message. A short catalog preview is never presented as the song.
+    INSTANT CARD (identify-fix 2026-11-09): the name card (title +
+    artist + heart/lyrics/playlist buttons) is sent FIRST — before the
+    bank-sample arming, before the exclusive-bank lookup, before the
+    iTunes/Deezer catalog search. The keyboard does not depend on the
+    catalog match (build_song_card_buttons only needs the result key),
+    so the card is complete without it. Everything else runs AFTER the
+    card in one background task (_after_card_delivery): the sample
+    arming, the exclusive-bank file (which IS the full version for a
+    bank song), the catalog enrichment of the stored result, and the
+    full-version background delivery. The full-song delivery itself is
+    unchanged (same _deliver_fullsong_bg, same guard, same tag-match
+    bug fix) — it just starts after the card now.
 
-    - Exact catalog match (version-aware) -> the card keeps the pro
-      buttons (heart / lyrics / add-to-playlist). Never a nearest song.
+    A short catalog preview is never presented as the song. Exact
+    catalog match (version-aware) -> the stored result keeps the pro
+    buttons working (heart / lyrics / add-to-playlist). Never a
+    nearest song. exclusive_check=False keeps the suggestion flow's
+    delivery routing exactly as before (no bank-file send there).
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     query = f"{title} {artist}".strip()
-    engine = SearchEngine([ITunesProvider(entity="song"), DeezerProvider()])
-    try:
-        results, _ = await smart_search(engine, query, limit=10)
-    except Exception:
-        results = []
-    dbmod.record_search(conn, message.from_user.id, query, ok=bool(results))
-    match = match_identified_song(results, title, artist)
-    key = profeat.remember_result(
-        title, artist,
-        (getattr(match, "url", "") or "") if match else "",
-        (getattr(match, "preview_url", "") or "") if match else "",
-        own_media=own_media)
+    # Minimal card first: the key needs no catalog match — the buttons
+    # are heart/lyrics/playlist only. The match enriches the stored
+    # result after the card (preview/catalog URLs for the buttons).
+    key = profeat.remember_result(title, artist, "", "", own_media=own_media)
     is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
     kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    # DECOUPLED (2026-11-08): the identification IS the answer — the
-    # card goes out NOW with the pro buttons. The full-version delivery
-    # runs in the background (at most one in flight per song) and must
-    # never delay this card.
+    # INSTANT CARD: the identification IS the answer — the card goes out
+    # NOW with the pro buttons. Nothing slow runs before this line.
+    # CONFIRM FIX (2026-11-09): the card is sent ONLY for a confirmed
+    # name (the gate lives in _identify_audio); when the file is ready
+    # the card is DELETED and the file is sent with this card's text as
+    # its caption — one final message (a text message cannot be edited
+    # into an audio message). The card message is threaded through the
+    # background delivery for that replacement.
+    card_msg = None
     try:
-        await _answer(message, conn,
-                      t("h_song_identified", ulang).format(
-                          title=title, artist=artist),
-                      reply_markup=kb)
+        card_msg = await _answer(message, conn,
+                                 t("h_song_identified", ulang).format(
+                                     title=title, artist=artist),
+                                 reply_markup=kb)
     except Exception:
         pass
-    _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
-                             own_media, bank_token, query, ulang)
-    return
+    _spawn_after_card_delivery(message, conn, title, artist, config, kb,
+                               own_media, bank_token, query, ulang, key, arm,
+                               exclusive_check, card_msg=card_msg)
+    return card_msg
 
 
 def _fullsong_duration_label(dur, ulang):
@@ -2985,7 +3355,9 @@ def _fullsong_duration_label(dur, ulang):
 
 async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
                                             caption: str, ulang,
-                                            track_user_id=None):
+                                            track_user_id=None,
+                                            reply_markup=None,
+                                            caption_key: str = ""):
     """Send the clip's ORIGINAL audio: stream copy, no re-encode.
 
     Used when a full-song candidate failed the identity check — the
@@ -2993,7 +3365,11 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
     the sent message or None. Never raises. track_user_id overrides
     the message sender for the clear-chat record (the download-full
     flow calls this on the bot's own card message, whose from_user
-    is the bot, not the user).
+    is the bot, not the user). The extracted file is Avano's own
+    extraction: performer is "Avano" (never "Unknown artist") and the
+    duration is the probed real one (ffprobe, never guessed). A
+    successful send writes one `sent_extracted_audio` log line (bytes +
+    caption key + attached button labels).
     """
     if not data:
         return None
@@ -3007,13 +3383,27 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
         vpath = os.path.join(tmpdir, "clip.mp4")
         with open(vpath, "wb") as f:
             f.write(data)
+        # ffprobe reads the audio codec AND the real format duration in
+        # one call: the extracted file carries a real duration (never
+        # 0:00) and performer "Avano" (never "Unknown artist").
         probe = await asyncio.to_thread(
             subprocess.run,
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=codec_name", "-of", "csv=p=0", vpath],
+             "-show_entries", "stream=codec_name:format=duration",
+             "-of", "json", vpath],
             capture_output=True, text=True, timeout=30)
-        _probe_out = (probe.stdout or "").strip()
-        codec = _probe_out.splitlines()[0].strip() if _probe_out else ""
+        _probe_json = {}
+        try:
+            import json as _json
+            _probe_json = _json.loads(probe.stdout or "{}")
+        except Exception:
+            _probe_json = {}
+        _streams = _probe_json.get("streams") or []
+        codec = str((_streams[0].get("codec_name") if _streams else "") or "")
+        try:
+            _dur = float((_probe_json.get("format") or {}).get("duration") or 0)
+        except Exception:
+            _dur = 0.0
         ext = {"aac": "m4a", "mp3": "mp3", "opus": "opus",
                "vorbis": "ogg", "flac": "flac"}.get(codec, "m4a")
         apath = os.path.join(tmpdir, f"clip.{ext}")
@@ -3030,7 +3420,9 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
             BufferedInputFile(adata, filename=f"clip.{ext}"),
             caption=caption,
             title=t("m_extracted_audio_title", ulang),
-            performer="")
+            performer="Avano",
+            duration=int(_dur) if _dur > 0 else None,
+            reply_markup=reply_markup)
         if sent is not None:
             try:
                 if track_user_id is not None:
@@ -3038,6 +3430,12 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
                                     sent.message_id)
                 else:
                     _track(conn, message, sent)
+            except Exception:
+                pass
+            try:
+                log_event(log, "extract", stage="sent_extracted_audio",
+                          bytes=len(adata), caption_key=caption_key or "",
+                          buttons=_keyboard_button_texts(reply_markup))
             except Exception:
                 pass
         return sent
@@ -3052,7 +3450,8 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
 
 
 async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
-                               own_media, bank_token, query, ulang):
+                               own_media, bank_token, query, ulang,
+                               card_msg=None):
     """Background full-version delivery for an identified song.
 
     Runs the EXISTING lookup chain (cached file_id fast path first,
@@ -3061,6 +3460,16 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
     labelled replacement, or the honest no-full message. The result
     card was already sent by _send_professional_song_card — this task
     only delivers the file. Fire-and-forget: never raises.
+
+    CONFIRM FIX (2026-11-09): when the card was sent (card_msg), a
+    successful file send REPLACES it — the audio goes out with the
+    card text as its caption (identified line + real duration) and
+    the card's buttons, then the card is deleted: ONE final message.
+    When the file delivery fails after the card was sent, the card
+    stays as-is (the name IS confirmed) and the extracted-audio
+    fallback follows with the new caption (no contradiction, because
+    the new caption says «official version not found», not
+    «not identified»).
     """
     _wait_msg = None
 
@@ -3072,6 +3481,24 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             except Exception:
                 pass
             _wait_msg = None
+
+    def _cap(duration_sec):
+        """Caption for a successful full-file send: with a card, the
+        card's text (one final message); without one, the old full-song
+        caption."""
+        if card_msg is not None:
+            return _final_audio_caption(title, artist, ulang,
+                                        duration_sec or 0)
+        return t("h_song_full_caption", ulang).format(
+            label=_fullsong_duration_label(duration_sec or 0, ulang),
+            title=title, artist=artist)
+
+    async def _replace_card():
+        """Delete the instant card after its file was sent (one final
+        message). No-op without a card; a failed delete leaves the
+        card in place."""
+        if card_msg is not None:
+            await _delete_card(card_msg)
 
     try:
         # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
@@ -3100,14 +3527,12 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     try:
                         sent = await message.answer_audio(
                             _cached["file_id"],
-                            caption=t("h_song_full_caption", ulang).format(
-                                label=_fullsong_duration_label(
-                                    _cached.get("duration_sec") or 0, ulang),
-                                title=title, artist=artist),
+                            caption=_cap(_cached.get("duration_sec") or 0),
                             title=title, performer=artist,
                             reply_markup=kb)
                         if sent is not None:
                             _track(conn, message, sent)
+                            await _replace_card()
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms)
@@ -3163,14 +3588,12 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     try:
                         sent = await message.answer_audio(
                             _turso_row["file_id"],
-                            caption=t("h_song_full_caption", ulang).format(
-                                label=_fullsong_duration_label(
-                                    _turso_row.get("duration_sec") or 0, ulang),
-                                title=title, artist=artist),
+                            caption=_cap(_turso_row.get("duration_sec") or 0),
                             title=title, performer=artist,
                             reply_markup=kb)
                         if sent is not None:
                             _track(conn, message, sent)
+                            await _replace_card()
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms, turso=True)
@@ -3276,16 +3699,14 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         sent = await asyncio.wait_for(
                             message.answer_audio(
                                 _full_url,
-                                caption=t("h_song_full_caption", ulang).format(
-                                    label=_fullsong_duration_label(
-                                        full["duration_sec"], ulang),
-                                    title=title, artist=artist),
+                                caption=_cap(full["duration_sec"]),
                                 title=title, performer=artist,
                                 duration=int(full["duration_sec"]),
                                 reply_markup=kb),
                             timeout=8.0)
                         if sent is not None:
                             _track(conn, message, sent)
+                            await _replace_card()
                             log_event(log, "fullsong", stage="sent_url",
                                       title=title[:40],
                                       source=full.get("source", "")[:40],
@@ -3326,14 +3747,13 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                   ms=int((_time.perf_counter() - _url_t0) * 1000))
                 sent = await message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
-                    caption=t("h_song_full_caption", ulang).format(
-                        label=_fullsong_duration_label(full["duration_sec"], ulang),
-                        title=title, artist=artist),
+                    caption=_cap(full["duration_sec"]),
                     title=title, performer=artist,
                     duration=int(full["duration_sec"]),
                     reply_markup=kb)
                 if sent is not None:
                     _track(conn, message, sent)
+                    await _replace_card()
                     log_event(log, "fullsong", stage="sent",
                               title=title[:40], bytes=len(full["data"]))
                     # Requirement #3: Store the Telegram file_id for future reuse.
@@ -3387,12 +3807,11 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                               title=title[:40], channel=hit.get("channel", "")[:20])
                     sent = await message.answer_audio(
                         hit["file_id"],
-                        caption=t("h_song_full_caption", ulang).format(
-                            label="",
-                            title=title, artist=artist),
+                        caption=_cap(0),
                         reply_markup=kb)
                     if sent is not None:
                         _track(conn, message, sent)
+                        await _replace_card()
                         return
                 elif hit:
                     log_event(log, "bank_text", stage="no_file_id",
@@ -3410,17 +3829,21 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             if full_data and len(full_data) <= 50 * 1024 * 1024:
                 sent = await send_music(
                     message, full_data, title, artist,
-                    caption=t("h_song_full_caption", ulang).format(label=label, title=title, artist=artist),
+                    caption=_cap(dur),
                     reply_markup=kb, duration=int(dur) if dur else None)
             if sent is not None:
                 _track(conn, message, sent)
+                await _replace_card()
                 return
         # 1c) IDENTITY CHECK FAILED: the fresh lookup's file was not the
         # identified song (or could not be verified). The wrong file is
         # never sent. The user gets the clip's ORIGINAL audio (stream
-        # copy, no re-encode) with the corporate text; only when the
-        # clip itself is unavailable does the honest no-full message
-        # below run.
+        # copy, no re-encode) with the new caption + Google/retry
+        # buttons; the card (if sent) stays — the name IS confirmed, and
+        # the new caption says «official version not found», not «not
+        # identified», so there is no contradiction. Only when the clip
+        # itself is unavailable does the honest no-full message below
+        # run.
         if _verify_failed:
             _sent_copy = None
             if own_media is not None:
@@ -3432,17 +3855,29 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         await message.bot.download_file(tg_file.file_path, buf)
                         _sent_copy = await _extract_and_send_clip_audio_copy(
                             message, conn, buf.getvalue(),
-                            t("m_clip_audio_unverified", ulang), ulang)
+                            t("m_extracted_audio_new", ulang), ulang,
+                            reply_markup=_extracted_audio_kb(
+                                title, artist, ulang, file_id=file_id,
+                                user_id=getattr(getattr(message, "from_user", None), "id", None),
+                                kind="file"),
+                            caption_key="m_extracted_audio_new")
                     except Exception:
                         _sent_copy = None
             if _sent_copy is not None:
                 return
         # 2) No full file: the user's own media as a labelled replacement (if any).
-        # Kept button-free and minimal; the 🔎 second search belongs to the
-        # not-identified flows (media/link not-found), where it is offered.
+        # Video: the clip's own extracted audio with the new caption +
+        # Google/retry buttons (confirmed name, no file — the card
+        # stays). Other kinds go back as-is with the old identified-clip
+        # caption (nothing was extracted from them) and no buttons.
         if own_media is not None and not _verify_failed:
             kind, file_id = own_media
-            cap = t("m_identified_clip_audio", ulang)
+            cap = (t("m_extracted_audio_new", ulang) if kind == "video"
+                   else t("m_identified_clip_audio", ulang))
+            _ex_kb = (_extracted_audio_kb(
+                title, artist, ulang, file_id=file_id,
+                user_id=getattr(getattr(message, "from_user", None), "id", None),
+                kind="file") if kind == "video" else None)
             try:
                 if kind == "video":
                     # The caption promises an audio file, so one must really
@@ -3460,7 +3895,9 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     except Exception:
                         data = None
                     sent = await _extract_and_send_clip_audio(
-                        message, conn, data or b"", caption=cap)
+                        message, conn, data or b"", caption=cap,
+                        reply_markup=_ex_kb,
+                        caption_key="m_extracted_audio_new")
                     if sent is None:
                         sent = await send_video(
                             message, file_id,
@@ -4655,65 +5092,34 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
     media_kind = ("video" if message.video is not None
                   else "voice" if message.voice is not None
                   else "audio" if message.audio is not None else "document")
-    if result.status == "not_found":
-        # Audio-content fallback BEFORE the honest "not found" return:
-        # 1) match against files the bot has actually seen (e.g. a
-        #    forwarded channel audio file) by chunk content — this is
-        #    the only channel-file matching that does not require
-        #    scraping private channels. A match is labelled as a
-        #    channel/file match, never as a catalog identification.
-        # 2) otherwise index this file so a later identical/shortened
-        #    upload can match it. Indexing never invents a title.
-        matched = find_audio_match(dbmod.list_audio_index(conn), data)
-        if matched is not None:
-            label = matched.get("title") or matched.get("caption") or ""
-            ch = matched.get("channel") or ""
-            post = matched.get("post_url") or ""
-            await _answer(message, conn,
-                          f"{t('audio_index_match', ulang)}\n{label}"
-                          + (t("h_channel_suffix", ulang).format(ch=ch) if ch else "")
-                          + (f"\n{post}" if post else ""))
-        else:
-            dbmod.index_audio_file(
-                conn, audio_fingerprint(data), title=caption, artist="",
-                channel=_forward_channel(message), caption=caption)
-        # Arm the second search on this same audio sample.
-        _tok = await _arm_bank_sample(conn, config, "file",
-                                      __import__("hashlib").sha256(data).hexdigest(),
-                                      data, "", caption)
-        _rows: list = []
-        _bb = _bank_button(_tok, ulang)
-        if _bb:
-            _rows.extend(_bb.inline_keyboard)
-        if message.video is not None:
-            # One-click retry on this same video: no re-send needed.
-            _rows.extend(_video_identify_kb(
-                message.from_user.id, message.video.file_id,
-                "file", lang=ulang).inline_keyboard)
-        elif message.audio is not None or message.voice is not None:
-            # Same-file retry for audio/voice: the registry resolves the
-            # Telegram file_id server-side, so the user never re-sends.
-            _media = message.audio or message.voice
-            _rows.extend(_video_identify_kb(
-                message.from_user.id, _media.file_id, "audio",
-                label=t("m_retry", ulang)).inline_keyboard)
-        await _answer(message, conn, t("audio_not_found", ulang),
-                      reply_markup=InlineKeyboardMarkup(inline_keyboard=_rows) if _rows else None)
-        # Fallback: the user's own audio, labelled honestly (never
-        # claimed identified). A video's audio is extracted to a real,
-        # validated MP3 — the user already has the video; the value is a
-        # playable audio file. Audio files are already audio and go back
-        # as-is. No speculation about the song (no AI-made guess): the
-        # not-found line above already says it plainly.
-        try:
-            if message.video is not None:
-                await _extract_and_send_clip_audio(message, conn, data)
-            elif message.audio is not None:
-                sent = await send_song_audio(message, media.file_id, "", "")
-                if sent is not None:
-                    _track(conn, message, sent)
-        except Exception:
-            pass
+    if result.status in ("unconfirmed", "not_found"):
+        # NOT confirmed (single source, disagreement, or no match):
+        # NO «شناسایی شد» card — ONLY the clip's own audio (video) or
+        # the file itself back (audio) with the new caption + Google /
+        # retry buttons. The audio-index match/index bookkeeping stays
+        # invisible (it never invents a title); its match text is
+        # dropped — the identification answer is only the extracted
+        # audio. The caption search still answers the caption text.
+        if result.status == "not_found":
+            matched = find_audio_match(dbmod.list_audio_index(conn), data)
+            if matched is None:
+                dbmod.index_audio_file(
+                    conn, audio_fingerprint(data), title=caption, artist="",
+                    channel=_forward_channel(message), caption=caption)
+        sent = await _send_unconfirmed_media(
+            message, conn, data, result.title, result.artist, ulang,
+            media_kind=media_kind,
+            file_id=media.file_id if media is not None else None,
+            user_id=message.from_user.id)
+        if sent is None:
+            # Extraction impossible: the honest line, with the same
+            # Google/retry buttons (no bank button).
+            _kb = _extracted_audio_kb(
+                result.title, result.artist, ulang,
+                file_id=media.file_id if media is not None else None,
+                user_id=message.from_user.id, kind="audio")
+            await _answer(message, conn, t("audio_not_found", ulang),
+                          reply_markup=_kb)
         if caption:
             await _do_search(message, conn, sanitize_text(caption, 300), config=config)
         return
@@ -4727,13 +5133,19 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             _err_kb = _video_identify_kb(
                 message.from_user.id, _media.file_id, "audio",
                 label=t("m_retry", ulang))
-        if getattr(result, "detail", "") == "lookup_error" \
-                and message.video is not None:
-            # Decodable, audible bytes — only the lookup service failed.
-            # The extract fallback still applies before the honest error
-            # line (never skipped just because no full-version MP3
-            # exists in the sources).
-            await _extract_and_send_clip_audio(message, conn, data)
+        if getattr(result, "detail", "") == "lookup_error":
+            # Unconfirmed (lookup failed): the extracted audio + new
+            # caption + buttons, no error text — the name was not
+            # confirmed, so there is no contradiction to state.
+            # Extraction impossible falls through to the honest error
+            # line below.
+            sent = await _send_unconfirmed_media(
+                message, conn, data, result.title, result.artist, ulang,
+                media_kind=media_kind,
+                file_id=media.file_id if media is not None else None,
+                user_id=message.from_user.id)
+            if sent is not None:
+                return
         # Distinct honest cause for video inputs (user order 2026-11-07):
         # the generic "audio_error" line must never hide the real cause.
         # The m_* keys word the cause for a video; audio/voice inputs
@@ -4748,14 +5160,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             }.get(getattr(result, "detail", ""), _err_msg)
         await _answer(message, conn, _err_msg, reply_markup=_err_kb)
         return
-    _tok = await _arm_bank_sample(conn, config, "file",
-                                  __import__("hashlib").sha256(data).hexdigest(),
-                                  data, "", caption)
+    # Bank sample is armed AFTER the card, inside _send_identified_song.
     await _send_identified_song(
         message, conn, result.title, result.artist, config,
         bot_id=dbmod.get_bot_id(conn, config),
-        bank_tok=_tok,
-        own_media=(media_kind, media.file_id))
+        own_media=(media_kind, media.file_id),
+        arm=("file", __import__("hashlib").sha256(data).hexdigest(),
+             data, "", caption))
 
 
 
@@ -4908,7 +5319,7 @@ async def suggest_get(callback, conn: sqlite3.Connection, config: Config):
         await _send_professional_song_card(
             callback.message, conn, res["title"], res.get("artist", ""),
             bot_id=dbmod.get_bot_id(conn, config),
-            config=config)
+            config=config, exclusive_check=False)
     except Exception:
         await callback.message.answer(
             t("m_suggest_send_fail", ulang))
@@ -5101,28 +5512,40 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                 _verify_failed = True
         if full and full.get("data"):
             try:
+                # CONFIRM FIX (2026-11-09): the file replaces the card
+                # it was requested from — one final message with the
+                # card text as caption + the card's buttons, then the
+                # card is deleted. (No button creates dl:full callbacks
+                # today, so this path is unreachable in production; the
+                # replacement is implemented for consistency.)
+                _key = callback.data[8:]
+                _is_fav = profeat.is_favorite(conn, callback.from_user.id,
+                                              title, artist)
+                _dl_kb = InlineKeyboardMarkup(inline_keyboard=
+                    profeat.build_song_card_buttons(_key, _is_fav))
                 sent = await callback.message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     title=title, performer=artist,
                     duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
-                    caption=t("h_song_full_caption", ulang).format(
-                        label=_fullsong_duration_label(
-                            full.get("duration_sec") or 0, ulang),
-                        title=title, artist=artist))
+                    caption=_final_audio_caption(
+                        title, artist, ulang,
+                        duration_sec=full.get("duration_sec") or 0),
+                    reply_markup=_dl_kb)
                 if sent is not None:
                     try:
                         adminfeat.track(conn, callback.from_user.id,
                                         callback.message.chat.id, sent.message_id)
                     except Exception:
                         pass
+                    await _delete_card(callback.message)
                 return
             except Exception:
                 pass
         # IDENTITY CHECK FAILED: the candidate file was not the
         # identified song. Send the clip's ORIGINAL audio (stream copy)
-        # with the corporate text — never the wrong file, never a
-        # re-encode labelled as the song. If the clip is unavailable,
-        # fall through to the honest no-full message below.
+        # with the new caption + Google/retry buttons — never the wrong
+        # file, never a re-encode labelled as the song. If the clip is
+        # unavailable, fall through to the honest no-full message below.
         if _verify_failed:
             own_media = result.get("own_media")
             if own_media:
@@ -5135,8 +5558,12 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                         await bot.download_file(tg_file.file_path, buf)
                         sent = await _extract_and_send_clip_audio_copy(
                             callback.message, conn, buf.getvalue(),
-                            t("m_clip_audio_unverified", ulang), ulang,
-                            track_user_id=callback.from_user.id)
+                            t("m_extracted_audio_new", ulang), ulang,
+                            track_user_id=callback.from_user.id,
+                            reply_markup=_extracted_audio_kb(
+                                title, artist, ulang, file_id=file_id,
+                                user_id=callback.from_user.id, kind="file"),
+                            caption_key="m_extracted_audio_new")
                         if sent is not None:
                             return
                     except Exception:
@@ -5171,13 +5598,34 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                         if _os.path.exists(apath) and _os.path.getsize(apath) > 0:
                             with open(apath, "rb") as af:
                                 audio_bytes = af.read()
+                            # Extracted audio: Avano's title + performer,
+                            # real probed duration, new caption + buttons.
+                            _ex_kb = _extracted_audio_kb(
+                                title, artist, ulang, file_id=file_id,
+                                user_id=callback.from_user.id, kind="file")
+                            _ex_dur = 0.0
+                            try:
+                                from ..search.fullsong_verify import probe_file_identity as _pfi
+                                _ex_dur = _pfi(audio_bytes, "m4a")[2]
+                            except Exception:
+                                _ex_dur = 0.0
                             sent = await callback.message.answer_audio(
                                 BufferedInputFile(audio_bytes,
                                                   filename=f"{title}.m4a"),
-                                title=title, performer=artist,
-                                caption=t("m_extracted_audio_caption", ulang).format(
-                                    title=title, artist=artist))
+                                title=t("m_extracted_audio_title", ulang),
+                                performer="Avano",
+                                duration=int(_ex_dur) if _ex_dur > 0 else None,
+                                caption=t("m_extracted_audio_new", ulang),
+                                reply_markup=_ex_kb)
                             if sent is not None:
+                                try:
+                                    log_event(log, "extract",
+                                              stage="sent_extracted_audio",
+                                              bytes=len(audio_bytes),
+                                              caption_key="m_extracted_audio_new",
+                                              buttons=_keyboard_button_texts(_ex_kb))
+                                except Exception:
+                                    pass
                                 try:
                                     adminfeat.track(conn, callback.from_user.id,
                                                     callback.message.chat.id,

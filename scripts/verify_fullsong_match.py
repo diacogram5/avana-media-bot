@@ -65,7 +65,7 @@ RESULTS = vs.RESULTS
 LOG_LINES = vs.LOG_LINES
 adapters_mod = vs.adapters_mod
 
-_CORPORATE_FA = t("m_clip_audio_unverified", "fa")
+_NEW_FA = t("m_extracted_audio_new", "fa")
 _STATIC_FA = t("m_full_duration_long", "fa")
 _EXTRACTED_TITLE_FA = t("m_extracted_audio_title", "fa")
 
@@ -163,11 +163,13 @@ def _full_dict(data, source, url=None, size=None, duration_sec=0.0):
     return d
 
 
-# The EXACT corporate text from the user order (2026-11-09 00:12),
-# typed here independently of i18n.py so the test proves byte equality.
-_CORPORATE_EXACT = ("آهنگ این ویدیو با اطمینان کافی شناسایی نشد. "
-                    "صدای اصلی همین کلیپ را برایتان ارسال کردیم. "
-                    "اگر نام آهنگ یا خواننده را می‌دانید، بنویسید تا جستجو کنیم.")
+# The EXACT new extracted-audio caption from the user order
+# (2026-11-09 01:17), typed here independently of i18n.py so the test
+# proves byte equality. (The 00:12 corporate text is superseded.)
+_NEW_EXACT = ("🎵 نسخه رسمی این آهنگ در منابع موسیقی پیدا نشد؛ اما آوانو "
+              "صدای آن را مستقیماً از همین کلیپ استخراج کرده تا چیزی از "
+              "دست ندهید. 💜\n\n🎧 صدای کلیپ، آماده شنیدن!\n\n"
+              "AVANO AI | همیشه یک راه برای شنیدن موسیقی هست!")
 
 
 class _FakeCallback:
@@ -313,8 +315,8 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F2b clip audio carries the exact corporate text",
-              cap == _CORPORATE_FA, f"caption={cap!r}")
+        check("F2b clip audio carries the new caption",
+              cap == _NEW_FA, f"caption={cap!r}")
         check("F2b clip audio is titled as extracted audio",
               (msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else "")
               == _EXTRACTED_TITLE_FA)
@@ -364,8 +366,8 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F2d clip audio carries the exact corporate text",
-              cap == _CORPORATE_FA, f"caption={cap!r}")
+        check("F2d clip audio carries the new caption",
+              cap == _NEW_FA, f"caption={cap!r}")
         check("F2d mismatch is logged", vs._log_has("fullsong_mismatch"))
         check("F2d no full-song caption anywhere",
               not any("نسخه کامل آهنگ پیدا" in
@@ -390,8 +392,8 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F3 clip audio carries the exact corporate text",
-              cap == _CORPORATE_FA, f"caption={cap!r}")
+        check("F3 clip audio carries the new caption",
+              cap == _NEW_FA, f"caption={cap!r}")
         title_kw = msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else ""
         check("F3 clip audio is titled as extracted audio",
               title_kw == _EXTRACTED_TITLE_FA, f"title={title_kw!r}")
@@ -574,10 +576,10 @@ async def main():
     # ---- F6g: cache-hit mismatch still falls back to the original audio --
     # The cached file is poisoned, the fresh lookup finds nothing: the
     # user still gets the clip's own audio (the honest own-media path),
-    # never the wrong cached file. The identification itself stands
-    # (Shazam identified it) so this path keeps the "identified"
-    # caption; the corporate text is reserved for a candidate file
-    # whose own tags actually fail (F2b/F2d).
+    # never the wrong cached file. The identification itself stands,
+    # but the confirmed-name-but-no-file path now carries the NEW
+    # extracted-audio caption (user order 2026-11-09 01:24 — the old
+    # identified-clip caption is superseded for this path too).
     try:
         LOG_LINES.clear()
         msg = _Msg()
@@ -593,8 +595,8 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F6g original audio keeps the honest identified caption",
-              cap.startswith(t("m_identified_clip_audio", "fa")),
+        check("F6g original audio carries the new caption",
+              cap == _NEW_FA,
               f"caption={cap!r}")
         check("F6g cache mismatch is logged",
               vs._log_has("fullsong_cache_mismatch"))
@@ -669,9 +671,9 @@ async def main():
               and "exclusive_bank" not in _vsrc)
         check("F9 verify module reads tags with ffprobe only",
               "ffprobe" in _vsrc and "ffmpeg" not in _vsrc)
-        check("F9 corporate fa text is byte-identical to the user order",
-              t("m_clip_audio_unverified", "fa") == _CORPORATE_EXACT,
-              f"i18n={t('m_clip_audio_unverified', 'fa')!r}")
+        check("F9 new-caption fa text is byte-identical to the user order",
+              t("m_extracted_audio_new", "fa") == _NEW_EXACT,
+              f"i18n={t('m_extracted_audio_new', 'fa')!r}")
         _hsrc = _Path(vs.ROOT, "app", "bot", "handlers.py").read_text()
         check("F9 clip-copy helper uses stream copy, never re-encode",
               '"-c:a", "copy"' in _hsrc)

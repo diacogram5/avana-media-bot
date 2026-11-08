@@ -115,6 +115,21 @@ _xb_conn = None
 _xb_ok = None
 _tables_ready_for: set = set()
 
+# In-memory bank list cache (identify-fix 2026-11-09): the identify hot
+# path reads the whole bank (all fingerprints as TEXT) on EVERY tap
+# (~0.86 s per Turso query). The bank changes only via the admin
+# mutations below, so the parsed list is cached for the process lifetime
+# and invalidated ONLY by those mutations. The cache holds the full
+# (active_only=False) list; active-only readers filter in Python.
+# Fail open: a failed fetch never populates the cache, and callers that
+# need fresh data (admin panel, audit, duplicate check) bypass it.
+_LIST_CACHE: list | None = None
+
+
+def _invalidate_list_cache() -> None:
+    global _LIST_CACHE
+    _LIST_CACHE = None
+
 
 def _get_conn():
     """Turso connection for the exclusive bank. None when unavailable."""
@@ -530,8 +545,8 @@ def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
 
-def list_songs(conn, active_only: bool = False,
-               req_id: str | None = None):
+def _list_songs_uncached(conn, active_only: bool = False,
+                         req_id: str | None = None):
     _init_tables(conn)
     q = f"SELECT {', '.join(_COLS)} FROM exclusive_songs"
     if active_only:
@@ -548,6 +563,22 @@ def list_songs(conn, active_only: bool = False,
     return [_row_to_dict(r, _COLS) for r in rows]
 
 
+def list_songs(conn, active_only: bool = False,
+               req_id: str | None = None, use_cache: bool = False):
+    """Full bank list. use_cache=True serves the identify hot path from
+    the process-lifetime in-memory list (invalidated by admin
+    mutations); default False keeps every other caller on a fresh Turso
+    read, exactly as before."""
+    global _LIST_CACHE
+    if not use_cache:
+        return _list_songs_uncached(conn, active_only=active_only, req_id=req_id)
+    if _LIST_CACHE is None:
+        _LIST_CACHE = _list_songs_uncached(conn, active_only=False, req_id=req_id)
+    if active_only:
+        return [s for s in _LIST_CACHE if s.get("active")]
+    return list(_LIST_CACHE)
+
+
 def get_song(conn, song_id: int):
     _init_tables(conn)
     row = conn.execute(
@@ -559,7 +590,7 @@ def get_song(conn, song_id: int):
 def find_by_title_artist(conn, title: str, artist: str):
     """Exact (case-insensitive) title+artist lookup, active songs only."""
     _init_tables(conn)
-    for song in list_songs(conn, active_only=True):
+    for song in list_songs(conn, active_only=True, use_cache=True):
         if _norm(song["title"]) == _norm(title) and _norm(song["artist"]) == _norm(artist):
             return song
     return None
@@ -619,6 +650,7 @@ def add_song(conn, *, title, artist, file_id, file_unique_id, duration_sec,
          fingerprint, fp_duration, 1 if fp_partial else 0,
          cover_file_id or "", description or "", added_by, now))
     conn.commit()
+    _invalidate_list_cache()
     try:
         return cur.lastrowid
     except Exception:
@@ -642,6 +674,7 @@ def update_song(conn, song_id: int, **fields):
     conn.execute(
         f"UPDATE exclusive_songs SET {', '.join(sets)} WHERE id = ?", tuple(vals))
     conn.commit()
+    _invalidate_list_cache()
 
 
 def set_active(conn, song_id: int, active: bool) -> None:
@@ -652,6 +685,7 @@ def delete_song(conn, song_id: int) -> None:
     _init_tables(conn)
     conn.execute("DELETE FROM exclusive_songs WHERE id = ?", (song_id,))
     conn.commit()
+    _invalidate_list_cache()
 
 
 def inc_identify(conn, song_id: int, req_id: str | None = None) -> None:
@@ -685,7 +719,7 @@ def match_sample(conn, query_items, req_id: str | None = None):
     activity is provable from the Render logs.
     """
     try:
-        songs = list_songs(conn, active_only=True, req_id=req_id)
+        songs = list_songs(conn, active_only=True, req_id=req_id, use_cache=True)
     except Exception as e:
         _log.warning("exclusive_bank: match_sample list failed: %s", e)
         return None, 0.0
@@ -791,6 +825,7 @@ def update_song_fingerprint(conn, song_id, fp_items, fp_duration, fp_partial=Fal
                      "fp_partial=? WHERE id=?",
                      (fp_items, fp_duration, 1 if fp_partial else 0, song_id))
         conn.commit()
+        _invalidate_list_cache()
         return True
     except Exception as e:
         _log.warning("exclusive_bank: update_song_fingerprint failed: %s", e)

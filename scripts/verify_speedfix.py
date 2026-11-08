@@ -100,6 +100,10 @@ class _Button:
     def __init__(self, text, callback_data=None, **kw):
         self.text = text
         self.callback_data = callback_data
+        # Real aiogram stores the URL too (confirm fix 2026-11-09: the
+        # Google-search button is a URL button); keep it so tests can
+        # read it back.
+        self.url = kw.get("url")
 
 
 class _Markup:
