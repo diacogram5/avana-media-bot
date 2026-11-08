@@ -2933,6 +2933,91 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     return
 
 
+def _fullsong_duration_label(dur, ulang):
+    """Real-duration label for a full-song caption.
+
+    " — مدت: m:ss" when the duration is known, else "" — the static
+    "full: over 90 seconds" label is never shown, because it was wrong
+    for files whose real length was unknown (the 23:54 file was 3:29
+    but the label only claimed "over 90 seconds").
+    """
+    try:
+        dur = float(dur or 0)
+    except Exception:
+        dur = 0
+    if dur <= 0:
+        return ""
+    return t("h_song_dur", ulang).format(dur=f"{int(dur // 60)}:{int(dur % 60):02d}")
+
+
+async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
+                                            caption: str, ulang,
+                                            track_user_id=None):
+    """Send the clip's ORIGINAL audio: stream copy, no re-encode.
+
+    Used when a full-song candidate failed the identity check — the
+    user gets the clip's own audio instead of a wrong song. Returns
+    the sent message or None. Never raises. track_user_id overrides
+    the message sender for the clear-chat record (the download-full
+    flow calls this on the bot's own card message, whose from_user
+    is the bot, not the user).
+    """
+    if not data:
+        return None
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="avano-clipcopy-")
+        vpath = os.path.join(tmpdir, "clip.mp4")
+        with open(vpath, "wb") as f:
+            f.write(data)
+        probe = await asyncio.to_thread(
+            subprocess.run,
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", vpath],
+            capture_output=True, text=True, timeout=30)
+        _probe_out = (probe.stdout or "").strip()
+        codec = _probe_out.splitlines()[0].strip() if _probe_out else ""
+        ext = {"aac": "m4a", "mp3": "mp3", "opus": "opus",
+               "vorbis": "ogg", "flac": "flac"}.get(codec, "m4a")
+        apath = os.path.join(tmpdir, f"clip.{ext}")
+        res = await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-v", "error", "-i", vpath, "-vn",
+             "-c:a", "copy", apath],
+            capture_output=True, text=True, timeout=120)
+        if res.returncode != 0 or not os.path.exists(apath) or os.path.getsize(apath) == 0:
+            return None
+        with open(apath, "rb") as f:
+            adata = f.read()
+        sent = await message.answer_audio(
+            BufferedInputFile(adata, filename=f"clip.{ext}"),
+            caption=caption,
+            title=t("m_extracted_audio_title", ulang),
+            performer="")
+        if sent is not None:
+            try:
+                if track_user_id is not None:
+                    adminfeat.track(conn, track_user_id, message.chat.id,
+                                    sent.message_id)
+                else:
+                    _track(conn, message, sent)
+            except Exception:
+                pass
+        return sent
+    except Exception:
+        return None
+    finally:
+        if tmpdir:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang):
     """Background full-version delivery for an identified song.
@@ -2966,77 +3051,128 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
         import time as _time
         _t_start = _time.time()
         _cache_hit = False
+        # IDENTITY GUARD (2026-11-09 mismatch fix): a cached file_id is
+        # only trusted when the file's OWN verified title/artist (ID3
+        # tags, probed at send time) match the identify result. A legacy
+        # row without verified identity is never sent — the 23:54 wrong
+        # file is already cached under the right key.
         try:
-            from .file_cache import get_cached_file_id, store_file_id
-            _cached_fid = get_cached_file_id(conn, artist, title)
-            if _cached_fid:
-                _cache_hit = True
-                try:
-                    sent = await message.answer_audio(
-                        _cached_fid,
-                        caption=t("h_song_full_caption", ulang).format(
-                            label=t("m_full_duration_long", ulang),
-                            title=title, artist=artist),
-                        title=title, performer=artist,
-                        reply_markup=kb)
-                    if sent is not None:
-                        _track(conn, message, sent)
-                        _t_ms = int((_time.time() - _t_start) * 1000)
-                        log_event(log, "fullsong", stage="sent_cached",
-                                  title=title[:40], ms=_t_ms)
-                        # Speed measurement (Requirement #7)
+            from .file_cache import get_cached_song, store_file_id, invalidate_file
+            from ..search.fullsong_verify import file_identity_matches
+            _cached = get_cached_song(conn, artist, title)
+            if _cached:
+                _vt, _va = _cached.get("verified_title"), _cached.get("verified_artist")
+                if _vt and file_identity_matches(title, artist, _vt, _va or ""):
+                    _cache_hit = True
+                    try:
+                        sent = await message.answer_audio(
+                            _cached["file_id"],
+                            caption=t("h_song_full_caption", ulang).format(
+                                label=_fullsong_duration_label(
+                                    _cached.get("duration_sec") or 0, ulang),
+                                title=title, artist=artist),
+                            title=title, performer=artist,
+                            reply_markup=kb)
+                        if sent is not None:
+                            _track(conn, message, sent)
+                            _t_ms = int((_time.time() - _t_start) * 1000)
+                            log_event(log, "fullsong", stage="sent_cached",
+                                      title=title[:40], ms=_t_ms)
+                            # Speed measurement (Requirement #7)
+                            try:
+                                conn.execute(
+                                    "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
+                                    ("send", _t_ms, int(_time.time())))
+                                conn.commit()
+                            except:
+                                pass
+                            return
+                    except Exception:
+                        # Cached file_id invalid, fall through to normal flow
+                        # and invalidate the cache entry
                         try:
-                            conn.execute(
-                                "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
-                                ("send", _t_ms, int(_time.time())))
-                            conn.commit()
+                            invalidate_file(conn, artist, title)
                         except:
                             pass
-                        return
-                except Exception:
-                    # Cached file_id invalid, fall through to normal flow
-                    # and invalidate the cache entry
+                elif _vt:
+                    # Cached file is a DIFFERENT song: poisoned entry.
+                    log_event(log, "fullsong", stage="fullsong_cache_mismatch",
+                              title=title[:40], file_title=str(_vt)[:40],
+                              file_artist=str(_va or "")[:40])
                     try:
-                        from .file_cache import invalidate_file
                         invalidate_file(conn, artist, title)
                     except:
                         pass
+                else:
+                    # Legacy row: no verified identity stored — never trust it.
+                    log_event(log, "fullsong", stage="fullsong_cache_unverified",
+                              title=title[:40])
         except Exception:
             pass
         # 1a) PERSISTENT Turso song cache: survives Render restarts (the
         # local bot.db cache above is wiped on every restart). Same
         # file_id fast path, then refresh the local cache.
+        # IDENTITY GUARD (2026-11-09 mismatch fix): same verified
+        # re-check as the local cache — a Turso row is only sent when
+        # its stored verified identity matches; a mismatch deletes the
+        # poisoned row, a legacy row without verified identity is never
+        # sent (falls through to a fresh, verified lookup).
         try:
-            from .turso_cache import get_song_file_id as _turso_song_get
-            _turso_fid = _turso_song_get(artist, title)
-            if _turso_fid:
-                try:
-                    sent = await message.answer_audio(
-                        _turso_fid,
-                        caption=t("h_song_full_caption", ulang).format(
-                            label=t("m_full_duration_long", ulang),
-                            title=title, artist=artist),
-                        title=title, performer=artist,
-                        reply_markup=kb)
-                    if sent is not None:
-                        _track(conn, message, sent)
-                        _t_ms = int((_time.time() - _t_start) * 1000)
-                        log_event(log, "fullsong", stage="sent_cached",
-                                  title=title[:40], ms=_t_ms, turso=True)
-                        try:
-                            store_file_id(conn, artist, title, _turso_fid, "audio")
-                        except Exception:
-                            pass
-                        try:
-                            conn.execute(
-                                "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
-                                ("send", _t_ms, int(_time.time())))
-                            conn.commit()
-                        except:
-                            pass
-                        return
-                except Exception:
-                    pass
+            from .turso_cache import get_song_file as _turso_song_get
+            from .turso_cache import delete_song_file_id as _turso_song_del
+            from .file_cache import store_file_id as _store_local
+            from .file_cache import invalidate_file as _inv_local
+            from ..search.fullsong_verify import file_identity_matches as _fim
+            _turso_row = _turso_song_get(artist, title)
+            if _turso_row:
+                _vt, _va = _turso_row.get("verified_title"), _turso_row.get("verified_artist")
+                if _vt and _fim(title, artist, _vt, _va or ""):
+                    try:
+                        sent = await message.answer_audio(
+                            _turso_row["file_id"],
+                            caption=t("h_song_full_caption", ulang).format(
+                                label=_fullsong_duration_label(
+                                    _turso_row.get("duration_sec") or 0, ulang),
+                                title=title, artist=artist),
+                            title=title, performer=artist,
+                            reply_markup=kb)
+                        if sent is not None:
+                            _track(conn, message, sent)
+                            _t_ms = int((_time.time() - _t_start) * 1000)
+                            log_event(log, "fullsong", stage="sent_cached",
+                                      title=title[:40], ms=_t_ms, turso=True)
+                            try:
+                                _store_local(conn, artist, title, _turso_row["file_id"],
+                                             "audio", 0,
+                                             _turso_row.get("duration_sec") or 0, "",
+                                             verified_title=_vt, verified_artist=_va)
+                            except Exception:
+                                pass
+                            try:
+                                conn.execute(
+                                    "INSERT INTO speed_metrics (operation, cache_hit, duration_ms, created_at) VALUES (?, 1, ?, ?)",
+                                    ("send", _t_ms, int(_time.time())))
+                                conn.commit()
+                            except:
+                                pass
+                            return
+                    except Exception:
+                        pass
+                elif _vt:
+                    log_event(log, "fullsong", stage="fullsong_cache_mismatch",
+                              title=title[:40], file_title=str(_vt)[:40],
+                              file_artist=str(_va or "")[:40], turso=True)
+                    try:
+                        _turso_song_del(artist, title)
+                    except Exception:
+                        pass
+                    try:
+                        _inv_local(conn, artist, title)
+                    except Exception:
+                        pass
+                else:
+                    log_event(log, "fullsong", stage="fullsong_cache_unverified",
+                              title=title[:40], turso=True)
         except Exception:
             pass
         # Background delivery: the result card was already sent —
@@ -3047,10 +3183,52 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             _wait_msg = None
         from ..search.adapters import find_full_song_file_v2
         full = None
+        _verify_failed = False
+        _verified = None
         try:
             full = await find_full_song_file_v2(artist, title)
         except Exception:
             full = None
+        if full:
+            # IDENTITY GUARD (2026-11-09 mismatch fix): the file's OWN
+            # tags (ffprobe on the downloaded bytes) must match the
+            # identify result. A page label is NOT proof — the 23:54
+            # site labelled the file "ATM" while the audio inside was
+            # another song. On mismatch/unverifiable the file is never
+            # sent; both caches are invalidated for this key and the
+            # corporate clip-audio fallback runs below.
+            try:
+                from ..search.fullsong_verify import verify_fullsong_file
+                _v = await asyncio.to_thread(
+                    verify_fullsong_file, full.get("data") or b"",
+                    full.get("ext") or "mp3", title, artist)
+            except Exception:
+                _v = {"status": "unverifiable", "file_title": "",
+                      "file_artist": "", "duration_sec": 0,
+                      "detail": "verify_error"}
+            if _v["status"] == "match":
+                if _v["duration_sec"] > 0:
+                    full["duration_sec"] = _v["duration_sec"]
+                _verified = (_v["file_title"], _v["file_artist"])
+            else:
+                log_event(log, "fullsong",
+                          stage="fullsong_mismatch" if _v["status"] == "mismatch"
+                          else "fullsong_unverifiable",
+                          title=title[:40], source=full.get("source", "")[:40],
+                          file_title=_v["file_title"][:40],
+                          file_artist=_v["file_artist"][:40])
+                try:
+                    from .file_cache import invalidate_file as _inv
+                    _inv(conn, artist, title)
+                except Exception:
+                    pass
+                try:
+                    from .turso_cache import delete_song_file_id as _turso_del
+                    _turso_del(artist, title)
+                except Exception:
+                    pass
+                full = None
+                _verify_failed = True
         if full:
             try:
                 # Direct-URL send: when the adapter knows a public URL and
@@ -3064,7 +3242,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         sent = await message.answer_audio(
                             _full_url,
                             caption=t("h_song_full_caption", ulang).format(
-                                label=t("m_full_duration_long", ulang),
+                                label=_fullsong_duration_label(
+                                    full["duration_sec"], ulang),
                                 title=title, artist=artist),
                             title=title, performer=artist,
                             duration=int(full["duration_sec"]),
@@ -3078,12 +3257,18 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             try:
                                 _fid = sent.audio.file_id if sent.audio else None
                                 if _fid:
+                                    _vt, _va = _verified if _verified else (None, None)
                                     store_file_id(conn, artist, title, _fid, "audio",
                                                   _full_size, full["duration_sec"],
-                                                  full.get("source", ""))
+                                                  full.get("source", ""),
+                                                  verified_title=_vt,
+                                                  verified_artist=_va)
                                     try:
                                         from .turso_cache import store_song_file_id as _turso_song_store
-                                        _turso_song_store(artist, title, _fid, "audio")
+                                        _turso_song_store(artist, title, _fid, "audio",
+                                                          verified_title=_vt,
+                                                          verified_artist=_va,
+                                                          duration_sec=full["duration_sec"])
                                     except Exception:
                                         pass
                             except Exception:
@@ -3097,7 +3282,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                 sent = await message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     caption=t("h_song_full_caption", ulang).format(
-                        label=t("m_full_duration_long", ulang),
+                        label=_fullsong_duration_label(full["duration_sec"], ulang),
                         title=title, artist=artist),
                     title=title, performer=artist,
                     duration=int(full["duration_sec"]),
@@ -3108,17 +3293,25 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                               title=title[:40], bytes=len(full["data"]))
                     # Requirement #3: Store the Telegram file_id for future reuse.
                     # This avoids re-downloading and re-uploading the same file.
+                    # The file's VERIFIED identity is stored with it, so a
+                    # later cache hit can be re-checked before send.
                     try:
                         _fid = None
                         if sent.audio:
                             _fid = sent.audio.file_id
                         if _fid:
+                            _vt, _va = _verified if _verified else (None, None)
                             store_file_id(conn, artist, title, _fid, "audio",
                                           len(full["data"]), full["duration_sec"],
-                                          full.get("source", ""))
+                                          full.get("source", ""),
+                                          verified_title=_vt,
+                                          verified_artist=_va)
                             try:
                                 from .turso_cache import store_song_file_id as _turso_song_store
-                                _turso_song_store(artist, title, _fid, "audio")
+                                _turso_song_store(artist, title, _fid, "audio",
+                                                  verified_title=_vt,
+                                                  verified_artist=_va,
+                                                  duration_sec=full["duration_sec"])
                             except Exception:
                                 pass
                         # Speed measurement (Requirement #7): cache miss
@@ -3150,7 +3343,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     sent = await message.answer_audio(
                         hit["file_id"],
                         caption=t("h_song_full_caption", ulang).format(
-                            label=t("m_full_duration_long", ulang),
+                            label="",
                             title=title, artist=artist),
                         reply_markup=kb)
                     if sent is not None:
@@ -3163,8 +3356,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                 pass
         if full:
             dur = full["duration_sec"]
-            label = (t("h_song_dur", ulang).format(dur=f"{int(dur // 60)}:{int(dur % 60):02d}") if dur < 90
-                     else t("m_full_duration_long", ulang))
+            label = _fullsong_duration_label(dur, ulang)
             # Real MP3 delivery via the unified pipeline: genuine conversion
             # when needed, honest probed bitrate, proper AUDIO message.
             # Telegram's Bot API upload limit is 50 MB.
@@ -3178,10 +3370,32 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             if sent is not None:
                 _track(conn, message, sent)
                 return
+        # 1c) IDENTITY CHECK FAILED: the fresh lookup's file was not the
+        # identified song (or could not be verified). The wrong file is
+        # never sent. The user gets the clip's ORIGINAL audio (stream
+        # copy, no re-encode) with the corporate text; only when the
+        # clip itself is unavailable does the honest no-full message
+        # below run.
+        if _verify_failed:
+            _sent_copy = None
+            if own_media is not None:
+                kind, file_id = own_media
+                if kind == "video":
+                    try:
+                        tg_file = await message.bot.get_file(file_id)
+                        buf = io.BytesIO()
+                        await message.bot.download_file(tg_file.file_path, buf)
+                        _sent_copy = await _extract_and_send_clip_audio_copy(
+                            message, conn, buf.getvalue(),
+                            t("m_clip_audio_unverified", ulang), ulang)
+                    except Exception:
+                        _sent_copy = None
+            if _sent_copy is not None:
+                return
         # 2) No full file: the user's own media as a labelled replacement (if any).
         # Kept button-free and minimal; the 🔎 second search belongs to the
         # not-identified flows (media/link not-found), where it is offered.
-        if own_media is not None:
+        if own_media is not None and not _verify_failed:
             kind, file_id = own_media
             cap = t("m_identified_clip_audio", ulang)
             try:
@@ -4808,11 +5022,38 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
     honest no-full message. Fire-and-forget: never raises."""
     ulang = _user_lang(conn, getattr(getattr(callback, "from_user", None), "id", None))
     try:
+        _verify_failed = False
         try:
             from ..search.adapters import find_full_song_file_v2
             full = await find_full_song_file_v2(artist, title)
         except Exception:
             full = None
+        if full and full.get("data"):
+            # IDENTITY GUARD (2026-11-09 mismatch fix): same rule as
+            # _deliver_fullsong_bg — the file's own tags must match the
+            # identify result; a mismatched/unverifiable file is never
+            # sent and the corporate clip-audio fallback runs instead.
+            try:
+                from ..search.fullsong_verify import verify_fullsong_file
+                _v = await asyncio.to_thread(
+                    verify_fullsong_file, full["data"], full.get("ext") or "mp3",
+                    title, artist)
+            except Exception:
+                _v = {"status": "unverifiable", "file_title": "",
+                      "file_artist": "", "duration_sec": 0,
+                      "detail": "verify_error"}
+            if _v["status"] == "match":
+                if _v["duration_sec"] > 0:
+                    full["duration_sec"] = _v["duration_sec"]
+            else:
+                log_event(log, "fullsong",
+                          stage="fullsong_mismatch" if _v["status"] == "mismatch"
+                          else "fullsong_unverifiable",
+                          title=title[:40], source=full.get("source", "")[:40],
+                          file_title=_v["file_title"][:40],
+                          file_artist=_v["file_artist"][:40])
+                full = None
+                _verify_failed = True
         if full and full.get("data"):
             try:
                 sent = await callback.message.answer_audio(
@@ -4820,7 +5061,9 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                     title=title, performer=artist,
                     duration=int(full["duration_sec"]) if full.get("duration_sec") else None,
                     caption=t("h_song_full_caption", ulang).format(
-                        label=t("m_full_duration_long", ulang), title=title, artist=artist))
+                        label=_fullsong_duration_label(
+                            full.get("duration_sec") or 0, ulang),
+                        title=title, artist=artist))
                 if sent is not None:
                     try:
                         adminfeat.track(conn, callback.from_user.id,
@@ -4830,10 +5073,33 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                 return
             except Exception:
                 pass
+        # IDENTITY CHECK FAILED: the candidate file was not the
+        # identified song. Send the clip's ORIGINAL audio (stream copy)
+        # with the corporate text — never the wrong file, never a
+        # re-encode labelled as the song. If the clip is unavailable,
+        # fall through to the honest no-full message below.
+        if _verify_failed:
+            own_media = result.get("own_media")
+            if own_media:
+                media_type, file_id = own_media
+                if media_type == "video":
+                    try:
+                        bot = callback.bot
+                        tg_file = await bot.get_file(file_id)
+                        buf = io.BytesIO()
+                        await bot.download_file(tg_file.file_path, buf)
+                        sent = await _extract_and_send_clip_audio_copy(
+                            callback.message, conn, buf.getvalue(),
+                            t("m_clip_audio_unverified", ulang), ulang,
+                            track_user_id=callback.from_user.id)
+                        if sent is not None:
+                            return
+                    except Exception:
+                        pass
         # Fallback: send the extracted audio from the user's own video
         # (the song itself, labelled as extracted — not a fake "full version").
         own_media = result.get("own_media")
-        if own_media:
+        if own_media and not _verify_failed:
             media_type, file_id = own_media
             try:
                 import io as _io

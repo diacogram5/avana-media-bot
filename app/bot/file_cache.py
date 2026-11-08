@@ -74,13 +74,58 @@ def get_cached_file_id(conn: sqlite3.Connection, artist: str, title: str) -> Opt
     
     return row["file_id"]
 
+def get_cached_song(conn: sqlite3.Connection, artist: str, title: str) -> Optional[dict]:
+    """Cached song row for a verified re-check before send.
+
+    Returns {"file_id", "duration_sec", "verified_title", "verified_artist"}
+    for a valid unexpired row, or None. Rows stored before migration 020
+    return None for the verified columns (legacy = unverified: the caller
+    must NOT send from such a row, it falls through to a fresh lookup).
+    """
+    key = _cache_key(artist, title)
+    now = int(time.time())
+
+    blocked = conn.execute(
+        "SELECT 1 FROM reported_content WHERE cache_key=? AND status='blocked'",
+        (key,)
+    ).fetchone()
+    if blocked:
+        return None
+
+    row = conn.execute(
+        """SELECT file_id, expires_at, is_valid, duration_sec,
+                  verified_title, verified_artist FROM file_cache
+           WHERE cache_key=? AND expires_at > ? AND is_valid = 1""",
+        (key, now)
+    ).fetchone()
+
+    if not row:
+        return None
+
+    conn.execute(
+        "UPDATE file_cache SET use_count = use_count + 1, last_used_at = ? WHERE cache_key=?",
+        (now, key)
+    )
+    conn.commit()
+
+    return {"file_id": row["file_id"],
+            "duration_sec": row["duration_sec"] or 0,
+            "verified_title": row["verified_title"],
+            "verified_artist": row["verified_artist"]}
+
 def store_file_id(conn: sqlite3.Connection, artist: str, title: str, 
                   file_id: str, file_type: str = "audio",
                   file_size: int = 0, duration_sec: float = 0,
-                  source: str = "") -> bool:
+                  source: str = "",
+                  verified_title: Optional[str] = None,
+                  verified_artist: Optional[str] = None) -> bool:
     """Store a Telegram file_id in cache.
     
     Returns True on success, False if content is blocked.
+    verified_title/verified_artist are the FILE's own identity (ID3 tags,
+    probed at send time) — stored so a later cache hit can be re-checked.
+    A re-store without them keeps any previously stored verified identity
+    (COALESCE) instead of wiping it.
     """
     key = _cache_key(artist, title)
     
@@ -98,8 +143,9 @@ def store_file_id(conn: sqlite3.Connection, artist: str, title: str,
     conn.execute(
         """INSERT INTO file_cache 
            (cache_key, file_id, file_type, title, artist, file_size, 
-            duration_sec, source, created_at, expires_at, use_count, last_used_at, is_valid)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1)
+            duration_sec, source, created_at, expires_at, use_count, last_used_at, is_valid,
+            verified_title, verified_artist)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?)
            ON CONFLICT(cache_key) DO UPDATE SET
              file_id=excluded.file_id,
              file_size=excluded.file_size,
@@ -107,9 +153,11 @@ def store_file_id(conn: sqlite3.Connection, artist: str, title: str,
              expires_at=excluded.expires_at,
              use_count=file_cache.use_count + 1,
              last_used_at=excluded.last_used_at,
+             verified_title=COALESCE(excluded.verified_title, file_cache.verified_title),
+             verified_artist=COALESCE(excluded.verified_artist, file_cache.verified_artist),
              is_valid=1""",
         (key, file_id, file_type, title, artist, file_size, 
-         duration_sec, source, now, expires, now)
+         duration_sec, source, now, expires, now, verified_title, verified_artist)
     )
     conn.commit()
     return True

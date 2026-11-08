@@ -314,6 +314,13 @@ _FA_CHAR_MAP = {
 _PACKAGING_STOPWORDS = frozenset({
     "official", "video", "music", "audio", "lyric", "lyrics", "hd", "hq",
     "4k", "clip", "song", "track", "new", "2024", "2025", "2026",
+    # Source-brand tokens found in real file ID3 tags (measured 2026-11-09:
+    # music sites stamp their brand on the file's own title/artist, e.g.
+    # "Fereshteh موزیکدل", "Omid Oghabi - Download1Music.IR"). A brand is
+    # never song identity, so it must not block a match. "mozikdl" is the
+    # skeleton of Persian "موزیکدل"; "ir" is the .IR TLD suffix.
+    "mozikdl", "musicdel", "msbmusic", "mifa", "mifamusic",
+    "download1music", "beys", "beysmusic", "radiojavan", "ir",
 })
 
 

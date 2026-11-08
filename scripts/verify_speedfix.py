@@ -305,9 +305,32 @@ _ARTIST = "Test Artist"
 _TITLE = "Test Song"
 _URL = "https://example.invalid/song.mp3"
 
+# Full-song mismatch fix (2026-11-09): _deliver_fullsong_bg now verifies
+# the file's OWN ID3 tags before any send, so fixtures must carry real
+# tags matching the wanted title/artist — fake bytes are "unverifiable"
+# and are never sent. One short tagged mp3 per (title, artist), cached.
+_TAGGED_MP3: dict[tuple[str, str], bytes] = {}
 
-def _full_dict(url=None, size=None):
-    d = {"data": b"FAKEAUDIO" * 1000, "ext": "mp3", "duration_sec": 200.0,
+
+def _tagged_mp3(title, artist):
+    key = (title, artist)
+    if key not in _TAGGED_MP3:
+        import subprocess
+        td = tempfile.mkdtemp(prefix="speedfix_mp3_")
+        path = os.path.join(td, "t.mp3")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=3",
+                        "-c:a", "libmp3lame",
+                        "-metadata", f"title={title}",
+                        "-metadata", f"artist={artist}", path],
+                       check=True, timeout=60)
+        with open(path, "rb") as f:
+            _TAGGED_MP3[key] = f.read()
+    return _TAGGED_MP3[key]
+
+
+def _full_dict(url=None, size=None, title=_TITLE, artist=_ARTIST):
+    d = {"data": _tagged_mp3(title, artist), "ext": "mp3", "duration_sec": 200.0,
          "source": "persian_music:test"}
     if url is not None:
         d["url"] = url
@@ -373,7 +396,12 @@ async def main():
     # ---- S2: Turso hit in _deliver_fullsong_bg ---------------------------
     try:
         LOG_LINES.clear()
-        turso_cache_mod.store_song_file_id(_ARTIST, _TITLE, "TURSO_HIT_ID")
+        # Verified identity: a legacy Turso row (no verified tags) is
+        # never sent from cache (full-song mismatch fix, 2026-11-09).
+        turso_cache_mod.store_song_file_id(_ARTIST, _TITLE, "TURSO_HIT_ID",
+                                           verified_title=_TITLE,
+                                           verified_artist=_ARTIST,
+                                           duration_sec=200.0)
         msg = _FakeMessage()
         conn = _make_conn()
         n = await _deliver(msg, conn, None, find_raises=True)
@@ -395,7 +423,7 @@ async def main():
         _turso_on()  # fresh module state; same fake DB file
         msg = _FakeMessage(str_mode="ok", bytes_mode="ok")
         conn = _make_conn()
-        n = await _deliver(msg, conn, _full_dict(url=_URL, size=1_000_000), title=_T3)
+        n = await _deliver(msg, conn, _full_dict(url=_URL, size=1_000_000, title=_T3), title=_T3)
         kinds = [k for k, _ in msg.audio_calls]
         check("S3 URL send attempted, bytes path never used", kinds == ["str"],
               f"kinds={kinds}")
@@ -416,7 +444,7 @@ async def main():
         LOG_LINES.clear()
         msg = _FakeMessage(str_mode="raise", bytes_mode="ok")
         conn = _make_conn()
-        n = await _deliver(msg, conn, _full_dict(url=_URL, size=1_000_000), title=_T4)
+        n = await _deliver(msg, conn, _full_dict(url=_URL, size=1_000_000, title=_T4), title=_T4)
         kinds = [k for k, _ in msg.audio_calls]
         check("S4 URL attempted first, then bytes fallback", kinds == ["str", "bytes"],
               f"kinds={kinds}")
@@ -435,7 +463,7 @@ async def main():
         LOG_LINES.clear()
         msg = _FakeMessage(str_mode="raise", bytes_mode="ok")
         conn = _make_conn()
-        n = await _deliver(msg, conn, _full_dict(url=_URL, size=25 * 1024 * 1024),
+        n = await _deliver(msg, conn, _full_dict(url=_URL, size=25 * 1024 * 1024, title=_T5),
                            title=_T5)
         kinds = [k for k, _ in msg.audio_calls]
         check("S5 oversize URL never attempted, bytes path used", kinds == ["bytes"],
