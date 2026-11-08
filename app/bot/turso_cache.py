@@ -40,6 +40,108 @@ def _url_key(url: str) -> str:
     return "url:" + hashlib.md5(_normalize_url(url).encode()).hexdigest()
 
 
+_USER_TABLES_OK = False
+
+
+def ensure_user_tables(conn) -> None:
+    """Create the user-owned tables in Turso (P1-14), idempotently.
+
+    Same columns as the local migrations (001/003/016): users (incl.
+    blocked), user_language, playlists (+ playlist_items), favorites,
+    settings, features, ads. Called once per process from startup
+    (run_bot) — never from a user path, so the DDL cost is never in
+    anyone's waiting time. Safe to call again (CREATE TABLE IF NOT
+    EXISTS). Raises on failure so callers can decide to fail open.
+    """
+    global _USER_TABLES_OK
+    if _USER_TABLES_OK:
+        return
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL DEFAULT '',
+            first_name TEXT NOT NULL DEFAULT '',
+            blocked INTEGER NOT NULL DEFAULT 0,
+            block_reason TEXT NOT NULL DEFAULT '',
+            blocked_until INTEGER,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_language (
+            telegram_id INTEGER PRIMARY KEY,
+            lang TEXT NOT NULL DEFAULT 'fa'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS playlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS playlist_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            title TEXT NOT NULL DEFAULT '',
+            artist TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            preview_url TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(playlist_id, title, artist)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            artist TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            preview_url TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(telegram_id, title, artist)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS features (
+            key TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            display_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            visible INTEGER NOT NULL DEFAULT 1,
+            message TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL DEFAULT '',
+            photo_file_id TEXT NOT NULL DEFAULT '',
+            link TEXT NOT NULL DEFAULT '',
+            button_text TEXT NOT NULL DEFAULT '',
+            views INTEGER NOT NULL DEFAULT 0,
+            clicks INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
+    _USER_TABLES_OK = True
+
+
 def _get_conn():
     """Get or create Turso connection. Returns None if not configured/fails."""
     global _turso_conn, _turso_ok

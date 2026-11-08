@@ -26,6 +26,7 @@ from aiogram.types import (
 )
 
 from .. import db as dbmod
+from ..bot import blocked_cache
 from ..bot.logic import menu_escape
 from ..i18n import t
 
@@ -211,6 +212,8 @@ def add_custom_feature(conn: sqlite3.Connection, name: str, reply_text: str,
     )
     dbmod.audit(conn, by_id, "admin_add_feature", f"{key} {name}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    dbmod.mark_dirty("features", key)
     return key
 
 
@@ -236,6 +239,9 @@ def move_feature(conn: sqlite3.Connection, key: str, direction: str) -> bool:
     conn.execute("UPDATE features SET display_order=? WHERE key=?", (b["display_order"], a["key"]))
     conn.execute("UPDATE features SET display_order=? WHERE key=?", (a["display_order"], b["key"]))
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    dbmod.mark_dirty("features", a["key"])
+    dbmod.mark_dirty("features", b["key"])
     return True
 
 
@@ -247,6 +253,9 @@ def delete_feature(conn: sqlite3.Connection, key: str, by_id: int | None = None,
     conn.execute("DELETE FROM features WHERE key=?", (key,))
     dbmod.audit(conn, by_id, "admin_delete_feature", key)
     conn.commit()
+    # P1-14: deferred Turso mirror — tombstone, so the flush deletes
+    # the row in Turso too.
+    dbmod.mark_deleted("features", key)
 
 
 def feats_view(conn: sqlite3.Connection,
@@ -296,6 +305,8 @@ def create_ad(conn: sqlite3.Connection, title: str, text: str, photo_file_id: st
     )
     dbmod.audit(conn, by_id, "admin_add_ad", f"{cur.lastrowid} {title}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    dbmod.mark_dirty("ads", cur.lastrowid)
     return cur.lastrowid
 
 
@@ -312,12 +323,17 @@ def update_ad(conn: sqlite3.Connection, ad_id: int, by_id: int | None = None, **
     conn.execute(f"UPDATE ads SET {', '.join(sets)} WHERE id=?", vals)
     dbmod.audit(conn, by_id, "admin_update_ad", f"{ad_id} {sorted(fields)}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    dbmod.mark_dirty("ads", ad_id)
 
 
 def delete_ad(conn: sqlite3.Connection, ad_id: int, by_id: int | None = None) -> None:
     conn.execute("DELETE FROM ads WHERE id=?", (ad_id,))
     dbmod.audit(conn, by_id, "admin_delete_ad", str(ad_id))
     conn.commit()
+    # P1-14: deferred Turso mirror — tombstone, so the flush deletes
+    # the row in Turso too.
+    dbmod.mark_deleted("ads", ad_id)
 
 
 def ad_inc(conn: sqlite3.Connection, ad_id: int, field: str) -> None:
@@ -461,9 +477,24 @@ def keybox_view(conn: sqlite3.Connection, config,
 # --- users --------------------------------------------------------------------
 def delete_user(conn: sqlite3.Connection, telegram_id: int,
                 by_id: int | None = None) -> None:
+    # P1-14: tombstone the user's Turso rows before the local delete
+    # (the ids are gone afterwards, so they must be captured first).
+    try:
+        _pl_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM playlists WHERE telegram_id=?", (telegram_id,))]
+    except Exception:
+        _pl_ids = []
+    for _pid in _pl_ids:
+        dbmod.mark_deleted("playlists", _pid)
+        dbmod.mark_deleted("playlist_items", _pid)
+    dbmod.mark_deleted("favorites", telegram_id)
+    dbmod.mark_deleted("user_language", telegram_id)
+    dbmod.mark_deleted("users", telegram_id)
     conn.execute("DELETE FROM users WHERE telegram_id=?", (telegram_id,))
     dbmod.audit(conn, by_id, "admin_delete_user", str(telegram_id))
     conn.commit()
+    # P1-16: a deleted user is not blocked anymore.
+    blocked_cache.set_blocked(telegram_id, False)
 
 
 def users_view(conn: sqlite3.Connection,
@@ -496,7 +527,14 @@ SETTINGS_FIELDS = (
     ("suno_sites", "adm_set_bank_sites"),
     ("audd_token", "adm_set_audd"),
 )
-SENSITIVE_SETTING_KEYS = {"audd_token"}
+SENSITIVE_SETTING_KEYS = {"audd_token", "openai_api_key"}
+
+
+def is_sensitive_setting_key(key: str) -> bool:
+    """P1-17: a setting is sensitive when named in the set above OR its
+    name matches the *_key/*_token/*_secret pattern (dbmod rule, shared
+    with the web panel)."""
+    return key in SENSITIVE_SETTING_KEYS or dbmod.is_sensitive_setting(key)
 
 
 def settings_view(conn: sqlite3.Connection,
@@ -505,7 +543,7 @@ def settings_view(conn: sqlite3.Connection,
     rows = []
     for key, label_key in SETTINGS_FIELDS:
         label = t(label_key, lang)
-        if key in SENSITIVE_SETTING_KEYS:
+        if is_sensitive_setting_key(key):
             shown = t("cmn_set", lang) if dbmod.get_setting(conn, key, "") else t("cmn_unset", lang)
         else:
             val = dbmod.get_setting(conn, key, "")
@@ -711,6 +749,13 @@ def wipe_user_data(conn: sqlite3.Connection, user_id: int) -> tuple[int, int, in
             if col:
                 conn.execute(f"DELETE FROM {table} WHERE {col}=?", (user_id,))
     conn.commit()
+    # P1-14: tombstone the user's Turso rows (the user row itself and
+    # the language choice are NOT wiped — wipe covers favourites,
+    # playlists and history only).
+    dbmod.mark_deleted("favorites", user_id)
+    for pid in pl_ids:
+        dbmod.mark_deleted("playlists", pid)
+        dbmod.mark_deleted("playlist_items", pid)
     return favs, playlists, history
 
 
@@ -1343,8 +1388,13 @@ def register(router: Router) -> None:
         if user is None:
             await callback.answer(brief("not_found", lang), show_alert=True)
             return
-        dbmod.set_user_blocked(conn, uid, not bool(user.get("blocked")),
+        _new_blocked = not bool(user.get("blocked"))
+        dbmod.set_user_blocked(conn, uid, _new_blocked,
                                by_id=callback.from_user.id)
+        # P1-16: the in-memory blocked set takes effect at once (the
+        # Turso mirror of the flag is deferred, via the dirty mark in
+        # set_user_blocked).
+        blocked_cache.set_blocked(uid, _new_blocked)
         await _edit(callback, *users_view(conn, lang))
 
     @ar.callback_query(F.data.startswith("adm:user:del:"))

@@ -16,10 +16,21 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db as dbmod
+from .bot import blocked_cache
 
 
 def _esc(s) -> str:
     return html.escape(str(s), quote=True)
+
+
+def settings_rows_html(settings: dict) -> str:
+    """Settings table rows for the panel (P1-17): sensitive keys
+    (*_key/*_token/*_secret — e.g. openai_api_key) render masked;
+    the real value stays in the settings table and is never rendered.
+    """
+    return "".join(
+        f"<tr><td>{_esc(k)}</td><td>{_esc(dbmod.mask_setting_value(k, v))}</td></tr>"
+        for k, v in settings.items())
 
 
 def make_handler(db_path, config):
@@ -80,7 +91,12 @@ def make_handler(db_path, config):
             if action == "block_user" and q.get("id"):
                 u = dbmod.get_user(conn, int(q["id"][0]))
                 if u:
-                    dbmod.set_user_blocked(conn, u["telegram_id"], not bool(u.get("blocked")))
+                    _new_blocked = not bool(u.get("blocked"))
+                    dbmod.set_user_blocked(conn, u["telegram_id"], _new_blocked)
+                    # P1-16: the in-memory blocked set takes effect at
+                    # once (the Turso mirror is deferred, via the dirty
+                    # mark in set_user_blocked).
+                    blocked_cache.set_blocked(u["telegram_id"], _new_blocked)
             settings = dbmod.list_settings(conn)
             feats = dbmod.list_features(conn)
             ads = dbmod.list_ads(conn)
@@ -99,8 +115,7 @@ def make_handler(db_path, config):
                 f"<td>{'⛔ مسدود' if u.get('blocked') else '✅ فعال'}</td>"
                 f"<td><a href='?token={_esc(token)}&action=block_user&id={u['telegram_id']}'>تغییر</a></td></tr>"
                 for u in users)
-            settings_rows = "".join(
-                f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>" for k, v in settings.items())
+            settings_rows = settings_rows_html(settings)
             body = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <title>پنل مدیریت ربات</title></head><body>
 <h1>🛡 پنل مدیریت ربات</h1>

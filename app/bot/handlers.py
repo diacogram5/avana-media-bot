@@ -47,6 +47,7 @@ from aiogram.types import (
 
 from .. import db as dbmod
 from .. import timing as _timing
+from . import blocked_cache
 from ..bot.audio_send import send_song_audio
 # NEW (2026-11-03): story clips — independent module. Guarded import so a
 # module bug can never break existing handlers or the main menu.
@@ -94,7 +95,13 @@ from ..search.lyrics import (
 )
 from ..search.channel import search_channels
 from ..search.suggest import is_mood_request, suggest_songs
-from ..security import RateLimiter, resolve_short_link, sanitize_text
+from ..security import (
+    RateLimiter,
+    resolve_short_link,
+    sanitize_text,
+    validate_media_url_for_fetch,
+    validate_url_for_fetch,
+)
 from ..services.audio_id import AudioIdResult, identify_acrcloud, identify_bytes, identify_url
 from ..services.brain import brain_clean_query
 from ..search.audio_match import fingerprint as audio_fingerprint, find_match as find_audio_match
@@ -1425,6 +1432,17 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         # audio stream is missing — the healthy path is preserved).
         # STEP 2: the file lives on DISK (streamed, never in RAM);
         # RapidAPI/crawler progressive files skip the mux entirely.
+        # P1-8: the resolve output (RapidAPI / DASH media URLs) is
+        # validated as media URLs (DNS / private-IP check, cached)
+        # before any byte is downloaded; a failure is a download
+        # failure exactly like an unreachable stream. The check lives
+        # HERE, not inside fetch_merged_video, so the downloader stays
+        # directly testable with local URLs (verify_step2).
+        if not await validate_media_url_for_fetch(video_url):
+            return None
+        if audio_url and audio_url != video_url:
+            if not await validate_media_url_for_fetch(audio_url):
+                audio_url = None
         _video_path, _has_audio, _tmpdir = await fetch_merged_video(
             video_url, audio_url, max_mb=max_mb, req_id=req_id)
     except Exception:
@@ -1602,8 +1620,19 @@ async def _download_link_audio(url: str, config, req_id: str | None = None,
     """Download a reel's separate audio stream for identification.
 
     Same validation as the video path: size cap, real container bytes —
-    never a renamed or empty payload."""
+    never a renamed or empty payload. P1-8: the audio URL is an
+    extracted CDN media URL — validated as a media URL (DNS /
+    private-IP check) before fetching; a failure raises ValueError
+    like any other failed audio validation.
+    """
     import time as _time
+    try:
+        if not await validate_media_url_for_fetch(url):
+            raise ValueError("url validation failed")
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("url validation failed")
     headers = {"User-Agent": "Mozilla/5.0",
                "Referer": "https://www.instagram.com/"}
     t = _time.perf_counter()
@@ -2740,6 +2769,10 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                     "", b"", "", url)
         t = _time.perf_counter()
         try:
+            # P1-8: validate the user-supplied direct-file URL (full
+            # rules + DNS) before fetching it.
+            if not await validate_url_for_fetch(url):
+                return ("error", "", "", False, "", b"")
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -2777,8 +2810,15 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
                               "resolve", _t_res, strategy=strategy)
     else:
         try:
+            # P1-8: validate the user-supplied page URL (full rules +
+            # DNS) before fetching, and re-validate the final URL
+            # after redirects before using the body.
+            if not await validate_url_for_fetch(url):
+                raise ValueError("url validation failed")
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if not await validate_url_for_fetch(str(resp.url)):
+                    raise ValueError("redirect target failed validation")
                 page = resp.text[:2_000_000] if resp.status_code == 200 else ""
             media_url = extract_media_url(page)
             page_text = extract_page_text(page)
@@ -2813,6 +2853,10 @@ async def _identify_link_audio(outcome, config: Config, conn=None,
         try:
             headers = {"User-Agent": "Mozilla/5.0",
                        "Referer": "https://www.instagram.com/"}
+            # P1-8: the extracted media URL is a CDN URL — validated
+            # as a media URL (DNS / private-IP check) before fetching.
+            if not await validate_media_url_for_fetch(media_url):
+                raise ValueError("url validation failed")
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(media_url, headers=headers)
                 resp.raise_for_status()
@@ -4642,6 +4686,16 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                                       "cache_store", _t_store)
         except Exception:
             pass
+        # P1-14: mirror the user save (and any other dirty user-owned
+        # rows) to Turso — fire-and-forget, AFTER the video was sent,
+        # never before the answer. The flush runs in a thread and
+        # opens its own SQLite connection.
+        try:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    dbmod.flush_dirty_to_turso, config.db_path))
+        except Exception:
+            pass
         # Phase 2 batch 2 (2026-11-08): background identify pre-compute,
         # spawned ONLY AFTER the video is sent — never at resolve-done,
         # never concurrent with the download/mux (Render is 0.1 CPU).
@@ -5905,6 +5959,49 @@ def _owner_commands() -> list[BotCommand]:
     ]
 
 
+class _BlockedGate:
+    """aiogram update outer middleware (P1-16): a blocked user is
+    refused on EVERY callback button and message BEFORE any handler
+    runs — one enforcement point for the main router and all feature
+    routers (admin/pro/bank/downloader share this dispatcher).
+
+    The decision comes from the in-memory blocked set
+    (app.bot.blocked_cache) — NO database and NO Turso query in the
+    waiting path. The owner is never gated. Never raises: on any
+    error the update passes through to the handlers, whose own
+    _blocked() checks stay as a second layer.
+    """
+    def __init__(self, owner_id):
+        self._owner_id = owner_id
+
+    async def __call__(self, handler, event, data):
+        try:
+            uid = getattr(getattr(event, "from_user", None), "id", None)
+            if uid is None:
+                return await handler(event, data)
+            if self._owner_id is not None and uid == self._owner_id:
+                return await handler(event, data)
+            if not blocked_cache.is_blocked(uid):
+                return await handler(event, data)
+        except Exception:
+            return await handler(event, data)
+        # Blocked: answer the refusal and swallow the update.
+        try:
+            conn = data.get("conn") if isinstance(data, dict) else None
+            lang = dbmod.user_lang_or_default(conn, uid) if conn is not None else "fa"
+        except Exception:
+            lang = "fa"
+        try:
+            from aiogram.types import CallbackQuery, Message
+            if isinstance(event, CallbackQuery):
+                await event.answer(t("blocked", lang), show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(t("blocked", lang))
+        except Exception:
+            pass
+        return None
+
+
 class _UpdateTracker:
     """aiogram outer middleware: records timestamp of every update.
 
@@ -5932,6 +6029,22 @@ async def run_bot(config: Config) -> None:
         # reports the service Live while the bot is dead.
         raise SystemExit(2)
     conn = init_db(config.db_path)
+    # P1-14: restore user-owned rows (users incl. blocked flags,
+    # playlists, favourites, language, settings, features, ads) from
+    # Turso into the fresh local DB — Render wipes bot.db on every
+    # restart, and this is what makes the data (and the admin user
+    # count) survive it. Runs once, before polling starts, so no user
+    # waits on it. Best effort: a Turso failure leaves local as-is.
+    try:
+        _restored = dbmod.restore_from_turso(conn)
+        log_event(log, "turso_user_restore", **{k: v for k, v in _restored.items()})
+    except Exception as exc:
+        log.warning("turso user restore failed: %s", exc)
+    # P1-16: populate the in-memory blocked set before polling.
+    try:
+        blocked_cache.refresh(conn)
+    except Exception:
+        pass
     # Web admin panel runs alongside polling, only with a token set.
     web = None
     if config.web_admin_enabled and config.web_admin_token:
@@ -6044,6 +6157,22 @@ async def run_bot(config: Config) -> None:
                           error="event loop blocked for >5min, exiting")
                 import os as _os
                 _os._exit(43)
+            # P1-16: refresh the in-memory blocked set (one tiny local
+            # SELECT — never Turso, never in a user path).
+            try:
+                blocked_cache.refresh(conn)
+            except Exception:
+                pass
+            # P1-14: mirror dirty user-owned rows to Turso, off the
+            # loop (the flush opens its own SQLite connection). The
+            # user save happens here — after the answer was sent —
+            # never inside a handler.
+            try:
+                _asyncio_outer.create_task(
+                    _asyncio_outer.to_thread(
+                        dbmod.flush_dirty_to_turso, config.db_path))
+            except Exception:
+                pass
             # Log periodic health (every ~10 min) for diagnosability
             if int(now) % 600 < 60:
                 log_event(log, "polling_health_ok")
@@ -6098,6 +6227,10 @@ async def run_bot(config: Config) -> None:
         # aiogram 3.x: register on every update via dispatcher event
         dp.update.outer_middleware.register(
             _UpdateTracker(_health))
+        # P1-16: blocked-user gate — one enforcement point for every
+        # callback and message on every router of this dispatcher.
+        dp.update.outer_middleware.register(
+            _BlockedGate(config.owner_id))
     except Exception:
         pass
 

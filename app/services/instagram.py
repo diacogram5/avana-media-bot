@@ -30,6 +30,7 @@ import httpx
 
 from .. import timing as _timing
 from ..logging_config import get_logger, log_event
+from ..security import validate_url_for_fetch
 from .link_media import (
     extract_dash_audio_url,
     extract_dash_video_url,
@@ -96,6 +97,10 @@ async def check_instagram_gating(page_url: str) -> str | None:
     generic branch. Never raises.
     """
     endpoint = _OEMBED_ENDPOINT + quote(_base(page_url), safe="")
+    # P1-8: never fetch a page URL that fails the allowlist/DNS checks
+    # (e.g. a host resolving to a private IP); no signal either way.
+    if not await validate_url_for_fetch(page_url):
+        return None
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(endpoint, headers=DESKTOP_UA)
@@ -103,6 +108,10 @@ async def check_instagram_gating(page_url: str) -> str | None:
         return "timeout"
     except Exception:
         return "network_error"
+    # P1-8: re-validate the URL actually fetched, after redirects, and
+    # refuse the signal when the redirect target fails the checks.
+    if not await validate_url_for_fetch(str(resp.url)):
+        return None
     if resp.status_code in (400, 404):
         # Instagram puts the age/region-gate signals INSIDE the 400 body
         # (measured 2026-10-29 on reel Dd23bq7vkPr: HTTP 400 with
@@ -148,6 +157,13 @@ async def _get(client: httpx.AsyncClient, url: str, headers: dict
         resp = await client.get(url, headers=headers)
     except Exception:
         return 0, "", 0
+    # P1-8: re-validate the URL actually fetched, after redirects — a
+    # redirect to an unvalidated host yields "" (no body is used).
+    try:
+        if not await validate_url_for_fetch(str(resp.url)):
+            return resp.status_code, "", len(resp.content)
+    except Exception:
+        pass
     nbytes = len(resp.content)
     if resp.status_code != 200:
         return resp.status_code, "", nbytes
@@ -262,6 +278,13 @@ async def _get_dash_page(client: httpx.AsyncClient, base: str, _t0: float,
             status = resp.status_code
             if status != 200:
                 return status, "", 0
+            # P1-8: re-validate the URL actually fetched, after redirects,
+            # BEFORE reading any body chunk.
+            try:
+                if not await validate_url_for_fetch(str(resp.url)):
+                    return status, "", 0
+            except Exception:
+                pass
             buf = bytearray()
             _scanned = {"sets": -1}
 
@@ -335,6 +358,16 @@ async def resolve_instagram_media(
     media_type = "unknown"
     import time as _time
     _t0 = _time.time()
+    # P1-8: refuse to fetch a page URL that fails the allowlist/DNS
+    # checks at all; the per-response final-URL check lives in _get /
+    # _get_dash_page. The RapidAPI branch below is unaffected (its host
+    # is code-constant; only its returned media URLs are validated,
+    # at the download call site).
+    if not await validate_url_for_fetch(page_url):
+        log_event(log, "instagram_resolve", strategy="none",
+                  media_type="unknown",
+                  ms=int((_time.time() - _t0) * 1000))
+        return None, None, page_text, "none", "unknown"
     try:
         async with httpx.AsyncClient(timeout=_STRATEGY_TIMEOUT,
                                      follow_redirects=True) as client:

@@ -125,6 +125,359 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# --- secret masking (P1-17) -------------------------------------------------
+# Display/history masking only: the real value is always stored in the
+# settings table itself. A key is sensitive when its name ends in _key /
+# _token / _secret (case-insensitive) — that covers openai_api_key,
+# audd_token, acrcloud_access_key/secret, spotify_client_secret, etc.
+MASKED_VALUE = "••••••"
+_SENSITIVE_SUFFIXES = ("_key", "_token", "_secret")
+
+
+def is_sensitive_setting(key: str) -> bool:
+    k = (key or "").strip().lower()
+    return k in ("key", "token", "secret") or k.endswith(_SENSITIVE_SUFFIXES)
+
+
+def mask_setting_value(key: str, value: str) -> str:
+    """Masked display/history value for a setting; '' stays ''."""
+    if not value:
+        return value
+    return MASKED_VALUE if is_sensitive_setting(key) else value
+
+
+# --- Turso backing for user-owned tables (P1-14) ----------------------------
+# Render's free tier wipes local data/bot.db on every restart/redeploy, so
+# user-owned rows are mirrored to Turso (already the durable store for
+# suggest_results, url_file_cache, exclusive_songs). Design — HOT-PATH
+# SAFE (user order): NO Turso query ever runs in a user's waiting path.
+#   * Local-first reads: every read below hits local SQLite only, so
+#     list/count/render latency is unchanged. A restart is repaired by
+#     restore_from_turso() at startup (before polling starts), which
+#     copies Turso rows back into the fresh local DB — that is what
+#     makes count_users (the admin user-count root cause) correct
+#     after a restart, and what keeps blocked flags, playlists,
+#     favourites and language choices alive across restarts.
+#   * Deferred writes: every local write below only marks its row
+#     dirty (a pure in-memory set add — no I/O). A background flush
+#     (60 s heartbeat + a fire-and-forget task after the link answer
+#     is sent) mirrors dirty rows to Turso. The user save therefore
+#     always happens AFTER the answer is sent, never before it.
+#   * Single writer: this bot is the only writer, so on restore the
+#     local row wins on conflict (INSERT OR REPLACE local -> Turso).
+#   * Best effort throughout: a Turso failure never raises and never
+#     blocks the local write, so the bot keeps working exactly as
+#     today when Turso is down.
+# Tables NOT migrated (deliberate): search_history / search_cache /
+# identify_cache / menu_collapse / download_jobs / outbox /
+# speed_metrics / audio_index / audit_log / settings_history —
+# regenerable caches, per-device state, or logs.
+import threading as _threading
+
+_DIRTY: dict[str, set] = {}
+_DIRTY_DELETED: dict[str, set] = {}
+_DIRTY_LOCK = _threading.Lock()
+_RESTORE_DONE = False
+_FLUSH_LOCK = _threading.Lock()
+
+_TURSO_USER_COLS = ("telegram_id", "username", "first_name", "blocked",
+                    "block_reason", "blocked_until", "created_at", "last_seen_at")
+_TURSO_PLAYLIST_COLS = ("id", "telegram_id", "name", "description", "color",
+                        "created_at")
+_TURSO_ITEM_COLS = ("id", "playlist_id", "title", "artist", "url",
+                    "preview_url", "position")
+_TURSO_FAV_COLS = ("id", "telegram_id", "title", "artist", "url",
+                   "preview_url", "created_at")
+_TURSO_AD_COLS = ("id", "text", "enabled", "created_at", "title",
+                  "photo_file_id", "link", "button_text", "views", "clicks")
+_TURSO_FEATURE_COLS = ("key", "title", "display_order", "enabled",
+                       "visible", "message")
+# table -> (key column in the local table, turso columns, turso key col)
+_TURSO_TABLES = {
+    "users": ("telegram_id", _TURSO_USER_COLS, "telegram_id"),
+    "user_language": ("telegram_id", ("telegram_id", "lang"), "telegram_id"),
+    "playlists": ("id", _TURSO_PLAYLIST_COLS, "id"),
+    "playlist_items": ("id", _TURSO_ITEM_COLS, "id"),
+    "favorites": ("telegram_id", _TURSO_FAV_COLS, "telegram_id"),
+    "settings": ("key", ("key", "value"), "key"),
+    "features": ("key", _TURSO_FEATURE_COLS, "key"),
+    "ads": ("id", _TURSO_AD_COLS, "id"),
+}
+# Tables whose local id is AUTOINCREMENT — their sqlite_sequence must be
+# re-seeded after a restore (see restore_from_turso).
+_TURSO_AUTOINC_TABLES = ("playlists", "playlist_items", "favorites", "ads")
+
+
+def _turso_conn():
+    """Shared Turso connection via turso_cache, or None. Never raises.
+
+    Lazy import: turso_cache lives under app.bot; importing it at module
+    load would couple this low-level module to the bot package.
+    """
+    try:
+        from .bot import turso_cache as _tc
+        return _tc._get_conn()
+    except Exception:
+        return None
+
+
+def _turso_read(sql: str, params=()):
+    """Turso SELECT rows (tuples) or None when Turso is unavailable/failed."""
+    tconn = _turso_conn()
+    if tconn is None:
+        return None
+    try:
+        return tconn.execute(sql, params).fetchall()
+    except Exception:
+        return None
+
+
+def _turso_write(sql: str, params=()) -> bool:
+    """Best-effort Turso write. True if applied; never raises."""
+    tconn = _turso_conn()
+    if tconn is None:
+        return False
+    try:
+        tconn.execute(sql, params)
+        tconn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def mark_dirty(table: str, key) -> None:
+    """Mark one local row for the next background Turso mirror.
+
+    Pure memory (no I/O) — safe to call from any write path, including
+    the hot path: the mirror itself happens later, off the user's wait.
+    """
+    with _DIRTY_LOCK:
+        _DIRTY.setdefault(table, set()).add(key)
+        _DIRTY_DELETED.get(table, set()).discard(key)
+
+
+def mark_deleted(table: str, key) -> None:
+    """Mark one locally-deleted row so the mirror deletes it in Turso."""
+    with _DIRTY_LOCK:
+        _DIRTY_DELETED.setdefault(table, set()).add(key)
+        _DIRTY.get(table, set()).discard(key)
+
+
+def dirty_keys() -> dict[str, frozenset]:
+    """Snapshot of pending dirty keys (tests / diagnostics)."""
+    with _DIRTY_LOCK:
+        return {t: frozenset(ks) for t, ks in _DIRTY.items() if ks}
+
+
+def is_user_blocked(conn, telegram_id: int | None) -> bool:
+    """Cycle-free blocked check for callback handlers (P1-16).
+
+    Same source as handlers._blocked (users.blocked via get_user) but
+    importable from app.features without importing handlers.py. Reads
+    LOCAL SQLite only — the blocked gate itself uses the in-memory
+    cache (app.bot.blocked_cache) and never calls this in a user path.
+    """
+    if telegram_id is None:
+        return False
+    user = get_user(conn, int(telegram_id))
+    return bool(user and user.get("blocked"))
+
+
+def _mirror_row_to_turso(table: str, row: dict | None, key) -> None:
+    """Mirror one local row to Turso (REPLACE), or DELETE it when the
+    local row is gone. Best effort; never raises."""
+    _key_col, cols, _tkey = _TURSO_TABLES[table]
+    if row is None:
+        _turso_write(f"DELETE FROM {table} WHERE {_key_col}=?", (key,))
+        if table == "playlists":
+            _turso_write("DELETE FROM playlist_items WHERE playlist_id=?", (key,))
+        return
+    ph = ", ".join("?" for _ in cols)
+    _turso_write(
+        f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({ph})",
+        tuple(row.get(c) if not isinstance(row.get(c), bool) else (1 if row.get(c) else 0)
+              for c in cols))
+
+
+def flush_dirty_to_turso(db_path: str) -> dict:
+    """Mirror all dirty rows to Turso. Returns {"mirrored": n, ...}.
+
+    Runs OFF the event loop (thread): it opens its OWN SQLite
+    connection — the loop's connection must never be used from a
+    thread. Concurrent flushes are skipped (one runs at a time).
+    Never raises; a Turso failure leaves the rows dirty for the next
+    flush. Called from the 60 s heartbeat and (fire-and-forget) after
+    the link answer is sent — never before an answer.
+    """
+    if not _FLUSH_LOCK.acquire(blocking=False):
+        return {"mirrored": 0, "skipped": True}
+    mirrored = 0
+    try:
+        with _DIRTY_LOCK:
+            work = {t: set(ks) for t, ks in _DIRTY.items() if ks}
+            gone = {t: set(ks) for t, ks in _DIRTY_DELETED.items() if ks}
+            _DIRTY.clear()
+            _DIRTY_DELETED.clear()
+        if not work and not gone:
+            return {"mirrored": 0}
+        if _turso_conn() is None:
+            # Turso unavailable: re-queue everything for the next flush.
+            with _DIRTY_LOCK:
+                for t, ks in work.items():
+                    _DIRTY.setdefault(t, set()).update(ks)
+                for t, ks in gone.items():
+                    _DIRTY_DELETED.setdefault(t, set()).update(ks)
+            return {"mirrored": 0, "turso": False}
+        try:
+            from .bot import turso_cache as _tc
+            _tc.ensure_user_tables(_turso_conn())
+        except Exception:
+            pass
+        try:
+            local = connect(db_path)
+        except Exception:
+            with _DIRTY_LOCK:
+                for t, ks in work.items():
+                    _DIRTY.setdefault(t, set()).update(ks)
+                for t, ks in gone.items():
+                    _DIRTY_DELETED.setdefault(t, set()).update(ks)
+            return {"mirrored": 0, "local": False}
+        try:
+            for table, keys in gone.items():
+                for key in keys:
+                    _mirror_row_to_turso(table, None, key)
+                    mirrored += 1
+            for table, keys in work.items():
+                key_col, cols, _tk = _TURSO_TABLES[table]
+                for key in keys:
+                    if table == "playlist_items":
+                        # Keyed by playlist_id: replace the whole item
+                        # set of that playlist (positions included).
+                        _turso_write(
+                            "DELETE FROM playlist_items WHERE playlist_id=?",
+                            (key,))
+                        try:
+                            items = local.execute(
+                                "SELECT * FROM playlist_items WHERE playlist_id=?",
+                                (key,)).fetchall()
+                        except Exception:
+                            items = []
+                        for it in items:
+                            d = dict(it)
+                            _mirror_row_to_turso("playlist_items", d, d["id"])
+                            mirrored += 1
+                        continue
+                    if table == "favorites":
+                        # Keyed by telegram_id: replace the user's set.
+                        _turso_write(
+                            "DELETE FROM favorites WHERE telegram_id=?", (key,))
+                        try:
+                            favs = local.execute(
+                                "SELECT * FROM favorites WHERE telegram_id=?",
+                                (key,)).fetchall()
+                        except Exception:
+                            favs = []
+                        for fv in favs:
+                            d = dict(fv)
+                            _mirror_row_to_turso("favorites", d, d["id"])
+                            mirrored += 1
+                        continue
+                    try:
+                        r = local.execute(
+                            f"SELECT * FROM {table} WHERE {key_col}=?",
+                            (key,)).fetchone()
+                    except Exception:
+                        r = None
+                    _mirror_row_to_turso(table, dict(r) if r else None, key)
+                    mirrored += 1
+        finally:
+            try:
+                local.close()
+            except Exception:
+                pass
+        return {"mirrored": mirrored}
+    finally:
+        _FLUSH_LOCK.release()
+
+
+def restore_from_turso(conn) -> dict:
+    """One-time Turso -> local restore at startup (P1-14). Returns counts.
+
+    Runs BEFORE polling starts, so no user waits on it. For each
+    user-owned table: Turso rows missing locally are inserted
+    (INSERT OR IGNORE — local wins on conflict), then local rows are
+    pushed up to Turso (INSERT OR REPLACE — this bot is the only
+    writer, so local is fresher than Turso whenever they differ, e.g.
+    a write that never got flushed before the last restart).
+    AUTOINCREMENT counters (sqlite_sequence) are re-seeded to the
+    restored max id so a fresh local create can never reuse an id
+    Turso already holds for a different row. Never raises.
+    """
+    global _RESTORE_DONE
+    if _RESTORE_DONE:
+        return {"restored": 0, "again": True}
+    _RESTORE_DONE = True
+    counts = {"restored": 0}
+    try:
+        tconn = _turso_conn()
+        if tconn is None:
+            return {"restored": 0, "turso": False}
+        try:
+            from .bot import turso_cache as _tc
+            _tc.ensure_user_tables(tconn)
+        except Exception:
+            pass
+        for table, (_key_col, cols, _tk) in _TURSO_TABLES.items():
+            try:
+                rows = tconn.execute(
+                    f"SELECT {', '.join(cols)} FROM {table}").fetchall()
+            except Exception:
+                continue
+            ph = ", ".join("?" for _ in cols)
+            try:
+                for row in rows:
+                    try:
+                        cur = conn.execute(
+                            f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) "
+                            f"VALUES ({ph})", tuple(row))
+                        counts["restored"] += cur.rowcount
+                    except Exception:
+                        pass
+                # Push local state up (local wins: only writer).
+                local_rows = conn.execute(
+                    f"SELECT {', '.join(cols)} FROM {table}").fetchall()
+                for row in local_rows:
+                    try:
+                        tconn.execute(
+                            f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) "
+                            f"VALUES ({ph})", tuple(row))
+                    except Exception:
+                        pass
+                # Re-seed AUTOINCREMENT counters for id-keyed tables.
+                if table in _TURSO_AUTOINC_TABLES:
+                    try:
+                        conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) "
+                            "VALUES (?, (SELECT COALESCE(MAX(id), 0) FROM "
+                            f"{table})) ON CONFLICT(name) DO UPDATE SET "
+                            "seq=MAX(seq, excluded.seq)", (table,))
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        try:
+            tconn.commit()
+        except Exception:
+            pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return counts
+
+
 # --- users ---------------------------------------------------------------
 def upsert_user(conn, telegram_id: int, username: str = "", first_name: str = "") -> dict:
     now = int(time.time())
@@ -136,6 +489,9 @@ def upsert_user(conn, telegram_id: int, username: str = "", first_name: str = ""
         (telegram_id, username, first_name, now, now),
     )
     conn.commit()
+    # P1-14: local write only — the Turso mirror is deferred (dirty
+    # mark, no I/O); the flush runs after the answer is sent.
+    mark_dirty("users", telegram_id)
     return get_user(conn, telegram_id) or {}
 
 
@@ -191,6 +547,8 @@ def set_feature(conn, key: str, enabled: bool | None = None, visible: bool | Non
     )
     audit(conn, by_id, "set_feature", f"{key} enabled={enabled} visible={visible}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("features", key)
 
 
 # --- persistent menu collapse (per user) ----------------------------------
@@ -244,6 +602,8 @@ def set_user_language(conn, telegram_id: int, lang: str) -> None:
         "ON CONFLICT(telegram_id) DO UPDATE SET lang=excluded.lang",
         (telegram_id, lang))
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("user_language", telegram_id)
 
 
 def user_lang_or_default(conn, telegram_id: int | None) -> str:
@@ -267,10 +627,16 @@ def set_setting(conn, key: str, value: str, by_id: int | None = None) -> None:
     )
     conn.execute(
         "INSERT INTO settings_history (key, old_value, new_value, changed_by, changed_at) VALUES (?,?,?,?,?)",
-        (key, old, value, by_id, int(time.time())),
+        # P1-17: settings_history and the audit line must never hold the real
+        # secret — store the masked value. The settings table above keeps the
+        # real value (only display/history are masked).
+        (key, mask_setting_value(key, old), mask_setting_value(key, value),
+         by_id, int(time.time())),
     )
-    audit(conn, by_id, "set_setting", f"{key}={value}")
+    audit(conn, by_id, "set_setting", f"{key}={mask_setting_value(key, value)}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("settings", key)
 
 
 def reset_settings_section(conn, keys: list[str], by_id: int | None = None) -> None:
@@ -319,22 +685,30 @@ def list_ads(conn) -> list[dict]:
 
 def add_ad(conn, text: str, by_id: int | None = None) -> None:
     import time as _t
-    conn.execute("INSERT INTO ads (text, enabled, created_at) VALUES (?,?,?)",
-                 (text, 1, int(_t.time())))
+    cur = conn.execute("INSERT INTO ads (text, enabled, created_at) VALUES (?,?,?)",
+                       (text, 1, int(_t.time())))
     audit(conn, by_id, "add_ad", text[:80])
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("ads", cur.lastrowid)
 
 
 def set_ad_enabled(conn, ad_id: int, enabled: bool, by_id: int | None = None) -> None:
     conn.execute("UPDATE ads SET enabled=? WHERE id=?", (1 if enabled else 0, ad_id))
     audit(conn, by_id, "set_ad", f"{ad_id} enabled={enabled}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("ads", ad_id)
 
 
 def set_user_blocked(conn, telegram_id: int, blocked: bool, by_id: int | None = None) -> None:
     conn.execute("UPDATE users SET blocked=? WHERE telegram_id=?", (1 if blocked else 0, telegram_id))
     audit(conn, by_id, "set_user_blocked", f"{telegram_id} blocked={blocked}")
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O). The
+    # in-memory blocked cache is updated by the caller (admin/web
+    # panel), not here — this module stays cache-agnostic.
+    mark_dirty("users", telegram_id)
 
 
 # --- playlists / favorites / cache ---------------------------------------
@@ -344,6 +718,8 @@ def create_playlist(conn, telegram_id: int, name: str, description: str = "", co
         "INSERT INTO playlists (telegram_id, name, description, color, created_at) VALUES (?,?,?,?,?)",
         (telegram_id, name.strip(), description, color, now))
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("playlists", cur.lastrowid)
     return get_playlist(conn, cur.lastrowid) or {}
 
 
@@ -365,12 +741,18 @@ def rename_playlist(conn, playlist_id: int, name: str, description: str | None =
     conn.execute("UPDATE playlists SET name=?, description=? WHERE id=?",
                  (name.strip(), pl["description"] if description is None else description, playlist_id))
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    mark_dirty("playlists", playlist_id)
 
 
 def delete_playlist(conn, playlist_id: int) -> None:
     conn.execute("DELETE FROM playlist_items WHERE playlist_id=?", (playlist_id,))
     conn.execute("DELETE FROM playlists WHERE id=?", (playlist_id,))
     conn.commit()
+    # P1-14: deferred Turso mirror — tombstones, so the flush deletes
+    # the rows in Turso too.
+    mark_deleted("playlists", playlist_id)
+    mark_deleted("playlist_items", playlist_id)
 
 
 def playlist_items(conn, playlist_id: int) -> list[dict]:
@@ -387,12 +769,22 @@ def add_to_playlist(conn, playlist_id: int, title: str, artist: str = "", url: s
         "INSERT OR IGNORE INTO playlist_items (playlist_id, title, artist, url, preview_url, position) VALUES (?,?,?,?,?,?)",
         (playlist_id, title, artist, url, preview_url, len(items)))
     conn.commit()
+    # P1-14: deferred Turso mirror of the whole item set (dirty mark
+    # only, no I/O).
+    mark_dirty("playlist_items", playlist_id)
     return True
 
 
 def remove_from_playlist(conn, item_id: int) -> None:
+    row = conn.execute(
+        "SELECT playlist_id FROM playlist_items WHERE id=?", (item_id,)).fetchone()
+    pid = row[0] if row else None
     conn.execute("DELETE FROM playlist_items WHERE id=?", (item_id,))
     conn.commit()
+    # P1-14: deferred Turso mirror of the whole item set (dirty mark
+    # only, no I/O).
+    if pid is not None:
+        mark_dirty("playlist_items", pid)
 
 
 def reorder_playlist(conn, playlist_id: int, item_ids: list[int]) -> None:
@@ -400,6 +792,9 @@ def reorder_playlist(conn, playlist_id: int, item_ids: list[int]) -> None:
         conn.execute("UPDATE playlist_items SET position=? WHERE id=? AND playlist_id=?",
                      (pos, item_id, playlist_id))
     conn.commit()
+    # P1-14: deferred Turso mirror of the whole item set (dirty mark
+    # only, no I/O).
+    mark_dirty("playlist_items", playlist_id)
 
 
 def add_favorite(conn, telegram_id: int, title: str, artist: str = "", url: str = "", preview_url: str = "") -> bool:
@@ -407,6 +802,9 @@ def add_favorite(conn, telegram_id: int, title: str, artist: str = "", url: str 
         "INSERT OR IGNORE INTO favorites (telegram_id, title, artist, url, preview_url, created_at) VALUES (?,?,?,?,?,?)",
         (telegram_id, title, artist, url, preview_url, int(time.time())))
     conn.commit()
+    # P1-14: deferred Turso mirror of the user's set (dirty mark only).
+    if cur.rowcount > 0:
+        mark_dirty("favorites", telegram_id)
     return cur.rowcount > 0
 
 
@@ -417,8 +815,14 @@ def list_favorites(conn, telegram_id: int) -> list[dict]:
 
 
 def remove_favorite(conn, fav_id: int) -> None:
+    row = conn.execute(
+        "SELECT telegram_id FROM favorites WHERE id=?", (fav_id,)).fetchone()
+    uid = row[0] if row else None
     conn.execute("DELETE FROM favorites WHERE id=?", (fav_id,))
     conn.commit()
+    # P1-14: deferred Turso mirror of the user's set (dirty mark only).
+    if uid is not None:
+        mark_dirty("favorites", uid)
 
 
 def get_cached_search(conn, key: str, max_age: int = 86400) -> str | None:

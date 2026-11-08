@@ -35,7 +35,7 @@ from ..config import Config
 from ..db import user_lang_or_default
 from ..media import process_link
 from ..bot.logic import menu_escape
-from ..security import validate_link
+from ..security import validate_link, validate_media_url_for_fetch, validate_url_for_fetch
 from ..services.link_media import extract_media_url, extract_video_qualities
 
 # ---------------------------------------------------------------------------
@@ -430,6 +430,13 @@ async def _probe_size(url: str) -> int | None:
 
 
 async def _head_media(url: str):
+    # P1-8: never probe a URL that fails the allowlist/DNS checks, and
+    # refuse the result when the redirect target fails them.
+    try:
+        if not await validate_url_for_fetch(url):
+            return None
+    except Exception:
+        return None
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.head(url, headers={"User-Agent": _UA})
@@ -437,16 +444,32 @@ async def _head_media(url: str):
         return None
     if resp.status_code >= 400:
         return None
+    try:
+        if not await validate_url_for_fetch(str(resp.url)):
+            return None
+    except Exception:
+        return None
     return resp
 
 
 async def _fetch_page(url: str) -> str | None:
+    # P1-8: same pre/post validation as _head_media.
+    try:
+        if not await validate_url_for_fetch(url):
+            return None
+    except Exception:
+        return None
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers={"User-Agent": _UA})
     except Exception:
         return None
     if resp.status_code >= 400:
+        return None
+    try:
+        if not await validate_url_for_fetch(str(resp.url)):
+            return None
+    except Exception:
         return None
     return resp.text
 
@@ -623,6 +646,18 @@ async def _refresh_status(message: types.Message, conn: sqlite3.Connection,
 async def _download_bytes(url: str, limit_bytes: int,
                           on_progress=None) -> bytes:
     buf = bytearray()
+    # P1-8: the URL here is an EXTRACTED media URL (chosen format /
+    # direct file) — validate it as a media URL (DNS/private-IP check,
+    # no allowlist/extension requirement) before fetching, and
+    # re-validate the final URL after redirects before consuming any
+    # chunk. A validation failure is permanent: retrying cannot help.
+    try:
+        if not await validate_media_url_for_fetch(url):
+            raise _PermanentError(UNAVAILABLE)
+    except (_TransientError, _PermanentError):
+        raise
+    except Exception:
+        raise _PermanentError(UNAVAILABLE)
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=15.0),
@@ -630,6 +665,13 @@ async def _download_bytes(url: str, limit_bytes: int,
         ) as client:
             async with client.stream("GET", url,
                                      headers={"User-Agent": _UA}) as resp:
+                try:
+                    if not await validate_media_url_for_fetch(str(resp.url)):
+                        raise _PermanentError(UNAVAILABLE)
+                except (_TransientError, _PermanentError):
+                    raise
+                except Exception:
+                    raise _PermanentError(UNAVAILABLE)
                 status = resp.status_code
                 if status in (401, 403, 404, 410):
                     raise _PermanentError(UNAVAILABLE)
@@ -748,6 +790,16 @@ async def run_job(message: types.Message, conn: sqlite3.Connection,
             _vpath: str | None = None
             _vtmp = None
             if _audio_url and job.get("content_type") == "video":
+                # P1-8: validate the extracted media URLs (DNS /
+                # private-IP check) before downloading them — the
+                # download itself must never fetch an internal address.
+                try:
+                    _ok_v = await validate_media_url_for_fetch(download_url)
+                    _ok_a = await validate_media_url_for_fetch(_audio_url)
+                except Exception:
+                    _ok_v = _ok_a = False
+                if not _ok_v or not _ok_a:
+                    raise _PermanentError(UNAVAILABLE)
                 from ..services.instagram import fetch_merged_video
                 _vpath, _, _vtmp = await fetch_merged_video(
                     download_url, _audio_url,

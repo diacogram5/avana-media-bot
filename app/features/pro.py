@@ -185,6 +185,8 @@ def _owns_item(conn: sqlite3.Connection, item_id: int, telegram_id: int) -> dict
 def set_playlist_color(conn: sqlite3.Connection, playlist_id: int, color: str) -> None:
     conn.execute("UPDATE playlists SET color=? WHERE id=?", (color, playlist_id))
     conn.commit()
+    # P1-14: deferred Turso mirror (dirty mark only, no I/O).
+    dbmod.mark_dirty("playlists", playlist_id)
 
 
 def _title_line(title: str, artist: str) -> str:
