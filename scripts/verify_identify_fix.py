@@ -390,6 +390,9 @@ async def main():
     try:
         vm._MP4 = vm._make_mp4()
         LOG_LINES.clear()
+        h._VIDEO_IDENTIFY.clear()
+        _kb0 = h._video_identify_kb(572595158, "VID123", "file")
+        _tok = _kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
         mp3 = vm._make_mp3("Bu Üräyin Dərdi Sənsən", "Canım Xəstə", seconds=5)
         msg = vm._Msg()
         vm._attach_clip_video(msg)
@@ -403,13 +406,18 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        # Unify fix: the name IS confirmed, so the ONE final message is
-        # the clip audio with the case-(b) caption — not the corporate
-        # "official version not found" caption.
-        _B_FA = ("«ATM» از Tiem & Salii شناسایی شد، اما نسخه کامل در منابع "
-                 "پیدا نشد؛ صدای همین کلیپ را فرستادیم.")
-        check("I5 clip audio carries the case-(b) caption (name known, no full file)",
-              cap == _B_FA, f"caption={cap!r}")
+        # 2026-11-09 extracted-buttons fix: the clip audio carries the
+        # CORPORATE caption + ONLY the retry button (the keyboard
+        # follows the file's origin, not the known name).
+        check("I5 clip audio carries the corporate caption byte-exact (name known, no full file)",
+              cap == vm._NEW_EXACT, f"caption={cap!r}")
+        _kb = msg.audio_kwargs[0].get("reply_markup") if msg.audio_kwargs else None
+        check("I5 clip audio has ONLY the retry button in ONE row (never playlist/lyrics)",
+              _kb is not None
+              and h._keyboard_button_texts(_kb) == ["🔍 جستجوی مجدد آهنگ"]
+              and len(_kb.inline_keyboard) == 1
+              and _kb.inline_keyboard[0][0].callback_data == f"vid:id:{_tok}",
+              f"buttons={h._keyboard_button_texts(_kb) if _kb is not None else None}")
         check("I5 mismatch is logged", vs._log_has("fullsong_mismatch"))
     except Exception as exc:
         check("I5 bug-fix guard still holds", False,

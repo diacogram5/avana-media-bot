@@ -9,8 +9,10 @@ message, then is deleted. Three final cases:
       09:50);
   (b) confirmed name + NO verified full file -> ONE audio from the
       clip's own audio (performer Avano + real duration) with the
-      case-(b) caption (name + artist + "full version not found") and
-      the same 3 identified buttons — never the corporate caption;
+      CORPORATE caption (byte-exact, 2026-11-09 16:52 three-paragraph
+      text) and ONLY the single retry button — never the case-(b)
+      caption, never the identified buttons (the keyboard follows the
+      file's origin, 2026-11-09 extracted-buttons fix);
   (c) not identified at all -> the CURRENT corporate caption
       (byte-exact) + ONLY the single retry button, no identified buttons.
 
@@ -19,10 +21,11 @@ Cases:
       identified buttons (wrong-song first, lyrics, playlist; NO
       heart, NO Google/retry); temp status deleted; no text message.
   U2  Case (b) mismatch: confirmed name + mismatched file -> one
-      audio (clip bytes) with the case-(b) caption + the same 3
-      buttons; performer Avano + real duration; status deleted.
+      audio (clip bytes) with the corporate caption byte-exact +
+      ONLY the retry button; performer Avano + real duration; status
+      deleted.
   U3  Case (b) no file: confirmed name + no file at all -> same as
-      U2 (clip audio, case-(b) caption, 3 buttons).
+      U2 (clip audio, corporate caption, retry only).
   U4  Case (c): _send_unconfirmed_media -> corporate caption
       byte-exact + ONLY the single retry button; performer Avano + real
       duration; no name, no identified buttons.
@@ -31,14 +34,20 @@ Cases:
       one audio with the corporate caption + the single retry button, and the
       temp status deleted.
   U6  Caption limit: very long title/artist -> the identified caption
-      and the case-(b) caption are both <= 1024 chars and carry an
-      ellipsis; the names are shortened, never the fixed wording.
+      is <= 1024 chars and carries an ellipsis; the corporate caption
+      is fixed text (no names) and is byte-exact.
   U7  No card before file status, all paths: _send_professional_song_card
       and _send_exclusive_song send no text message; the exclusive
       bank audio is the one final message with the bank caption +
       measured bitrate; the status is deleted.
   U8  i18n: the two new keys exist in fa/en/ar; fa m_identify_searching
-      is byte-exact; fa m_identified_no_full_clip formats the pattern.
+      is byte-exact; fa m_identified_no_full_clip formats the pattern
+      (key kept, retired from audio sends); fa corporate caption is
+      byte-exact (16:52 text).
+  U9  Cached identified result (the 2026-11-09 16:40 real test was a
+      cache hit): _send_identified_song with source="cache" flows
+      through the same verify-failed fallback -> clip audio with the
+      corporate caption + ONLY the retry button.
 
 Reuses the fake aiogram / fake libsql / fake message harness from
 scripts/verify_speedfix.py and the clip fixtures from
@@ -237,7 +246,7 @@ async def main():
             check("U1 case (a) one final audio", False,
                   f"{type(exc).__name__}: {exc}")
 
-        # ---- U2: case (b) — mismatch -> clip audio, case-(b) caption ---
+        # ---- U2: case (b) — mismatch -> clip audio, corporate caption ---
         try:
             h._VIDEO_IDENTIFY.clear()
             token = _mint_video_token()
@@ -255,16 +264,17 @@ async def main():
                   and msg.audio_calls[0][0] == "bytes" and msg.answers == [],
                   f"audio={msg.audio_calls} answers={msg.answers}")
             cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-            _b = _B_FA.format(title="ATM", artist="Tiem & Salii")
-            check("U2 clip audio carries the case-(b) caption",
-                  cap == _b, f"caption={cap!r}")
+            check("U2 clip audio carries the CORPORATE caption byte-exact (no name in it)",
+                  cap == _NEW_FA
+                  and "ATM" not in cap and "Tiem & Salii" not in cap,
+                  f"caption={cap!r}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U2 clip audio has exactly the 2 identified buttons (one row), no heart, no wrong-song, no new buttons",
-                  _btns == [_PLAYLIST_FA, _LYRICS_FA]
+            check("U2 clip audio has ONLY the retry button in ONE row, reusing the video token",
+                  _btns == [_RETRY_FA]
                   and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
-                  and not any("❤️" in b for b in _btns)
-                  and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup")))
-                  and _GOOGLE_FA not in _btns and _RETRY_FA not in _btns,
+                  and _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")) == [f"vid:id:{token}"]
+                  and _PLAYLIST_FA not in _btns and _LYRICS_FA not in _btns
+                  and _GOOGLE_FA not in _btns,
                   f"buttons={_btns}")
             kw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
             check("U2 clip audio performer is Avano with a real duration",
@@ -293,14 +303,16 @@ async def main():
                   and msg.audio_calls[0][0] == "bytes" and msg.answers == [],
                   f"audio={msg.audio_calls} answers={msg.answers}")
             cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-            _b = _B_FA.format(title=_TITLE, artist=_ARTIST)
-            check("U3 clip audio carries the case-(b) caption",
-                  cap == _b, f"caption={cap!r}")
+            check("U3 clip audio carries the CORPORATE caption byte-exact (no name in it)",
+                  cap == _NEW_FA
+                  and _TITLE not in cap and _ARTIST not in cap,
+                  f"caption={cap!r}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U3 clip audio has exactly the 2 identified buttons (one row), no wrong-song",
-                  _btns == [_PLAYLIST_FA, _LYRICS_FA]
+            check("U3 clip audio has ONLY the retry button in ONE row, reusing the video token",
+                  _btns == [_RETRY_FA]
                   and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
-                  and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup"))),
+                  and _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")) == [f"vid:id:{token}"]
+                  and _PLAYLIST_FA not in _btns and _LYRICS_FA not in _btns,
                   f"buttons={_btns}")
             kw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
             check("U3 clip audio performer is Avano with a real duration",
@@ -393,6 +405,10 @@ async def main():
                   f"{type(exc).__name__}: {exc}")
 
         # ---- U6: caption limit — long names never exceed 1024 ----------
+        # The corporate extracted-audio caption is FIXED text (no names
+        # in it), so long names cannot blow it up: it is byte-exact and
+        # well under 1024 chars. The case-(b) caption helper was deleted
+        # with the 2026-11-09 extracted-buttons fix.
         try:
             long_title = "T" * 600
             long_artist = "A" * 600
@@ -403,17 +419,15 @@ async def main():
             check("U6 long identified caption shortens the names with an ellipsis",
                   "…" in cap_a and "شناسایی شد" in cap_a,
                   f"caption={cap_a!r}")
-            cap_b = h._identified_no_full_caption(long_title, long_artist, "fa")
-            check("U6 case-(b) caption with long names is <= 1024 chars",
-                  len(cap_b) <= 1024, f"len={len(cap_b)}")
-            check("U6 long case-(b) caption keeps the fixed wording + ellipsis",
-                  "…" in cap_b and "شناسایی شد" in cap_b
-                  and "نسخه کامل در منابع پیدا نشد" in cap_b,
-                  f"caption={cap_b!r}")
+            check("U6 corporate extracted caption is byte-exact and <= 1024 chars",
+                  _NEW_FA == vm._NEW_EXACT and len(_NEW_FA) <= 1024,
+                  f"caption={_NEW_FA!r}")
+            check("U6 corporate extracted caption carries no song name",
+                  "ATM" not in _NEW_FA and "Tiem & Salii" not in _NEW_FA,
+                  f"caption={_NEW_FA!r}")
             check("U6 short names are untouched (no ellipsis added)",
                   "…" not in h._final_audio_caption(_TITLE, _ARTIST, "fa",
-                                                    duration_sec=200)
-                  and "…" not in h._identified_no_full_caption(_TITLE, _ARTIST, "fa"),
+                                                    duration_sec=200),
                   "short caption gained an ellipsis")
         except Exception as exc:
             check("U6 caption limit", False, f"{type(exc).__name__}: {exc}")
@@ -501,12 +515,68 @@ async def main():
                   and TRANSLATIONS["fa"]["m_id_pl_btn"] == _PLAYLIST_FA
                   and TRANSLATIONS["fa"]["m_id_lyrics_btn"] == _LYRICS_FA,
                   f"fa={ {k: TRANSLATIONS['fa'].get(k) for k in _new_keys} }")
-            check("U8 fa extracted caption has NO middle line (exact new text)",
-                  TRANSLATIONS["fa"]["m_extracted_audio_new"] == _NEW_FA
+            check("U8 fa extracted caption is byte-exact (16:52 three-paragraph text)",
+                  TRANSLATIONS["fa"]["m_extracted_audio_new"] == vm._NEW_EXACT
+                  and TRANSLATIONS["fa"]["m_extracted_audio_new"].count("\n\n") == 2
                   and "آماده شنیدن" not in TRANSLATIONS["fa"]["m_extracted_audio_new"],
                   f"value={TRANSLATIONS['fa']['m_extracted_audio_new']!r}")
         except Exception as exc:
             check("U8 new i18n keys", False, f"{type(exc).__name__}: {exc}")
+
+        # ---- U9: cached identified result -> same case-(b) path --------
+        # The 2026-11-09 16:40 real test (req d99f50b7) was a CACHE HIT
+        # of the identify result: the cached name flows through the SAME
+        # _send_identified_song -> _deliver_fullsong_bg -> verify-failed
+        # fallback, so the clip audio must carry the corporate caption
+        # + ONLY the retry button there too.
+        try:
+            LOG_LINES.clear()
+            h._VIDEO_IDENTIFY.clear()
+            token = _mint_video_token()
+            msg = vm._Msg()
+            vm._attach_clip_video(msg)
+            conn = vs._make_conn()
+            mp3 = vm._make_mp3("Bu Üräyin Dərdi Sənsən", "Canım Xəstə", seconds=5)
+            status = _StatusSent()
+            orig_find = adapters_mod.find_full_song_file_v2
+
+            async def _fake_find9(a, t):
+                return vm._full_dict(mp3, "persian_music:musicdel",
+                                     duration_sec=209.0)
+
+            adapters_mod.find_full_song_file_v2 = _fake_find9
+            try:
+                spawned = await h._send_identified_song(
+                    msg, conn, "ATM", "Tiem & Salii", None,
+                    own_media=("video", "VID123"), source="cache",
+                    status_msg=status)
+                drained = await _drain()
+            finally:
+                adapters_mod.find_full_song_file_v2 = orig_find
+            check("U9 cached identified result spawns the delivery (source=cache)",
+                  spawned and drained,
+                  f"spawned={spawned} drained={drained}")
+            check("U9 cached case (b) -> exactly ONE final message (one clip audio, no text)",
+                  len(msg.audio_calls) == 1
+                  and msg.audio_calls[0][0] == "bytes" and msg.answers == [],
+                  f"audio={msg.audio_calls} answers={msg.answers}")
+            cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
+            check("U9 cached case (b) clip audio carries the corporate caption byte-exact",
+                  cap == _NEW_FA, f"caption={cap!r}")
+            _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
+            check("U9 cached case (b) clip audio has ONLY the retry button in ONE row",
+                  _btns == [_RETRY_FA]
+                  and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
+                  and _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")) == [f"vid:id:{token}"]
+                  and _PLAYLIST_FA not in _btns and _LYRICS_FA not in _btns,
+                  f"buttons={_btns}")
+            check("U9 cached case (b) temp status is deleted once the final audio is out",
+                  status.deleted, f"deleted={status.deleted}")
+            check("U9 cached case (b) mismatch is logged",
+                  vs._log_has("fullsong_mismatch"))
+        except Exception as exc:
+            check("U9 cached identified result", False,
+                  f"{type(exc).__name__}: {exc}")
     finally:
         h.smart_search = orig_search
         h._exclusive_song_for = orig_excl

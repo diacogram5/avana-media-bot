@@ -1874,22 +1874,14 @@ def _fit_caption(fmt, title: str, artist: str,
     return text
 
 
-def _identified_no_full_caption(title: str, artist: str, ulang) -> str:
-    """Case (b) caption: the name IS confirmed, but no verified full
-    file exists — the clip's own audio is the one final message."""
-    return _fit_caption(
-        lambda _t, _a: t("m_identified_no_full_clip", ulang).format(
-            title=_t, artist=_a),
-        title, artist)
-
-
 def _identified_audio_row(key: str, ulang) -> list:
-    """The ONE row under an identified full song (and under a case-(b)
-    clip audio): add-to-playlist + lyrics (& translation), side by
-    side. Callbacks/handlers unchanged (pro:pick: / ly:). No heart,
-    no wrong-song, no Google/YouTube/retry, no library/save button —
-    the wrong-song report lives ONLY under the video (final identify
-    UI, 2026-11-09)."""
+    """The ONE row under an identified full song ONLY — never under a
+    clip/extracted audio file (the keyboard follows the file's
+    origin, 2026-11-09): add-to-playlist + lyrics (& translation),
+    side by side. Callbacks/handlers unchanged (pro:pick: / ly:). No
+    heart, no wrong-song, no Google/YouTube/retry, no library/save
+    button — the wrong-song report lives ONLY under the video (final
+    identify UI, 2026-11-09)."""
     return [InlineKeyboardButton(
                 text=t("m_id_pl_btn", ulang),
                 callback_data=f"pro:pick:{key}"),
@@ -4140,10 +4132,10 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
     (identified caption + real duration + the same buttons), and the
     temporary status message is deleted right after it is sent. When
     no verified full file exists, the ONE final message is the clip's
-    own audio with the case-(b) caption (the confirmed name + "full
-    version not found") and the identified buttons — never the
-    corporate "official version not found" caption, which is reserved
-    for the not-identified case. The old «⏳ در حال ارسال نسخه کامل
+    own audio with the corporate extracted-audio caption and ONLY the
+    single retry button — never the case-(b) caption, never the
+    identified buttons (the keyboard follows the file's origin,
+    2026-11-09). The old «⏳ در حال ارسال نسخه کامل
     آهنگ...» wait message is gone: the entry point's temporary status
     is the only waiting message in the identify path.
     """
@@ -4489,13 +4481,29 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                 _track(conn, message, sent)
                 await _drop_status()
                 return
+        # EXTRACTED-AUDIO KEYBOARD + CAPTION (2026-11-09): the keyboard
+        # is chosen by the FILE'S ORIGIN, not by whether a name is
+        # known — any clip/extracted audio carries ONLY the single
+        # retry button (or no keyboard when no retry callback can be
+        # built), never the identified-song keyboard; the caption is
+        # the corporate extracted-audio caption, never the case-(b)
+        # caption. Full-song sends above keep `kb` unchanged.
+        _clip_kb = None
+        if own_media is not None:
+            _ck, _cf = own_media
+            _clip_kb = _extracted_audio_kb(
+                title, artist, ulang, file_id=_cf,
+                user_id=getattr(getattr(message, "from_user", None),
+                                "id", None),
+                kind="audio" if _ck in ("audio", "voice") else "file")
+        _clip_cap = t("m_extracted_audio_new", ulang)
         # 1c) IDENTITY CHECK FAILED: the fresh lookup's file was not the
         # identified song (or could not be verified). The wrong file is
         # never sent. Case (b): the ONE final message is the clip's
-        # ORIGINAL audio (stream copy, no re-encode) with the confirmed
-        # name + "full version not found" caption and the identified
-        # buttons. Only when the clip itself is unavailable does the
-        # honest no-full message below run.
+        # ORIGINAL audio (stream copy, no re-encode) with the corporate
+        # extracted-audio caption and ONLY the single retry button.
+        # Only when the clip itself is unavailable does the honest
+        # no-full message below run.
         if _verify_failed:
             _sent_copy = None
             if own_media is not None:
@@ -4507,25 +4515,25 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         await message.bot.download_file(tg_file.file_path, buf)
                         _sent_copy = await _extract_and_send_clip_audio_copy(
                             message, conn, buf.getvalue(),
-                            _identified_no_full_caption(title, artist, ulang),
+                            _clip_cap,
                             ulang,
-                            reply_markup=kb,
-                            caption_key="m_identified_no_full_clip")
+                            reply_markup=_clip_kb,
+                            caption_key="m_extracted_audio_new")
                     except Exception:
                         _sent_copy = None
             if _sent_copy is not None:
                 await _drop_status()
                 return
         # 2) No full file: case (b) — the ONE final message is the user's
-        # own media as the clip's audio, with the confirmed name +
-        # "full version not found" caption and the identified buttons.
+        # own media as the clip's audio, with the corporate
+        # extracted-audio caption and ONLY the single retry button.
         # Video: the clip's own extracted audio. Other kinds go back
         # as-is (nothing was extracted from them). Only when extraction
         # is impossible does the video go back with a caption that says
         # exactly that.
         if own_media is not None and not _verify_failed:
             kind, file_id = own_media
-            cap = _identified_no_full_caption(title, artist, ulang)
+            cap = _clip_cap
             try:
                 if kind == "video":
                     # The caption promises an audio file, so one must really
@@ -4544,8 +4552,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         data = None
                     sent = await _extract_and_send_clip_audio(
                         message, conn, data or b"", caption=cap,
-                        reply_markup=kb,
-                        caption_key="m_identified_no_full_clip")
+                        reply_markup=_clip_kb,
+                        caption_key="m_extracted_audio_new")
                     if sent is None:
                         sent = await send_video(
                             message, file_id,
@@ -4558,11 +4566,11 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     # exactly like the audio kind below.
                     sent = await send_song_audio(
                         message, file_id, title, artist, caption=cap,
-                        reply_markup=kb)
+                        reply_markup=_clip_kb)
                 else:
                     sent = await send_song_audio(
                         message, file_id, title, artist, caption=cap,
-                        reply_markup=kb)
+                        reply_markup=_clip_kb)
                 if sent is not None:
                     _track(conn, message, sent)
                     await _drop_status()

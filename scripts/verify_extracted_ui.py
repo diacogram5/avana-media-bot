@@ -35,9 +35,10 @@ Cases (each driven end-to-end through the real handlers):
   X4  Confirmed tap (full song, LOCKED): ONE final audio with exactly
       [playlist, lyrics] in one row, no Google/retry/heart/wrong-song;
       video keyboard [Google, YouTube] + [report] unchanged.
-  X5  Case (b) (name known, no full file, LOCKED): clip audio with
-      the case-(b) caption + [playlist, lyrics] in one row; no retry,
-      no Google.
+  X5  Case (b) (name known, no full file, 2026-11-09 extracted-
+      buttons fix): clip audio with the CORPORATE caption byte-exact
+      + ONLY [retry] in one row; no playlist, no lyrics, no Google.
+      The case-(b) caption is retired from audio sends.
   X6  §6 still holds: the only answer_voice left in handlers.py is
       the TTS feature; sendVoice appears 0 times; the extracted send
       carries a REAL duration + the exact title + performer "Avano".
@@ -91,7 +92,6 @@ _RETRY_EN = "🔍 Search the song again"
 _RETRY_AR = "🔍 البحث عن الأغنية مجددًا"
 _EGOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
 _NEW_EXACT = vm._NEW_EXACT
-_B_FA = vu._B_FA
 _EXTRACTED_TITLE = "صدای استخراج‌شده از ویدیو"
 
 
@@ -251,7 +251,7 @@ async def main():
     except Exception as exc:
         check("X4 confirmed tap", False, f"{type(exc).__name__}: {exc}")
 
-    # ---- X5: case (b) — clip audio, case-(b) caption, LOCKED ---------
+    # ---- X5: case (b) — clip audio, corporate caption, retry only ----
     try:
         h._VIDEO_IDENTIFY.clear()
         token = vu._mint_video_token()
@@ -269,14 +269,17 @@ async def main():
               and msg.audio_calls[0][0] == "bytes" and msg.answers == [],
               f"audio={msg.audio_calls} answers={msg.answers}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        _b = _B_FA.format(title="ATM", artist="Tiem & Salii")
-        check("X5 clip audio carries the case-(b) caption (LOCKED)",
-              cap == _b, f"caption={cap!r}")
+        check("X5 clip audio carries the CORPORATE caption byte-exact (no name in it)",
+              cap == _NEW_EXACT
+              and "ATM" not in cap and "Tiem & Salii" not in cap,
+              f"caption={cap!r}")
         _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-        check("X5 case-(b) audio has [playlist, lyrics] one row, no retry, no Google",
-              _btns == [_PL_FA, _LYRICS_FA]
+        check("X5 case-(b) audio has ONLY [retry] in ONE row, reusing the video token",
+              _btns == [_RETRY_FA]
               and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
-              and _RETRY_FA not in _btns and _EGOOGLE_FA not in _btns,
+              and _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")) == [f"vid:id:{token}"]
+              and _PL_FA not in _btns and _LYRICS_FA not in _btns
+              and _EGOOGLE_FA not in _btns,
               f"buttons={_btns}")
         check("X5 temp status is deleted once the final audio is out",
               status.deleted, f"deleted={status.deleted}")
@@ -322,13 +325,28 @@ async def main():
               and TRANSLATIONS["ar"]["m_extracted_retry_btn"] == _RETRY_AR,
               f"en={TRANSLATIONS['en']['m_extracted_retry_btn']!r} "
               f"ar={TRANSLATIONS['ar']['m_extracted_retry_btn']!r}")
-        check("X7 fa extracted caption is byte-exact (no middle line)",
+        check("X7 fa extracted caption is byte-exact (16:52 three-paragraph text)",
               TRANSLATIONS["fa"]["m_extracted_audio_new"] == _NEW_EXACT,
               f"caption={TRANSLATIONS['fa']['m_extracted_audio_new']!r}")
         src = Path(h.__file__).read_text(encoding="utf-8")
         check("X7 the Google key is NOT referenced in handlers.py (button deleted)",
               "m_extracted_google_btn" not in src,
               "m_extracted_google_btn still referenced in handlers.py")
+        check("X7 the case-(b) caption key is referenced by NO audio send site",
+              "m_identified_no_full_clip" not in src,
+              "m_identified_no_full_clip still referenced in handlers.py")
+        _start = src.index("async def _deliver_fullsong_bg")
+        _end = src.index("\ndef _openai_ready", _start)
+        _seg = src[_start:_end]
+        _seg = _seg[_seg.index("# 1c) IDENTITY CHECK FAILED"):
+                   _seg.index("# 3) Honest")]
+        check("X7 no clip-audio send in _deliver_fullsong_bg attaches the identified keyboard",
+              "reply_markup=kb" not in _seg
+              and _seg.count("reply_markup=_clip_kb") == 4,
+              f"clip-kb sites={_seg.count('reply_markup=_clip_kb')}")
+        check("X7 the identified keyboard is built exactly once (never at a clip-audio site)",
+              src.count("_identified_song_kb(") == 2,
+              f"sites={src.count('_identified_song_kb(')}")
     except Exception as exc:
         check("X7 i18n", False, f"{type(exc).__name__}: {exc}")
 

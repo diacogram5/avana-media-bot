@@ -25,14 +25,15 @@ Cases (each driven end-to-end through the real handlers):
   F4  Scenario 4 (exclusive bank): same audio layout as scenario 2
       (playlist + lyrics, one row), bank marker + real duration in
       the caption, status deleted.
-  F5  Case (b) (name known, no full file): clip audio with the
-      case-(b) caption (independently typed) + [playlist, lyrics]
-      in one row; status deleted.
+  F5  Case (b) (name known, no full file, 2026-11-09 extracted-
+      buttons fix): clip audio with the CORPORATE caption byte-exact
+      + ONLY the retry button in one row; status deleted.
   F6  §6 (extracted-audio appearance): the only answer_voice left in
       handlers.py is the TTS feature (the identify paths never send
       a voice bubble); _extract_and_send_clip_audio passes the REAL
       probed duration + title + performer "Avano" via answer_audio.
-  F7  i18n: the extracted caption has no middle line in fa/en/ar.
+  F7  i18n: the extracted caption is byte-exact (16:52 three-paragraph
+      text) in fa; no middle line in fa/en/ar.
   F8  Aggregate: no TEXT answer in any driven flow contains
       «شناسایی شد» (the name is announced only inside the one final
       audio's caption, never as a card).
@@ -82,8 +83,6 @@ _RETRY_FA = "🔍 جستجوی مجدد آهنگ"
 _STATUS_FA = "در حال جستجوی موسیقی..."
 # Independently typed expected captions (never read from i18n.py).
 _NEW_EXACT = vm._NEW_EXACT
-_B_EXACT = ("«{title}» از {artist} شناسایی شد، اما نسخه کامل در منابع "
-            "پیدا نشد؛ صدای همین کلیپ را فرستادیم.")
 _EXTRACTED_TITLE = "صدای استخراج‌شده از ویدیو"
 
 _ALL_TEXT: list[str] = []
@@ -336,6 +335,8 @@ async def main():
 
     # ---- F5: case (b) — name known, no full file ----------------------
     try:
+        h._VIDEO_IDENTIFY.clear()
+        token = vu._mint_video_token()
         msg = vm._Msg()
         vm._attach_clip_video(msg)
         conn = vs._make_conn()
@@ -348,14 +349,16 @@ async def main():
               and msg.audio_calls[0][0] == "bytes" and msg.answers == [],
               f"audio={msg.audio_calls} answers={msg.answers}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F5 clip audio carries the case-(b) caption (byte-exact)",
-              cap == _B_EXACT.format(title=_TITLE, artist=_ARTIST),
+        check("F5 clip audio carries the CORPORATE caption byte-exact (no name in it)",
+              cap == _NEW_EXACT
+              and _TITLE not in cap and _ARTIST not in cap,
               f"caption={cap!r}")
         _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-        check("F5 case-(b) audio has [playlist, lyrics] in ONE row, no wrong-song",
-              _btns == [_PL_FA, _LYRICS_FA]
+        check("F5 case-(b) audio has ONLY [retry] in ONE row, reusing the video token",
+              _btns == [_RETRY_FA]
               and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
-              and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup"))),
+              and _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")) == [f"vid:id:{token}"]
+              and _PL_FA not in _btns and _LYRICS_FA not in _btns,
               f"buttons={_btns}")
         check("F5 temp status is deleted",
               status.deleted, f"deleted={status.deleted}")
@@ -389,8 +392,12 @@ async def main():
     except Exception as exc:
         check("F6 §6 appearance", False, f"{type(exc).__name__}: {exc}")
 
-    # ---- F7: i18n — no middle line in any language --------------------
+    # ---- F7: i18n — byte-exact corporate caption, no middle line ----
     try:
+        check("F7 fa extracted caption is byte-exact (16:52 three-paragraph text)",
+              TRANSLATIONS["fa"]["m_extracted_audio_new"] == _NEW_EXACT
+              and TRANSLATIONS["fa"]["m_extracted_audio_new"].count("\n\n") == 2,
+              f"fa={TRANSLATIONS['fa']['m_extracted_audio_new']!r}")
         check("F7 fa/en/ar extracted captions have NO middle line",
               "آماده شنیدن" not in TRANSLATIONS["fa"]["m_extracted_audio_new"]
               and "ready to listen" not in TRANSLATIONS["en"]["m_extracted_audio_new"].lower()

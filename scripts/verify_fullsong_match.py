@@ -13,15 +13,15 @@ Cases:
   F2  Mismatched tags (the literal 23:54 pair) are NEVER sent; no
       own_media -> the honest no-full message.
   F2b Mismatched tags + own_media video -> the clip's original audio
-      (stream copy) with the case-(b) caption (unify fix 2026-11-09:
-      the name IS confirmed, so the corporate caption no longer
-      applies to this path).
+      (stream copy) with the corporate caption + ONLY the retry
+      button (2026-11-09 extracted-buttons fix: the keyboard follows
+      the file's origin, not the known name).
   F2c/F2d The same guard + fallback in the download-full flow
       (_download_full_bg): matching tags send, mismatch -> clip audio.
       (Untouched by the unify fix — the download-full flow still
       carries the corporate caption.)
   F3  Untagged file is NEVER sent; own_media video -> the clip's
-      original audio + the case-(b) caption.
+      original audio + the corporate caption + ONLY the retry button.
   F4  Duration label: real m:ss; unit checks on _fullsong_duration_label.
   F5  Missing duration omits the label entirely (unit + cache-hit send).
   F6  Cache-hit guard: verified match sends; verified mismatch blocks
@@ -70,10 +70,10 @@ LOG_LINES = vs.LOG_LINES
 adapters_mod = vs.adapters_mod
 
 _NEW_FA = t("m_extracted_audio_new", "fa")
-# Case-(b) caption template (unify fix 2026-11-09): the name IS
-# confirmed but no verified full file exists — the clip's own audio
-# is the one final message.
-_B_FA = t("m_identified_no_full_clip", "fa")
+# _B_FA (the retired case-(b) caption) was deleted with the 2026-11-09
+# extracted-buttons fix: EVERY extracted audio file now carries the
+# corporate caption below, and the case-(b) key is referenced by no
+# audio send site in handlers.py (the key itself stays in i18n.py).
 _STATIC_FA = t("m_full_duration_long", "fa")
 _EXTRACTED_TITLE_FA = t("m_extracted_audio_title", "fa")
 
@@ -171,14 +171,14 @@ def _full_dict(data, source, url=None, size=None, duration_sec=0.0):
     return d
 
 
-# The EXACT new extracted-audio caption from the user order
-# (2026-11-09 01:17, middle line removed by the 2026-11-09 14:54
-# final identify-UI order), typed here independently of i18n.py so
-# the test proves byte equality. (The 00:12 corporate text is
-# superseded.)
-_NEW_EXACT = ("🎵 نسخه رسمی این آهنگ در منابع موسیقی پیدا نشد؛ اما آوانو "
-              "صدای آن را مستقیماً از همین کلیپ استخراج کرده تا چیزی از "
-              "دست ندهید. 💜\n\n"
+# The EXACT corporate extracted-audio caption from the user order
+# (2026-11-09 16:52 rewrite — THREE paragraphs, two blank lines;
+# supersedes the 16:46 and 16:49 pastes), typed here independently of
+# i18n.py so the test proves byte equality.
+_NEW_EXACT = ("🎵 این آهنگ هنوز نسخه آماده‌ای در منابع موسیقی ندارد؛ اما "
+              "آوانو راه دیگری برای شنیدن آن فراهم کرده است! 💜\n\n"
+              "صدای موسیقی مستقیماً از همین کلیپ استخراج و برای شما آماده "
+              "شده؛ بدون نیاز به هیچ ابزار یا ویرایش اضافی. 🎧\n\n"
               "AVANO AI | همیشه یک راه برای شنیدن موسیقی هست!")
 
 
@@ -312,6 +312,9 @@ async def main():
     # ---- F2b: mismatched tags + own_media -> original audio, exact text --
     try:
         LOG_LINES.clear()
+        h._VIDEO_IDENTIFY.clear()
+        _kb0 = h._video_identify_kb(572595158, "VID123", "file")
+        _tok = _kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
         mp3 = _make_mp3("Bu Üräyin Dərdi Sənsən", "Canım Xəstə", seconds=5)
         msg = _Msg()
         _attach_clip_video(msg)
@@ -325,9 +328,16 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F2b clip audio carries the case-(b) caption",
-              cap == _B_FA.format(title="ATM", artist="Tiem & Salii"),
+        check("F2b clip audio carries the corporate caption byte-exact",
+              cap == _NEW_EXACT,
               f"caption={cap!r}")
+        _kb = msg.audio_kwargs[0].get("reply_markup") if msg.audio_kwargs else None
+        check("F2b clip audio has ONLY the retry button in ONE row (never playlist/lyrics)",
+              _kb is not None
+              and h._keyboard_button_texts(_kb) == ["🔍 جستجوی مجدد آهنگ"]
+              and len(_kb.inline_keyboard) == 1
+              and _kb.inline_keyboard[0][0].callback_data == f"vid:id:{_tok}",
+              f"buttons={h._keyboard_button_texts(_kb) if _kb is not None else None}")
         check("F2b clip audio is titled as extracted audio",
               (msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else "")
               == _EXTRACTED_TITLE_FA)
@@ -390,6 +400,9 @@ async def main():
     # ---- F3: untagged file -> original clip audio + corporate text ----
     try:
         LOG_LINES.clear()
+        h._VIDEO_IDENTIFY.clear()
+        _kb0 = h._video_identify_kb(572595158, "VID123", "file")
+        _tok = _kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
         mp3 = _make_mp3(None, None, seconds=5)  # no ID3 tags at all
         msg = _Msg()
         _attach_clip_video(msg)
@@ -403,9 +416,16 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F3 clip audio carries the case-(b) caption",
-              cap == _B_FA.format(title="Terror", artist="Tiem & Salii"),
+        check("F3 clip audio carries the corporate caption byte-exact",
+              cap == _NEW_EXACT,
               f"caption={cap!r}")
+        _kb = msg.audio_kwargs[0].get("reply_markup") if msg.audio_kwargs else None
+        check("F3 clip audio has ONLY the retry button in ONE row (never playlist/lyrics)",
+              _kb is not None
+              and h._keyboard_button_texts(_kb) == ["🔍 جستجوی مجدد آهنگ"]
+              and len(_kb.inline_keyboard) == 1
+              and _kb.inline_keyboard[0][0].callback_data == f"vid:id:{_tok}",
+              f"buttons={h._keyboard_button_texts(_kb) if _kb is not None else None}")
         title_kw = msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else ""
         check("F3 clip audio is titled as extracted audio",
               title_kw == _EXTRACTED_TITLE_FA, f"title={title_kw!r}")
@@ -588,12 +608,14 @@ async def main():
     # ---- F6g: cache-hit mismatch still falls back to the original audio --
     # The cached file is poisoned, the fresh lookup finds nothing: the
     # user still gets the clip's own audio (the honest own-media path),
-    # never the wrong cached file. The identification itself stands,
-    # so the fallback now carries the case-(b) caption (unify fix
-    # 2026-11-09 — the corporate caption no longer applies to a
-    # confirmed name).
+    # never the wrong cached file. The fallback carries the corporate
+    # caption + ONLY the retry button (2026-11-09 extracted-buttons
+    # fix — the keyboard follows the file's origin, not the known name).
     try:
         LOG_LINES.clear()
+        h._VIDEO_IDENTIFY.clear()
+        _kb0 = h._video_identify_kb(572595158, "VID123", "file")
+        _tok = _kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
         msg = _Msg()
         _attach_clip_video(msg)
         conn = vs._make_conn()
@@ -607,9 +629,16 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F6g original audio carries the case-(b) caption",
-              cap == _B_FA.format(title="Aramazsan Arama", artist="Maviler"),
+        check("F6g original audio carries the corporate caption byte-exact",
+              cap == _NEW_EXACT,
               f"caption={cap!r}")
+        _kb = msg.audio_kwargs[0].get("reply_markup") if msg.audio_kwargs else None
+        check("F6g original audio has ONLY the retry button in ONE row (never playlist/lyrics)",
+              _kb is not None
+              and h._keyboard_button_texts(_kb) == ["🔍 جستجوی مجدد آهنگ"]
+              and len(_kb.inline_keyboard) == 1
+              and _kb.inline_keyboard[0][0].callback_data == f"vid:id:{_tok}",
+              f"buttons={h._keyboard_button_texts(_kb) if _kb is not None else None}")
         check("F6g cache mismatch is logged",
               vs._log_has("fullsong_cache_mismatch"))
         check("F6g poisoned local row is invalidated",
