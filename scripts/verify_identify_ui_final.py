@@ -19,9 +19,9 @@ Cases (each driven end-to-end through the real handlers):
       no name to search for).
   F3  Scenario 3 (extracted, single-source name): the send is
       answer_audio (never answer_voice); caption byte-exact; ONLY
-      [Google, retry] in one row; Google URL exact; retry reuses the
-      video's identify token; no full-song buttons; video keyboard
-      shows Google + YouTube + report.
+      the retry button in one row (no Google button at all); retry
+      reuses the video's identify token; no full-song buttons; video
+      keyboard shows Google + YouTube + report.
   F4  Scenario 4 (exclusive bank): same audio layout as scenario 2
       (playlist + lyrics, one row), bank marker + real duration in
       the caption, status deleted.
@@ -78,7 +78,7 @@ _REPORT_FA = "⚠️ گزارش شناسایی اشتباه ⚠️"
 _VGOOGLE_FA = "🌐 جستجو در Google"
 _VYT_FA = "▶️ جستجو در YouTube"
 _EGOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
-_RETRY_FA = "🔄 شناسایی مجدد"
+_RETRY_FA = "🔍 جستجوی مجدد آهنگ"
 _STATUS_FA = "در حال جستجوی موسیقی..."
 # Independently typed expected captions (never read from i18n.py).
 _NEW_EXACT = vm._NEW_EXACT
@@ -276,14 +276,12 @@ async def main():
         check("F3 extracted caption is byte-exact",
               _akw.get("caption", "") == _NEW_EXACT,
               f"caption={_akw.get('caption')!r}")
-        check("F3 extracted audio has ONLY [Google, retry] in ONE row",
-              _kb_texts(_akw.get("reply_markup")) == [_EGOOGLE_FA, _RETRY_FA]
+        check("F3 extracted audio has ONLY the retry button in ONE row (no Google)",
+              _kb_texts(_akw.get("reply_markup")) == [_RETRY_FA]
               and len(_akw.get("reply_markup").inline_keyboard) == 1,
               f"buttons={_kb_texts(_akw.get('reply_markup'))}")
-        _q = quote_plus(f"{_TITLE} {_ARTIST}")
-        check("F3 Google URL is exact; retry reuses the video token",
-              _kb_urls(_akw.get("reply_markup"))[0]
-              == f"https://www.google.com/search?q={_q}"
+        check("F3 no Google URL anywhere; retry reuses the video token",
+              [u for u in _kb_urls(_akw.get("reply_markup")) if u] == []
               and f"vid:id:{token}" in _kb_callbacks(_akw.get("reply_markup")),
               f"urls={_kb_urls(_akw.get('reply_markup'))} "
               f"callbacks={_kb_callbacks(_akw.get('reply_markup'))}")
@@ -398,7 +396,7 @@ async def main():
               and "ready to listen" not in TRANSLATIONS["en"]["m_extracted_audio_new"].lower()
               and "جاهز للاستماع" not in TRANSLATIONS["ar"]["m_extracted_audio_new"],
               f"fa={TRANSLATIONS['fa']['m_extracted_audio_new']!r}")
-        check("F7 fa retry text is exactly «🔄 شناسایی مجدد»",
+        check("F7 fa retry text is exactly «🔍 جستجوی مجدد آهنگ»",
               TRANSLATIONS["fa"]["m_extracted_retry_btn"] == _RETRY_FA,
               f"value={TRANSLATIONS['fa']['m_extracted_retry_btn']!r}")
     except Exception as exc:

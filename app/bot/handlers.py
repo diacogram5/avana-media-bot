@@ -1763,29 +1763,26 @@ def _extracted_audio_kb(title: str, artist: str, ulang,
                         file_id: str | None = None,
                         user_id: int | None = None,
                         kind: str = "file"):
-    """The buttons under an extracted-audio message (final identify UI,
-    2026-11-09): ONE row — Google search for the best available name
-    (the confirmed name, else the single-source name; OMITTED when no
-    name exists at all — a query is never invented) + retry
-    identification via the video's EXISTING identify button
-    (vid:id:<token>). Never used on an identified/bank send; never
-    playlist/lyrics/wrong-song under an extracted file."""
-    import urllib.parse as _up
-    row = []
-    name = f"{(title or '').strip()} {(artist or '').strip()}".strip()
-    if name:
-        row.append(InlineKeyboardButton(
-            text=t("m_extracted_google_btn", ulang),
-            url="https://www.google.com/search?q=" + _up.quote_plus(name)))
+    """The buttons under an extracted-audio message (extracted-audio UI,
+    2026-11-09): EXACTLY ONE button — re-identify via the video's
+    EXISTING identify button (vid:id:<token>). The Google button was
+    removed from extracted audio by the user's order; the retry runs
+    the previously defined supplementary re-identification, unchanged.
+    The single-button row renders full-width by Telegram's layout.
+    Never used on an identified/bank send; never playlist/lyrics/
+    wrong-song under an extracted file. Returns None when no retry
+    callback can be built (a keyboard without the retry would be a
+    Google-only keyboard, which the order forbids)."""
     cb = None
     if token:
         cb = f"vid:id:{token}"
     elif file_id and user_id:
         cb = _find_identify_callback(file_id, user_id, kind)
     if cb:
-        row.append(InlineKeyboardButton(
-            text=t("m_extracted_retry_btn", ulang), callback_data=cb))
-    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=t("m_extracted_retry_btn", ulang), callback_data=cb)]])
+    return None
 
 
 async def _send_unconfirmed_audio(message, conn, data: bytes,
@@ -1796,7 +1793,7 @@ async def _send_unconfirmed_audio(message, conn, data: bytes,
                                   user_id: int | None = None,
                                   kind: str = "file"):
     """The unconfirmed identification response: ONLY the clip's own
-    audio with the new caption + Google/retry buttons. No «شناسایی شد»
+    audio with the new caption + the single retry button. No «شناسایی شد»
     card, no separate text message. Returns the sent message, or None
     when extraction is impossible (the caller then sends the honest
     text)."""
@@ -1815,8 +1812,8 @@ async def _send_unconfirmed_media(message, conn, data: bytes,
                                   file_id: str | None = None,
                                   user_id: int | None = None):
     """Unconfirmed response for a directly-sent file. Video: the clip's
-    own extracted audio (new caption + buttons). Audio: the file itself
-    back, with the buttons and NO caption — nothing was extracted from
+    own extracted audio (new caption + the single retry button). Audio: the file itself
+    back, with the button and NO caption — nothing was extracted from
     it. Voice/document: no audio send (same coverage as before).
     Returns the sent message or None."""
     if media_kind == "video":
@@ -2158,8 +2155,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 or result.detail == "lookup_error":
             # NOT confirmed (single source, disagreement, no match, or
             # lookup error): NO «شناسایی شد» card at all — ONLY the
-            # clip's own audio with the new caption + Google/retry
-            # buttons. The retry reuses THIS button's token, so it runs
+            # clip's own audio with the new caption + the single retry
+            # button. The retry reuses THIS button's token, so it runs
             # the existing identify flow on the same video.
             sent = await _send_unconfirmed_audio(
                 callback.message, conn, data, result.title, result.artist,
@@ -3545,7 +3542,7 @@ async def _answer_link_identify_result(message, conn, config, outcome,
     heard (a reachable video with an audio track) but the name was NOT
     confirmed (single source, disagreement, no match, lookup error),
     ONLY the video's own audio is sent — a real, validated MP3 with
-    the new caption + Google/retry buttons, never a «شناسایی شد» card
+    the new caption + the single retry button, never a «شناسایی شد» card
     and never a second honest text. The plain video-download path
     (``_send_link_video``) is untouched and stays independent of
     identification.
@@ -3633,13 +3630,13 @@ async def _answer_link_identify_result(message, conn, config, outcome,
     elif status in ("unconfirmed", "not_found", "error"):
         # NOT confirmed (single source, disagreement, no match, or
         # lookup error): NO «شناسایی شد» card — ONLY the clip's own
-        # audio with the new caption + Google/retry buttons. The retry
+        # audio with the new caption + the single retry button. The retry
         # reuses the video's existing identify token when one is
         # registered for the sent video. The channel stage still runs
         # on the page text (a different input, not the identification
         # answer). When nothing was heard / extraction fails, the
         # existing honest text is sent instead (edge case — the user
-        # must get something), with the same Google/retry buttons and
+        # must get something), with the single retry button and
         # no bank button.
         _vid_fid = None
         try:
@@ -5807,8 +5804,8 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             media.file_id if media is not None else None,
             message.from_user.id, media_kind, result.source)
         if sent is None:
-            # Extraction impossible: the honest line, with the same
-            # Google/retry buttons (no bank button).
+            # Extraction impossible: the honest line, with the single
+            # retry button (no bank button).
             _kb = _extracted_audio_kb(
                 result.title, result.artist, ulang,
                 file_id=media.file_id if media is not None else None,
@@ -6269,7 +6266,7 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                 pass
         # IDENTITY CHECK FAILED: the candidate file was not the
         # identified song. Send the clip's ORIGINAL audio (stream copy)
-        # with the new caption + Google/retry buttons — never the wrong
+        # with the new caption + the single retry button — never the wrong
         # file, never a re-encode labelled as the song. If the clip is
         # unavailable, fall through to the honest no-full message below.
         if _verify_failed:
@@ -6325,7 +6322,7 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                             with open(apath, "rb") as af:
                                 audio_bytes = af.read()
                             # Extracted audio: Avano's title + performer,
-                            # real probed duration, new caption + buttons.
+                            # real probed duration, new caption + the single retry button.
                             _ex_kb = _extracted_audio_kb(
                                 title, artist, ulang, file_id=file_id,
                                 user_id=callback.from_user.id, kind="file")

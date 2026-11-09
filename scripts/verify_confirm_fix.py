@@ -3,7 +3,7 @@ result-unification fix (2026-11-09): a song name is shown as
 «شناسایی شد» ONLY when TWO sources agree (exclusive bank, or
 Shazam+AudD). A single source, a disagreement, or no identification
 never gets a card — ONLY the clip's own audio with the new caption +
-Google/retry buttons. NO card is ever sent before the file status is
+the single retry button. NO card is ever sent before the file status is
 known: a temporary «در حال جستجوی موسیقی...» status stays until the
 ONE final message, then is deleted. A confirmed song's ONE final
 message is the audio with the identified caption + real duration +
@@ -56,7 +56,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-import urllib.parse as _up
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,7 +77,7 @@ _TITLE = "Test Song"
 _ARTIST = "Test Artist"
 _NEW_FA = vm._NEW_FA
 _GOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
-_RETRY_FA = "🔄 شناسایی مجدد"
+_RETRY_FA = "🔍 جستجوی مجدد آهنگ"
 
 
 class _CardSent(vs._FakeSent):
@@ -332,8 +331,8 @@ async def main():
         check("C1g extracted audio carries the new caption",
               kw.get("caption", "") == _NEW_FA, f"caption={kw.get('caption')!r}")
         _texts = _kb_texts(kw.get("reply_markup"))
-        check("C1g extracted audio has BOTH new buttons, in ONE row",
-              _GOOGLE_FA in _texts and _RETRY_FA in _texts
+        check("C1g extracted audio has ONLY the retry button, in ONE row",
+              _texts == [_RETRY_FA]
               and len(kw.get("reply_markup").inline_keyboard) == 1,
               f"buttons={_texts}")
         check("C1g retry button reuses the video's existing token",
@@ -497,36 +496,33 @@ async def main():
     except Exception as exc:
         check("C4 extracted metadata", False, f"{type(exc).__name__}: {exc}")
 
-    # ---- C5: Google URL ---------------------------------------------------
+    # ---- C5: extracted keyboard has NO Google URL (2026-11-09) --------
     try:
         kb = h._extracted_audio_kb(_TITLE, _ARTIST, "fa", token="tok123")
         urls = [u for u in _kb_urls(kb) if u]
-        check("C5 Google URL contains the name query",
-              len(urls) == 1
-              and urls[0] == "https://www.google.com/search?q="
-              + _up.quote_plus(f"{_TITLE} {_ARTIST}"),
-              f"urls={urls}")
-        check("C5 Google URL decodes back to the name",
-              _up.parse_qs(_up.urlparse(urls[0]).query).get("q") == [f"{_TITLE} {_ARTIST}"],
-              f"urls={urls}")
+        check("C5 extracted keyboard has exactly ONE button (the retry)",
+              _kb_texts(kb) == [_RETRY_FA]
+              and len(kb.inline_keyboard) == 1,
+              f"buttons={_kb_texts(kb)}")
+        check("C5 extracted keyboard carries NO URL at all",
+              urls == [], f"urls={urls}")
         kb_fa = h._extracted_audio_kb("آهنگ تست", "خواننده تست", "fa",
                                       token="tok123")
-        _u = [u for u in _kb_urls(kb_fa) if u][0]
-        check("C5 Persian name is URL-encoded in the Google query",
-              _up.parse_qs(_up.urlparse(_u).query).get("q") == ["آهنگ تست خواننده تست"],
-              f"url={_u}")
+        check("C5 Persian name also gives only the retry button, no URL",
+              _kb_texts(kb_fa) == [_RETRY_FA]
+              and [u for u in _kb_urls(kb_fa) if u] == [],
+              f"buttons={_kb_texts(kb_fa)} urls={_kb_urls(kb_fa)}")
         kb_none = h._extracted_audio_kb("", "", "fa")
-        check("C5 no name at all omits the Google button",
+        check("C5 no name and no token gives NO keyboard",
               kb_none is None, f"kb={kb_none}")
         kb_name_only = h._extracted_audio_kb(_TITLE, _ARTIST, "fa")
-        check("C5 name without a token gives only the Google button",
-              _kb_texts(kb_name_only) == [_GOOGLE_FA],
-              f"buttons={_kb_texts(kb_name_only)}")
+        check("C5 name without a token gives NO keyboard (no Google fallback)",
+              kb_name_only is None, f"kb={kb_name_only}")
         check("C5 retry button carries vid:id:<token>",
               [c for c in _kb_callbacks(kb) if c] == ["vid:id:tok123"],
               f"callbacks={_kb_callbacks(kb)}")
     except Exception as exc:
-        check("C5 Google button", False, f"{type(exc).__name__}: {exc}")
+        check("C5 extracted keyboard", False, f"{type(exc).__name__}: {exc}")
 
     # ---- C6: retry triggers the existing identify flow --------------------
     try:

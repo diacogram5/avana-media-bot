@@ -12,7 +12,7 @@ message, then is deleted. Three final cases:
       case-(b) caption (name + artist + "full version not found") and
       the same 3 identified buttons — never the corporate caption;
   (c) not identified at all -> the CURRENT corporate caption
-      (byte-exact) + ONLY Google + retry, no identified buttons.
+      (byte-exact) + ONLY the single retry button, no identified buttons.
 
 Cases:
   U1  Case (a): one audio, identified caption + real duration, the 3
@@ -24,11 +24,11 @@ Cases:
   U3  Case (b) no file: confirmed name + no file at all -> same as
       U2 (clip audio, case-(b) caption, 3 buttons).
   U4  Case (c): _send_unconfirmed_media -> corporate caption
-      byte-exact + ONLY Google + retry; performer Avano + real
+      byte-exact + ONLY the single retry button; performer Avano + real
       duration; no name, no identified buttons.
   U5  Gate: a single-source (Shazam-only) video-button tap -> NO
       identified message at all (no «شناسایی شد» anywhere), exactly
-      one audio with the corporate caption + Google/retry, and the
+      one audio with the corporate caption + the single retry button, and the
       temp status deleted.
   U6  Caption limit: very long title/artist -> the identified caption
       and the case-(b) caption are both <= 1024 chars and carry an
@@ -75,7 +75,7 @@ _REPORT_FA = "⚠️ گزارش شناسایی اشتباه ⚠️"
 _LYRICS_FA = "📝 متن آهنگ و ترجمه"
 _PLAYLIST_FA = "🎵 افزودن به پلی‌لیست"
 _GOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
-_RETRY_FA = "🔄 شناسایی مجدد"
+_RETRY_FA = "🔍 جستجوی مجدد آهنگ"
 _VIDEO_GOOGLE_FA = "🌐 جستجو در Google"
 _VIDEO_YT_FA = "▶️ جستجو در YouTube"
 _SEARCHING_FA = "در حال جستجوی موسیقی..."
@@ -330,8 +330,8 @@ async def main():
                   kw.get("caption", "") == _NEW_FA,
                   f"caption={kw.get('caption')!r}")
             _btns = _kb_texts(kw.get("reply_markup"))
-            check("U4 ONLY Google + retry in ONE row (no identified buttons)",
-                  _btns == [_GOOGLE_FA, _RETRY_FA]
+            check("U4 ONLY the retry button in ONE row (no Google, no identified buttons)",
+                  _btns == [_RETRY_FA]
                   and len(kw.get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_btns}")
             check("U4 no name in the caption",
@@ -379,8 +379,8 @@ async def main():
                   and msg.audio_kwargs[0].get("caption", "") == _NEW_FA,
                   f"calls={msg.audio_calls}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U5 single-source audio has ONLY Google + retry, in ONE row",
-                  _btns == [_GOOGLE_FA, _RETRY_FA]
+            check("U5 single-source audio has ONLY the retry button, in ONE row",
+                  _btns == [_RETRY_FA]
                   and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_btns}")
             check("U5 temp status was sent once and deleted",
