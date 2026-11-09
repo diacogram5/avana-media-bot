@@ -2109,12 +2109,18 @@ def _smart_search_eligible(callback, entry, hit) -> bool:
       audio/voice file, kind "audio");
     - the 1b cache hit is a clip result (kind "clip") with a known
       title (the search reuses the prior identify info — it never
-      re-runs identification, and it cannot run without a title).
+      re-runs identification, and it cannot run without a title);
+    - the identification is CONFIRMED (status "identified", fix
+      round 1, finding 1B: an unconfirmed single-source name must
+      never be searched — the tap falls back to the normal BG
+      identify path instead).
     A kind "full" hit already HAS the full version; a title-less hit
     has nothing to search for. Never raises.
     """
     try:
         if not isinstance(hit, dict) or not (hit.get("title") or "").strip():
+            return False
+        if hit.get("status") != "identified":
             return False
         if (hit.get("kind") or "clip") != "clip":
             return False
@@ -2212,9 +2218,26 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
     title = (hit.get("title") or "").strip()
     artist = (hit.get("artist") or "").strip()
     t0 = _time.monotonic()
-    clip_fp = await _smart_clip_fingerprint(callback, entry, hit)
-    outcome = await _smart_search(artist, title, clip_fingerprint=clip_fp)
+    # Fix round 1, finding 2B: the search call used to run BEFORE the
+    # try — an exception there escaped with no answer sent and no log
+    # line. Everything now runs inside the try, and the outcome is
+    # logged the moment the search returns, so a missing message is
+    # distinguishable from a missing branch. The function still never
+    # raises; it returns the outcome status ("found" / "not_found" /
+    # "error") so the caller can log the true total status.
+    status_out = "error"
     try:
+        clip_fp = await _smart_clip_fingerprint(callback, entry, hit)
+        outcome = await _smart_search(artist, title, clip_fingerprint=clip_fp)
+        status_out = outcome.status
+        try:
+            _timing.log_stage(
+                log, "identify_stage", req_id or _timing.new_req_id(),
+                t0, "smart_searched", t0, status=outcome.status,
+                checked=getattr(outcome, "checked", 0),
+                ms=int((_time.monotonic() - t0) * 1000))
+        except Exception:
+            pass
         if outcome.status == "found" and outcome.file is not None:
             f = outcome.file
             sent = None
@@ -2269,11 +2292,17 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
                 except Exception:
                     pass
             log_event(log, "smart_search", stage="sent",
+                      req_id=req_id,
                       ms=int((_time.monotonic() - t0) * 1000),
                       source=f.source, sent=bool(sent))
+            if sent is None:
+                # The verified file could not be sent: the delivered
+                # outcome is the honest error, not "found".
+                status_out = "error"
         elif outcome.status == "error":
             await message.answer(t("m_smart_error", ulang))
             log_event(log, "smart_search", stage="error",
+                      req_id=req_id,
                       ms=int((_time.monotonic() - t0) * 1000),
                       detail=outcome.detail)
         else:  # not_found
@@ -2332,8 +2361,10 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
                     except Exception:
                         pass
             log_event(log, "smart_search", stage="not_found",
+                      req_id=req_id,
                       ms=int((_time.monotonic() - t0) * 1000),
                       checked=outcome.checked,
+                      detail=outcome.detail,
                       links=len(stream.links) if stream else 0,
                       preview=bool(stream and stream.preview_disk_path),
                       survey=survey_sent)
@@ -2350,6 +2381,7 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
             await message.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass
+    return status_out
 
 
 @router.callback_query(F.data.startswith("vid:id:"))
@@ -2472,9 +2504,20 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 except Exception:
                     pass
             _t_smart = _time.perf_counter()
-            await _run_smart_search_tap(
+            _smart_status = await _run_smart_search_tap(
                 callback, conn, entry, _hit, _cache_key, token,
                 ulang, req_id=_req_id)
+            # Fix round 1, finding 6: the tap answered from the smart
+            # path, so the total status is the smart outcome — never
+            # the default "error" the finally logged while result
+            # stayed None. A found + sent file logs "found".
+            if _smart_status:
+                result = AudioIdResult(
+                    status=_smart_status,
+                    title=_hit.get("title", ""),
+                    artist=_hit.get("artist", ""),
+                    confirmed=_hit.get("status") == "identified",
+                    source=_hit.get("source") or "smart")
             _send_ms = int((_time.perf_counter() - _t_smart) * 1000)
             _log_identify_timing()
             _timing.log_stage(log, "identify_stage", _req_id, _t_req,

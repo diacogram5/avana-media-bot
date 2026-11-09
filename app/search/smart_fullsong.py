@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -89,6 +90,12 @@ _SMART_MAX_CANDIDATES_PER_VARIANT = 4
 # not-found is not re-searched for 10 minutes (in-memory only — no
 # Turso query in the waiting path). A found file is cached by the
 # caller (1b cache + song_file_cache), not here.
+# KNOWN STALENESS (2026-11-10, fix round 1, finding 1E): the key is
+# per-SONG (artist|title), not per-request — a verified not-found
+# for one reel suppresses a re-search of the same song from another
+# reel for 10 minutes. Keying per-request needs the 1b cache key
+# threaded through search_smart_full_version (3 signature changes,
+# not a one-line fix) — deferred; the 10-minute window bounds it.
 _NEGATIVE_TTL_SEC = 600
 _NEGATIVE: dict[str, float] = {}
 
@@ -248,6 +255,7 @@ def _post_accepted(post_title: str, artist: str, title: str) -> bool:
 
 async def _smart_wp_candidates(client, base: str, style: str, q: str,
                                artist: str, title: str,
+                               deadline: float | None = None,
                                ) -> tuple[list[tuple[float, str, str]], bool]:
     """Ranked (rank, file_url, site) candidates from ONE wp site, plus
     whether the WP search itself ran (HTTP 200 — even with zero
@@ -255,29 +263,58 @@ async def _smart_wp_candidates(client, base: str, style: str, q: str,
     nothing" (not_found) from "no site could even be reached" (error).
 
     WP /v2/search -> tier filter -> the post's public HTML page ->
-    mp3 links from the page anchors. The /search endpoint returns
-    {title, url} with NO post id (verified in the free-only study's
-    sweep), so there is no WP-API post-content fetch here — the page
-    is the source of the links, exactly as the study found them (the
-    128/320 anchors). Never raises.
+    mp3 links from the page anchors (href-aware extraction: melonmusic
+    serves raw spaces in hrefs, which _FILE_RE cannot match).
+    Per-post page fetches are bounded (2 s each) and deadline-checked:
+    ONE slow page fails PER-POST — it never aborts the whole site
+    call (fix round 1, finding 1D: the old 20 s page timeout inside
+    a 6 s site budget aborted the entire site on the first slow page).
+    per_page is 10: the WP search is ONE HTTP call regardless of
+    per_page, so a wider window costs no search time — extra posts
+    only cost bounded page fetches, and the tier filter rejects junk,
+    so more posts is more recall, not more noise.
+    A per-site log line is emitted on every exit (fix round 1,
+    finding 5: the live logs had zero "melon" lines because nothing
+    logged a site that returned no candidates). Never raises.
     """
     out: list[tuple[float, str, str]] = []
+    site = base.replace("https://", "")
+
+    def _site_log(ran: bool, wp_posts: int = 0, tier_accepted: int = 0,
+                  error: str | None = None) -> None:
+        try:
+            log_event(log, "smart_search", stage="site_search",
+                      site=site, query=q, wp_posts=wp_posts,
+                      tier_accepted=tier_accepted,
+                      candidates=len(out), ran=ran,
+                      error=error)
+        except Exception:
+            pass
+
+    if deadline is None:
+        deadline = time.monotonic() + _SMART_SITE_TIMEOUT_SEC
     try:
-        resp = await client.get(
-            _search_url(base, style),
-            params={"search": q, "per_page": 5})
-    except Exception:
+        search_timeout = max(0.5, min(3.0, deadline - time.monotonic()))
+        resp = await asyncio.wait_for(
+            client.get(_search_url(base, style),
+                       params={"search": q, "per_page": 10}),
+            timeout=search_timeout)
+    except Exception as exc:
+        _site_log(False, error=type(exc).__name__)
         return out, False
     if resp.status_code != 200:
+        _site_log(False, error=f"http_{resp.status_code}")
         return out, False
     try:
         data = resp.json()
     except Exception:
+        _site_log(False, error="bad_json")
         return out, False
     if not isinstance(data, list):
+        _site_log(False, error="bad_shape")
         return out, False
-    site = base.replace("https://", "")
-    for p in data[:5]:
+    tier_accepted = 0
+    for p in data[:10]:
         if not isinstance(p, dict):
             continue
         ptitle = p.get("title") or ""
@@ -286,15 +323,22 @@ async def _smart_wp_candidates(client, base: str, style: str, q: str,
         tier = _post_tier(ptitle, artist, title)
         if tier == 0:
             continue
+        tier_accepted += 1
         page_url = p.get("url") or ""
         if not page_url.startswith("http"):
             continue
+        # Per-post budget: stop fetching pages when the site deadline
+        # is near — the site returns its partial candidates instead
+        # of dying on the backstop.
+        if time.monotonic() >= deadline - 0.3:
+            break
         file_urls: list[str] = []
         try:
-            hr = await client.get(page_url, timeout=20)
+            page_timeout = max(0.3, min(2.0, deadline - time.monotonic()))
+            hr = await asyncio.wait_for(client.get(page_url),
+                                        timeout=page_timeout)
             if hr.status_code == 200:
-                file_urls = [m.group(0)
-                             for m in _FILE_RE.finditer(hr.text)]
+                file_urls = _extract_mp3_urls(hr.text)
         except Exception:
             file_urls = []
         if not file_urls:
@@ -303,7 +347,73 @@ async def _smart_wp_candidates(client, base: str, style: str, q: str,
             fname = url.rsplit("/", 1)[-1]
             rank = _rank_candidate(fname, artist, title, tier=tier)
             out.append((rank, url, site))
+    _site_log(True, wp_posts=len(data), tier_accepted=tier_accepted)
     return out, True
+
+
+# mp3/m4a URLs from a post page, tolerant of raw spaces in hrefs.
+# _FILE_RE (shared with the normal path, app/search/fullsong.py) can
+# NOT match a URL that contains raw spaces: its [^\s\"'<>]+ stops at
+# the first space, so a page whose anchors are unencoded yields zero
+# candidates. melonmusic serves exactly that
+# (".../Ho3ein - Sob Zohr Shab [128].mp3" — proven 2026-11-10 on the
+# REAL post-4021 page: _FILE_RE finds [], the hrefs hold both 128 and
+# 320). The smart path therefore extracts href="..." values first and
+# percent-encodes spaces/brackets, then ALSO runs _FILE_RE for URLs
+# that appear outside hrefs (src=, plain text) — deduped on the
+# encoded form. This lives ONLY in the smart path: the shared _FILE_RE
+# is untouched (normal path unchanged). Never raises.
+_HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _encode_mp3_url(url: str) -> str:
+    """Percent-encode a candidate mp3 URL's unsafe chars (spaces,
+    brackets, non-ASCII) so httpx can fetch it. Already-encoded URLs
+    pass through unchanged (% stays safe). Never raises."""
+    try:
+        from urllib.parse import quote, urlsplit, urlunsplit
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc,
+                           quote(parts.path, safe="/%"),
+                           parts.query, parts.fragment))
+    except Exception:
+        return url
+
+
+def _extract_mp3_urls(html: str) -> list[str]:
+    """All mp3/m4a URLs on a post page (href-aware + _FILE_RE).
+
+    Order: href values first (space-tolerant), then _FILE_RE matches
+    for anything outside an href. Deduped on the encoded URL.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        try:
+            low = (raw or "").strip().lower().split("?")[0]
+            if not low.startswith("http"):
+                return
+            if not (low.endswith(".mp3") or low.endswith(".m4a")):
+                return
+            enc = _encode_mp3_url((raw or "").strip())
+            if enc and enc not in seen:
+                seen.add(enc)
+                out.append(enc)
+        except Exception:
+            pass
+
+    try:
+        for m in _HREF_RE.finditer(html or ""):
+            _add(m.group(1))
+    except Exception:
+        pass
+    try:
+        for m in _FILE_RE.finditer(html or ""):
+            _add(m.group(0))
+    except Exception:
+        pass
+    return out
 
 
 def _rank_candidate(fname: str, artist: str, title: str, tier: int = 2) -> float:
@@ -342,7 +452,9 @@ async def _download_to_disk(client, url: str, timeout_s: float,
         fd = None
         written = 0
         first = True
-        async with client.stream("GET", url, headers={"User-Agent": _UA["User-Agent"]}) as resp:
+        async with client.stream("GET", url,
+                                 headers={"User-Agent": _UA["User-Agent"]},
+                                 timeout=timeout_s) as resp:
             if resp.status_code not in (200, 206):
                 return None
             async for chunk in resp.aiter_bytes(65536):
@@ -455,6 +567,16 @@ async def search_smart_full_version(
                     timeout=min(12.0, max(1.0, deadline - time.monotonic())))
             except Exception:
                 expected_duration_sec = None
+            if expected_duration_sec is None:
+                # Fix round 1, finding 1G: iTunes + Deezer both failed
+                # (or matched nothing), so the duration gate is SKIPPED
+                # for this search — tags + version still apply. Logged
+                # (never silent); the outcome already records
+                # expected_duration_sec=None.
+                log_event(log, "smart_search",
+                          stage="no_expected_duration",
+                          detail="itunes_deezer_no_match",
+                          title=title, artist=artist)
         for variant in smart_query_variants(artist, title):
             if time.monotonic() >= deadline:
                 break
@@ -463,9 +585,16 @@ async def search_smart_full_version(
             # never blocks the others.
             async def _one_site(base, style):
                 try:
+                    # The per-post budget inside _smart_wp_candidates
+                    # is driven by this deadline (fix round 1, 1D):
+                    # a slow page fails per-post instead of aborting
+                    # the whole site call on the wait_for backstop.
+                    site_deadline = time.monotonic() + min(
+                        _SMART_SITE_TIMEOUT_SEC, remaining)
                     return await asyncio.wait_for(
                         _smart_wp_candidates(client, base, style, variant,
-                                             artist, title),
+                                             artist, title,
+                                             deadline=site_deadline),
                         timeout=min(_SMART_SITE_TIMEOUT_SEC, remaining))
                 except Exception:
                     return [], False

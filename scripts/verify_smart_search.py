@@ -68,6 +68,32 @@ Cases:
       vip1 pattern, no vip\\d* change (normal path unchanged).
   T22 Live tree untouched: stage-render-probe still has the probe
       code and has NO smart-search files.
+  T23 (fix 1B) eligibility requires CONFIRMED identification:
+      unconfirmed / not_found hits are NOT eligible; confirmed is.
+  T24 (fix 1D) one slow post page fails PER-POST: the site still
+      returns the fast post's candidates, in < 5 s (old code aborted
+      the whole site call on the 6 s backstop).
+  T25 (fix 1G) iTunes+Deezer both fail -> expected_duration_sec is
+      None AND a "no_expected_duration" warning is logged.
+  T26 (fix 2B) the search raising escapes nothing: the tap still
+      sends exactly the honest error text and returns "error".
+  T27 (fix 5) per-site logging: a site_search line exists for BOTH
+      sites even when one returns zero candidates (the live logs had
+      zero "melon" lines because nothing was logged per site).
+  T28 (fix 6) the tap returns its outcome status (found /
+      not_found / error); a full video_identify run with a found
+      outcome logs identify_stage total status "found", not "error".
+  T29 (fix 9 + 3-song test, REAL fixtures): _extract_mp3_urls on
+      the REAL melonmusic post-4021 page finds both mp3s where
+      _FILE_RE finds none; Sob Zohr Shab (Ho3ein, 196.8 s) is FOUND
+      via melonmusic (javanmelody has only the 230.1 s DJ Alvan
+      remix, correctly rejected on duration); Joft 6 is NOT FOUND
+      as identified (HesamTiem) and as catalog (Amir Tataloo) — the
+      javanmelody file is the right song but its tags say "Joft
+      shish", a title_mismatch (digit "6" vs word "shish"); En
+      Güzel Tesadüfüm (Tefo & SEKO, reel Dd1niVHN07n) is NOT FOUND
+      with checked 0 — both v1 sources genuinely carry no Tefo
+      post, so the failure there is upstream (identify), not search.
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -105,6 +131,17 @@ FIXTURES = Path.home() / "workspace" / "free-only-study"
 JAVAN = FIXTURES / "javanmelody-taziyane-remix-320.mp3"
 MELON = FIXTURES / "melonmusic-taziyane-remix-320.mp3"
 MSB = FIXTURES / "msbmusic-taziyane.mp3"
+# Songs 2–3 of the mandatory 3-song test (fix round 1): REAL files
+# downloaded 2026-11-10 from the REAL post pages (ffprobe-verified
+# tags + durations). Dd1niVHN07n's song has no file in either v1
+# source, so it needs no fixture (T29e proves the empty searches).
+SONG23 = FIXTURES / "song2-3"
+JOFT6 = SONG23 / "joft6-javan-320.mp3"
+SOB = SONG23 / "sobzohrshab-melon-128.mp3"
+SOB_REMIX = SONG23 / "sobzohrshab-remix-javan-128.mp3"
+JAVAN11303_HTML = SONG23 / "javan11303.html"
+JAVAN1657_HTML = SONG23 / "javan1657.html"
+MELON4021_HTML = SONG23 / "melon4021.html"
 
 ARTIST = "Amir Tataloo"
 TITLE = "Taziyane (Remix)"
@@ -165,16 +202,22 @@ class _FakeClient:
 
     searches: {host: hits | 'raise' | http-status}; pages:
     {url-substring: html | 'raise'}; mp3s: {url-substring: bytes};
-    sleep_hosts: {host: seconds} (sleeps before answering a search).
+    sleep_hosts: {host: seconds} (sleeps before answering a search);
+    sleep_pages: {url-substring: seconds} (sleeps before a page).
+    iTunes is query-aware: the term decides which catalog record is
+    returned (Taziyane default; "Joft" / "Sob" / "Tesad" for the
+    3-song test), so resolve_expected_duration exercises the real
+    title/artist matching per song.
     """
 
     def __init__(self, *, itunes=True, searches=None, pages=None,
-                 mp3s=None, sleep_hosts=None):
+                 mp3s=None, sleep_hosts=None, sleep_pages=None):
         self.itunes = itunes
         self.searches = searches or {}
         self.pages = pages or {}
         self.mp3s = mp3s or {}
         self.sleep_hosts = sleep_hosts or {}
+        self.sleep_pages = sleep_pages or {}
         self.calls: list[tuple[str, str]] = []
 
     async def get(self, url, params=None, timeout=None):
@@ -182,11 +225,29 @@ class _FakeClient:
         if "itunes.apple.com/search" in url:
             if not self.itunes:
                 return _FakeResp(404)
-            return _FakeResp(200, {"results": [{
-                "trackName": TITLE, "artistName": ARTIST,
-                "trackTimeMillis": 341026,
-                "trackViewUrl": "https://music.apple.com/us/album/x",
-                "previewUrl": "https://audio-ssl.itunes.apple.com/x.m4a"}]})
+            term = ((params or {}).get("term") or "")
+            if "Joft" in term:
+                rec = {"trackName": "Joft 6", "artistName": "Amir Tataloo",
+                       "trackTimeMillis": 225555,
+                       "trackViewUrl": "https://music.apple.com/us/album/x",
+                       "previewUrl": "https://audio-ssl.itunes.apple.com/x.m4a"}
+            elif "Sob" in term:
+                rec = {"trackName": "Sob Zohr Shab", "artistName": "Ho3ein",
+                       "trackTimeMillis": 196807,
+                       "trackViewUrl": "https://music.apple.com/us/album/x",
+                       "previewUrl": "https://audio-ssl.itunes.apple.com/x.m4a"}
+            elif "Tesad" in term or "Güzel" in term:
+                rec = {"trackName": "En Güzel Tesadüfüm",
+                       "artistName": "Tefo & SEKO",
+                       "trackTimeMillis": 164656,
+                       "trackViewUrl": "https://music.apple.com/us/album/x",
+                       "previewUrl": "https://audio-ssl.itunes.apple.com/x.m4a"}
+            else:
+                rec = {"trackName": TITLE, "artistName": ARTIST,
+                       "trackTimeMillis": 341026,
+                       "trackViewUrl": "https://music.apple.com/us/album/x",
+                       "previewUrl": "https://audio-ssl.itunes.apple.com/x.m4a"}
+            return _FakeResp(200, {"results": [rec]})
         if "api.deezer.com/search" in url:
             return _FakeResp(200, {"data": []})
         for host, hits in self.searches.items():
@@ -200,12 +261,14 @@ class _FakeClient:
                 return _FakeResp(200, hits)
         for sub, html in self.pages.items():
             if sub in url:
+                if sub in self.sleep_pages:
+                    await asyncio.sleep(self.sleep_pages[sub])
                 if html == "raise":
                     raise RuntimeError("page failed")
                 return _FakeResp(200, text=html)
         return _FakeResp(404)
 
-    def stream(self, method, url, headers=None):
+    def stream(self, method, url, headers=None, timeout=None):
         self.calls.append(("STREAM", url))
         for sub, data in self.mp3s.items():
             if sub in url:
@@ -233,6 +296,54 @@ def _javan_page(mp3=JAVAN_MP3):
 
 def _melon_page():
     return f'<html><a href="{MELON_MP3}">320</a></html>'
+
+
+# --- 3-song test (fix round 1): REAL WP /v2/search responses + REAL
+# post pages, fetched 2026-11-10 via the browser fetcher (browser.open)
+# and curl. Titles are the sites' own Persian titles, byte-identical
+# to the live responses; pages are the live HTML files saved under
+# ~/workspace/free-only-study/song2-3/.
+def _sob_javan_hits():
+    return [{"title": "دانلود آهنگ حصین صب ظهر شاب (دی جی الوان ریمیکس) | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/1657/%d8%ad%d8%b5%db%8c%d9%86-%d8%b5%d8%a8-%d8%b8%d9%87%d8%b1-%d8%b4%d8%a8-%d8%af%db%8c-%d8%ac%db%8c-%d8%a7%d9%84%d9%88%d8%a7%d9%86-%d8%b1%db%8c%d9%85%db%8c%da%a9%d8%b3"}]
+
+
+def _sob_melon_hits():
+    return [{"title": "دانلود آهنگ حصین اه نام صباح ظهر شاب",
+             "url": "https://melonmusic.ir/4021/%d8%ad%d8%b5%db%8c%d9%86-%d8%b5%d8%a8%d8%ad-%d8%b8%d9%87%d8%b1-%d8%b4%d8%a8/"},
+            {"title": "دانلود گلچین معروف ترین آهنگ های حصین شاد و غمگین",
+             "url": "https://melonmusic.ir/4065/%da%af%d9%84%da%86%db%8c%d9%86-%d8%a2%d9%87%d9%86%da%af-%d9%87%d8%a7%db%8c-%d8%ad%d8%b5%db%8c%d9%86/"},
+            {"title": "ریمیکس آهنگ ای ای سی ریمیکس اه نام صبح ظهر شب",
+             "url": "https://melonmusic.ir/20925/%d8%b1%db%8c%d9%85%db%8c%da%a9%d8%b3-%d8%b5%d8%a8%d8%ad-%d8%b8%d9%87%d8%b1-%d8%b4%d8%a8-%d8%a8%db%8c-%d8%a8%db%8c-%d8%b3%db%8c-%d8%b1%db%8c%d9%85%db%8c%da%a9%d8%b3/"}]
+
+
+def _joft_javan_hits():
+    return [{"title": "دانلود آهنگ امیر تتلو جفت 6 | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/11303/%d8%a7%d9%85%db%8c%d8%b1-%d8%aa%d8%aa%d9%84%d9%88-%d8%ac%d9%81%d8%aa-6"},
+            {"title": "دانلود آهنگ ابراهیم چاوشی جفت شش | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/29260/%d8%a7%d8%a8%d8%b1%d8%a7%d9%87%db%8c%d9%85-%da%86%d8%a7%d9%88%d8%b4%db%8c-%d8%ac%d9%81%d8%aa-%d8%b4%d8%b4"},
+            {"title": "دانلود آهنگ ابراهیم چاوشی جفت شیش | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/29173/%d8%a7%d8%a8%d8%b1%d8%a7%d9%87%db%8c%d9%85-%da%86%d8%a7%d9%88%d8%b4%db%8c-%d8%ac%d9%81%d8%aa-%d8%b4%db%8c%d8%b4"},
+            {"title": "دانلود آهنگ مصطفی تفتیش جفت منی | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/5211/%d9%85%d8%b5%d8%b7%d9%81%db%8c-%d8%aa%d9%81%d8%aa%db%8c%d8%b4-%d8%ac%d9%81%d8%aa-%d9%85%d9%86%db%8c"}]
+
+
+def _joft_melon_hits():
+    return [{"title": "دانلود آهنگ امیر خلوت و دارا اه نام جفت پوچ",
+             "url": "https://melonmusic.ir/35866/%d8%a7%d9%85%db%8c%d8%b1-%d8%ae%d9%84%d9%88%d8%aa-%d8%ac%d9%81%d8%aa-%d9%be%d9%88%da%86/"},
+            {"title": "دانلود گلچین معروف ترین آهنگ های مرجان شاد و غمگین",
+             "url": "https://melonmusic.ir/3866/%da%af%d9%84%da%86%db%8c%d9%86-%d8%a2%d9%87%d9%86%da%af-%d9%87%d8%a7%db%8c-%d9%85%d8%b1%d8%ac%d8%a7%d9%86/"},
+            {"title": "دانلود آهنگ شایان اشراقی اه نام ساعت جفت",
+             "url": "https://melonmusic.ir/18821/%d8%b4%d8%a7%db%8c%d8%a7%d9%86-%d8%a7%d8%b4%d8%b1%d8%a7%d9%82%db%8c-%d8%b3%d8%a7%d8%b9%d8%aa-%d8%ac%d9%81%d8%aa/"},
+            {"title": "دانلود آهنگ الیاد اه نام ساعت جفت",
+             "url": "https://melonmusic.ir/10582/%d8%a7%d9%84%db%8c%d8%a7%d8%af-%d8%b3%d8%a7%d8%b9%d8%aa-%d8%ac%d9%81%d8%aa/"},
+            {"title": "دانلود آهنگ نوان اه نام ساعت جفت",
+             "url": "https://melonmusic.ir/3059/%d9%86%d9%88%d8%a7%d9%86-%d8%b3%d8%a7%d8%b9%d8%aa-%d8%ac%d9%81%d8%aa/"}]
+
+
+def _real_page_html(path: Path) -> str:
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 def _fixture_bytes(path: Path) -> bytes:
@@ -310,13 +421,20 @@ async def _run_search(client, **kw):
 
 
 async def main() -> int:
-    for p in (JAVAN, MELON, MSB):
+    for p in (JAVAN, MELON, MSB, JOFT6, SOB, SOB_REMIX,
+              JAVAN11303_HTML, JAVAN1657_HTML, MELON4021_HTML):
         if not p.is_file():
             print(f"missing fixture: {p}")
             return 1
     javan_bytes = _fixture_bytes(JAVAN)
     melon_bytes = _fixture_bytes(MELON)
     msb_bytes = _fixture_bytes(MSB)
+    joft6_bytes = _fixture_bytes(JOFT6)
+    sob_bytes = _fixture_bytes(SOB)
+    sob_remix_bytes = _fixture_bytes(SOB_REMIX)
+    javan11303_html = _real_page_html(JAVAN11303_HTML)
+    javan1657_html = _real_page_html(JAVAN1657_HTML)
+    melon4021_html = _real_page_html(MELON4021_HTML)
 
     # T1: discovery tiers on the REAL post titles.
     check("T1 tier javanmelody 10959 is LOOSE (Persian-only)",
@@ -736,6 +854,231 @@ async def main() -> int:
     check("T22 live tree has NO smart-search files",
           not (live / "app" / "search" / "smart_fullsong.py").exists()
           and not (live / "scripts" / "verify_smart_search.py").exists())
+
+    # --- FIX ROUND 1 (2026-11-10) -------------------------------------
+    # T23 (fix 1B): eligibility requires CONFIRMED identification.
+    cb_audio = _Cb(_Msg(with_audio=True))
+    check("T23 gate: unconfirmed hit -> NOT eligible (never searched)",
+          not h._smart_search_eligible(
+              cb_audio, _link_entry(),
+              _clip_hit(status="unconfirmed")))
+    check("T23 gate: not_found hit with a name -> NOT eligible",
+          not h._smart_search_eligible(
+              cb_audio, _link_entry(),
+              _clip_hit(status="not_found", title="X", artist="Y")))
+    check("T23 gate: confirmed clip hit -> eligible",
+          h._smart_search_eligible(
+              cb_audio, _link_entry(), _clip_hit(status="identified")))
+
+    # T24 (fix 1D): one slow post page fails PER-POST, never the site.
+    client = _FakeClient(
+        searches={"javanmelody.ir": [
+            {"title": "دانلود آهنگ امیر تتلو جفت 6 | کیفیت اصلی 320",
+             "url": "https://javanmelody.ir/slow/x"},
+            {"title": JAVAN_TITLE,
+             "url": "https://javanmelody.ir/fast/x"}]},
+        pages={"javanmelody.ir/slow": "<html>no links</html>",
+               "javanmelody.ir/fast": _javan_page()},
+        sleep_pages={"javanmelody.ir/slow": 8.0})
+    t0 = time.monotonic()
+    cands, ran = await sf._smart_wp_candidates(
+        client, "https://javanmelody.ir", "wp-json", "q", ARTIST, TITLE)
+    elapsed = time.monotonic() - t0
+    check("T24 slow page fails per-post: site still returns the fast post",
+          ran and any("Taziyane" in u and "320" in u for _, u, _ in cands),
+          f"ran={ran} cands={cands} elapsed={elapsed:.2f}s")
+    check("T24 slow page does not abort the site (returns in < 5 s)",
+          elapsed < 5.0, f"elapsed={elapsed:.2f}s")
+
+    # T25 (fix 1G): iTunes+Deezer both fail -> None + warning logged.
+    # App loggers set propagate=False, so the capture handler must sit
+    # on the smart module's own logger (same pattern as verify_speedfix).
+    sf.log.addHandler(vs._ListHandler())
+    vs.LOG_LINES.clear()
+    client = _FakeClient(itunes=False,
+                         searches={"javanmelody.ir": [],
+                                   "melonmusic.ir": []})
+    out = await sf.search_smart_full_version(
+        ARTIST, TITLE, client=client, expected_duration_sec=None,
+        workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+    check("T25 no catalog match: expected_duration_sec is None (gate skipped, not silent)",
+          out.status == "not_found" and out.expected_duration_sec is None,
+          f"status={out.status} expected={out.expected_duration_sec}")
+    check("T25 no_expected_duration warning logged",
+          any('"stage": "no_expected_duration"' in ln for ln in vs.LOG_LINES),
+          f"lines={len(vs.LOG_LINES)}")
+
+    # T26 (fix 2B): the search raising escapes nothing.
+    async def _fake_raising(artist, title, clip_fingerprint=None):
+        raise RuntimeError("search exploded")
+
+    sf.search_smart_full_version = _fake_raising
+    try:
+        msg = _Msg(with_audio=True)
+        status = await h._run_smart_search_tap(
+            _Cb(msg), conn, _link_entry(), _clip_hit(), cache_key,
+            token, "fa", req_id="req-t26")
+    finally:
+        sf.search_smart_full_version = orig_search
+    check("T26 raising search: no exception escapes, tap returns 'error'",
+          status == "error", f"status={status}")
+    check("T26 raising search: exactly the honest error text sent",
+          msg.answers == [t("m_smart_error", "fa")],
+          f"answers={msg.answers}")
+
+    # T27 (fix 5): per-site logging — both sites visible, even at 0.
+    vs.LOG_LINES.clear()
+    client = _FakeClient(
+        searches={"javanmelody.ir": _javan_hits(), "melonmusic.ir": []},
+        pages={"javanmelody.ir/10959": _javan_page()},
+        mp3s={"dl.javanmelody.ir": javan_bytes})
+    out = await _run_search(client)
+    site_lines = [ln for ln in vs.LOG_LINES
+                  if '"stage": "site_search"' in ln]
+    check("T27 per-site log: a site_search line exists for BOTH sites",
+          any('"site": "javanmelody.ir"' in ln for ln in site_lines)
+          and any('"site": "melonmusic.ir"' in ln for ln in site_lines),
+          f"site_lines={len(site_lines)}")
+    check("T27 per-site log: melonmusic ran with 0 candidates is VISIBLE",
+          any('"site": "melonmusic.ir"' in ln and '"ran": true' in ln
+              and '"candidates": 0' in ln for ln in site_lines),
+          f"melon={[ln for ln in site_lines if 'melonmusic' in ln]}")
+    check("T27 per-site log: javanmelody line carries the WP hit count",
+          any('"site": "javanmelody.ir"' in ln and '"wp_posts": 1' in ln
+              for ln in site_lines))
+
+    # T28 (fix 6): the tap returns its outcome status.
+    for _fake, _want, _label in ((_fake_found, "found", "found"),
+                                 (_fake_not_found, "not_found", "not_found"),
+                                 (_fake_error, "error", "error")):
+        sf.search_smart_full_version = _fake
+        try:
+            msg = _Msg(with_audio=True)
+            status = await h._run_smart_search_tap(
+                _Cb(msg), conn, _link_entry(), _clip_hit(), cache_key,
+                token, "fa", req_id="req-t28")
+        finally:
+            sf.search_smart_full_version = orig_search
+        check(f"T28 tap returns '{_want}' for {_label} outcome",
+              status == _want, f"status={status}")
+    check("T28 the tap's outcome lines carry the request id",
+          any('"req_id": "req-t28"' in ln for ln in vs.LOG_LINES))
+    # T28b: full video_identify run with a FOUND outcome logs total "found".
+    vs.LOG_LINES.clear()
+    token3 = "tok-smart-t28"
+    entry3 = _link_entry()
+    entry3["user_id"] = 572595158
+    h._VIDEO_IDENTIFY[token3] = entry3
+    key3 = h._identify_result_key(link=entry3["link"])
+    h._identify_result_put(key3, {**_clip_hit(),
+                                  "created_at": time.time(), "ttl": 600})
+    sf.search_smart_full_version = _fake_found
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data=f"vid:id:{token3}")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        sf.search_smart_full_version = orig_search
+        h._VIDEO_IDENTIFY.pop(token3, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token3)
+    total_lines = [ln for ln in vs.LOG_LINES
+                   if '"stage": "total"' in ln
+                   and '"event": "identify_stage"' in ln]
+    check("T28 video_identify total status is 'found' after a found smart tap",
+          any('"status": "found"' in ln for ln in total_lines),
+          f"total_lines={total_lines}")
+
+    # T29 (fix 9 + 3-song test, REAL fixtures).
+    # T29a: the extractor on the REAL melonmusic post-4021 page.
+    got29a = sf._extract_mp3_urls(melon4021_html)
+    check("T29a _extract_mp3_urls finds both mp3s on the REAL melonmusic 4021 page",
+          set(got29a) == {
+              "https://dl.melonmusic.ir/Music/Ho3ein%20-%20Sob%20Zohr%20Shab%20%5B128%5D.mp3",
+              "https://dl.melonmusic.ir/Music/Ho3ein%20-%20Sob%20Zohr%20Shab%20%5B320%5D.mp3"},
+          f"found={got29a}")
+    check("T29a _FILE_RE alone finds NOTHING on that page (the live bug)",
+          sf._FILE_RE.findall(melon4021_html) == [])
+
+    # T29b: Sob Zohr Shab (Ho3ein, 196.8 s) — FOUND via melonmusic.
+    sf._NEGATIVE.clear()
+    client = _FakeClient(
+        searches={"javanmelody.ir": _sob_javan_hits(),
+                  "melonmusic.ir": _sob_melon_hits()},
+        pages={"javanmelody.ir/1657": javan1657_html,
+               "melonmusic.ir/4021": melon4021_html},
+        mp3s={"Dj-Elvan-Remix": sob_remix_bytes,
+              "dl.melonmusic.ir": sob_bytes})
+    out = await sf.search_smart_full_version(
+        "Ho3ein", "Sob Zohr Shab", client=client,
+        workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+    check("T29b Sob Zohr Shab FOUND via melonmusic (javanmelody has only the remix)",
+          out.status == "found" and out.file is not None
+          and out.file.source == "smart:melonmusic.ir"
+          and out.file.validation.get("status") == "match",
+          f"status={out.status} detail={out.detail} "
+          f"file={out.file.source if out.file else None} "
+          f"validation={out.file.validation if out.file else None}")
+    if out.file is not None:
+        check("T29b found file is the original (196.7 s, not the 230.1 s remix)",
+              abs(out.file.duration_sec - 196.7) < 1.0,
+              f"duration={out.file.duration_sec}")
+        sf._unlink_quietly(out.file.disk_path)
+    sf._NEGATIVE.clear()
+
+    # T29c: Joft 6 AS IDENTIFIED (HesamTiem) — NOT FOUND (correct rejections).
+    sf._NEGATIVE.clear()
+    client = _FakeClient(
+        searches={"javanmelody.ir": _joft_javan_hits(),
+                  "melonmusic.ir": _joft_melon_hits()},
+        pages={"javanmelody.ir/11303": javan11303_html},
+        mp3s={"Amir-Tataloo-Joft-shish": joft6_bytes})
+    out = await sf.search_smart_full_version(
+        "HesamTiem", "Joft 6", client=client,
+        workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+    check("T29c Joft 6 as identified (HesamTiem) is NOT FOUND — the file is Tataloo's",
+          out.status == "not_found" and out.checked >= 2,
+          f"status={out.status} detail={out.detail} checked={out.checked}")
+    sf._NEGATIVE.clear()
+
+    # T29d: Joft 6 AS CATALOG (Amir Tataloo) — still NOT FOUND: "Joft shish".
+    sf._NEGATIVE.clear()
+    client = _FakeClient(
+        searches={"javanmelody.ir": _joft_javan_hits(),
+                  "melonmusic.ir": _joft_melon_hits()},
+        pages={"javanmelody.ir/11303": javan11303_html},
+        mp3s={"Amir-Tataloo-Joft-shish": joft6_bytes})
+    out = await sf.search_smart_full_version(
+        "Amir Tataloo", "Joft 6", client=client,
+        workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+    check("T29d Joft 6 as catalog (Amir Tataloo) is NOT FOUND — 'Joft shish' title_mismatch",
+          out.status == "not_found" and out.checked >= 2,
+          f"status={out.status} detail={out.detail} checked={out.checked}")
+    check("T29d the rejection reason is title_mismatch (digit 6 vs word shish)",
+          sf.validate_smart_file(
+              "Joft 6", "Amir Tataloo",
+              "Joft shish [Amir Tataloo] From abanmusics.com",
+              "Amir Tataloo", 225.4, 225.5).get("detail") == "title_mismatch")
+    sf._NEGATIVE.clear()
+
+    # T29e: En Güzel Tesadüfüm (Tefo & SEKO, reel Dd1niVHN07n) — NOT FOUND,
+    # checked 0: both v1 sources genuinely carry no Tefo post (WP search
+    # returned [] live 2026-11-10). The failure here is upstream
+    # (identify), not search — even a confirmed name finds nothing.
+    sf._NEGATIVE.clear()
+    client = _FakeClient(searches={"javanmelody.ir": [],
+                                   "melonmusic.ir": []})
+    out = await sf.search_smart_full_version(
+        "Tefo & SEKO", "En Güzel Tesadüfüm", client=client,
+        workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+    check("T29e En Güzel Tesadüfüm NOT FOUND, checked 0 — v1 sources carry no Tefo post",
+          out.status == "not_found" and out.detail == "no_verified_file"
+          and out.checked == 0 and out.expected_duration_sec == 164.0,
+          f"status={out.status} detail={out.detail} checked={out.checked} "
+          f"expected={out.expected_duration_sec}")
+    check("T29e both v1 sites WERE queried (searches ran, zero hits)",
+          any("javanmelody.ir" in u for _, u in client.calls)
+          and any("melonmusic.ir" in u for _, u in client.calls))
+    sf._NEGATIVE.clear()
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")
