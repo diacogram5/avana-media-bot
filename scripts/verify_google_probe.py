@@ -1,6 +1,6 @@
 """Sandbox tests for the TEMPORARY Google probe (app/services/brave_probe.py
 Google engine + the /brave-probe route in app/webpanel.py, which now
-runs BOTH engines).
+runs all three sections: Brave, Google AND Persian).
 
 No network beyond localhost, no Telegram, no real Turso, no Google
 account / API key / payment anywhere. The HTTP layer is faked
@@ -23,16 +23,17 @@ Cases:
   G12 Google-internal links skipped (/url?q= unwrap + dedupe).
   G13 run_google_probe: ok True only when BOTH queries ok.
   G14 run_search_probe: combined shape {probe: search, brave, google,
-      ok}; outer ok follows Google only (Brave ok + Google blocked
-      -> ok False; both ok -> ok True).
+      persian, ok}; outer ok follows Google only (Brave ok + Google
+      blocked -> ok False; both ok -> ok True; persian section present
+      with probe "persian", ok False on empty results).
   G15 No key/account/payment anywhere in brave_probe.py (source scan:
       no api_key/API_KEY/password/Authorization/x-api-key/googleapis/
       oauth/client_secret/rapidapi/secret/credential).
-  G16 /brave-probe route returns the combined JSON with BOTH brave
-      and google sections (real local HTTP server,
+  G16 /brave-probe route returns the combined JSON with all three
+      sections (brave + google + persian; real local HTTP server,
       run_search_probe_sync monkeypatched — no outbound traffic).
-  G17 run_search_probe calls both engines: 4 calls total, Brave first
-      (2), then Google (2).
+  G17 run_search_probe calls Brave first (2), then Google (2), then
+      Persian (first 4 calls are Brave, Brave, Google, Google).
 
 Run: python3 scripts/verify_google_probe.py ; exit 0 = all PASS.
 """
@@ -78,6 +79,9 @@ class _FakeResp:
         # fake does not model a redirect.
         self.url = url
 
+    def json(self):
+        return json.loads(self.text)
+
 
 class _FakeClient:
     """Fake httpx.AsyncClient: handler(query) -> _FakeResp or raises."""
@@ -92,7 +96,13 @@ class _FakeClient:
 
 
 class _RouteClient:
-    """Fake client routing by engine URL: 2 handlers (Brave, Google)."""
+    """Fake client routing by engine URL: 2 handlers (Brave, Google).
+
+    Also routes the Persian section (added 2026-11-09, render probe):
+    WP searches return an empty list (0 hits), the RadioJavan home
+    GET returns 200, mp3 HEADs return 404 (so no prefix download ever
+    runs). Unknown URLs still raise.
+    """
 
     def __init__(self, brave_handler, google_handler):
         self.brave_handler = brave_handler
@@ -101,12 +111,24 @@ class _RouteClient:
 
     async def get(self, url, params=None, headers=None):
         self.calls.append((url, params))
-        q = params["q"] if params else ""
         if url == bp.BRAVE_SEARCH_URL:
-            return self.brave_handler(q)
+            return self.brave_handler(params["q"])
         if url == bp.GOOGLE_SEARCH_URL:
-            return self.google_handler(q)
+            return self.google_handler(params["q"])
+        if url == "https://www.radiojavan.com":
+            return _FakeResp(200, "<html>ok</html>")
+        if url in {w for _n, w, _m, _h in bp._PERSIAN_SITES if w}:
+            return _FakeResp(200, "[]")
         raise AssertionError(f"unexpected url {url}")
+
+    async def head(self, url, headers=None):
+        self.calls.append(("HEAD", url, None))
+        if url in {m for _n, _w, m, _h in bp._PERSIAN_SITES if m}:
+            return _FakeResp(404, "Not Found")
+        raise AssertionError(f"unexpected HEAD url {url}")
+
+    def stream(self, method, url, headers=None):
+        raise AssertionError("stream must not run when HEAD is 404")
 
 
 _GOOGLE_OK_HTML = (
@@ -268,7 +290,9 @@ async def _run_cases() -> None:
           and combined["brave"]["ok"] is True
           and combined["google"]["probe"] == "google"
           and combined["google"]["ok"] is False
-          and combined["ok"] is False,
+          and combined["ok"] is False
+          and combined["persian"]["probe"] == "persian"
+          and combined["persian"]["ok"] is False,
           f"combined={combined}")
 
     route2 = _RouteClient(_ok_handler, _ok_handler)
@@ -276,7 +300,8 @@ async def _run_cases() -> None:
     check("G14b both engines ok -> outer ok True",
           combined2["ok"] is True
           and combined2["brave"]["ok"] is True
-          and combined2["google"]["ok"] is True,
+          and combined2["google"]["ok"] is True
+          and combined2["persian"]["probe"] == "persian",
           f"combined2={combined2}")
 
     # G15: no key / account / payment anywhere in the probe module.
@@ -291,10 +316,12 @@ async def _run_cases() -> None:
 
     # G16 + G17: route + call routing.
     _run_route_cases()
-    check("G17 run_search_probe calls Brave then Google (4 calls)",
-          [c[0] for c in route2.calls] == [
+    check("G17 run_search_probe calls Brave then Google then Persian",
+          [c[0] for c in route2.calls][:4] == [
               bp.BRAVE_SEARCH_URL, bp.BRAVE_SEARCH_URL,
-              bp.GOOGLE_SEARCH_URL, bp.GOOGLE_SEARCH_URL],
+              bp.GOOGLE_SEARCH_URL, bp.GOOGLE_SEARCH_URL]
+          and any(c[0] not in (bp.BRAVE_SEARCH_URL, bp.GOOGLE_SEARCH_URL)
+                  for c in route2.calls[4:]),
           f"calls={route2.calls}")
 
 
@@ -343,13 +370,25 @@ def _run_route_cases() -> None:
             "ms_total": 250,
             "ok": True,
         },
+        "persian": {
+            "probe": "persian",
+            "temporary": True,
+            "sites": {
+                "javanmelody": {"reachable": True, "http": 200,
+                                "search_hits": 2, "mp3_head": 200,
+                                "mp3_ms": 120, "download_ms": 900,
+                                "error": None},
+            },
+            "ms_total": 1020,
+            "ok": True,
+        },
         "ok": True,
     }
     handler_cls = webpanel.make_handler(
         ":memory:", types.SimpleNamespace(web_admin_token="x"))
     orig = webpanel.run_search_probe_sync
 
-    # G16: route returns the combined JSON with both sections.
+    # G16: route returns the combined JSON with all three sections.
     webpanel.run_search_probe_sync = lambda: canned
     try:
         srv, port = _serve_once(handler_cls)
@@ -360,9 +399,11 @@ def _run_route_cases() -> None:
             srv.server_close()
     finally:
         webpanel.run_search_probe_sync = orig
-    check("G16 route returns combined JSON (brave + google)",
+    check("G16 route returns combined JSON (brave+google+persian)",
           status == 200 and payload == canned
           and "brave" in payload and "google" in payload
+          and "persian" in payload
+          and payload["persian"]["probe"] == "persian"
           and payload["probe"] == "search",
           f"status={status}")
 

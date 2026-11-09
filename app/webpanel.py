@@ -83,12 +83,13 @@ def make_handler(db_path, config):
                 return
             # TEMPORARY search probe (see app/services/brave_probe.py):
             # public like /health — NO auth, NO database, NO user data,
-            # NO state changes. One call runs BOTH engines (Brave, then
-            # Google) and returns {"probe": "search", "brave": {...},
-            # "google": {...}, "ok": <Google ok>}. One run at a time;
-            # a second call while running returns {"busy": true} plus
-            # the last result. The final smart-search implementation
-            # MUST remove this route and the probe module.
+            # NO state changes. One call runs all three sections (Brave,
+            # then Google, then the Persian-sites reachability probe)
+            # and returns {"probe": "search", "brave": {...},
+            # "google": {...}, "persian": {...}, "ok": <Google ok>}.
+            # One run at a time; a second call while running returns
+            # {"busy": true} plus the last result. The final smart-search
+            # implementation MUST remove this route and the probe module.
             if urllib.parse.urlparse(self.path).path == "/brave-probe":
                 global _BRAVE_PROBE_LAST
                 if not _BRAVE_PROBE_LOCK.acquire(blocking=False):
