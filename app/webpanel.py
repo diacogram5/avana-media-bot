@@ -18,9 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db as dbmod
 from .bot import blocked_cache
-from .services.brave_probe import run_brave_probe_sync
+from .services.brave_probe import run_search_probe_sync
 
-# TEMPORARY Brave probe guard (see app/services/brave_probe.py):
+# TEMPORARY search probe guard (see app/services/brave_probe.py):
 # one probe run at a time; _BRAVE_PROBE_LAST holds the last result.
 _BRAVE_PROBE_LOCK = threading.Lock()
 _BRAVE_PROBE_LAST: dict | None = None
@@ -81,18 +81,21 @@ def make_handler(db_path, config):
                 self.end_headers()
                 self.wfile.write(data)
                 return
-            # TEMPORARY Brave probe (see app/services/brave_probe.py):
+            # TEMPORARY search probe (see app/services/brave_probe.py):
             # public like /health — NO auth, NO database, NO user data,
-            # NO state changes. One run at a time; a second call while
-            # running returns {"busy": true} plus the last result.
-            # The final smart-search implementation MUST remove this route.
+            # NO state changes. One call runs BOTH engines (Brave, then
+            # Google) and returns {"probe": "search", "brave": {...},
+            # "google": {...}, "ok": <Google ok>}. One run at a time;
+            # a second call while running returns {"busy": true} plus
+            # the last result. The final smart-search implementation
+            # MUST remove this route and the probe module.
             if urllib.parse.urlparse(self.path).path == "/brave-probe":
                 global _BRAVE_PROBE_LAST
                 if not _BRAVE_PROBE_LOCK.acquire(blocking=False):
                     self._send_json({"busy": True, "last": _BRAVE_PROBE_LAST})
                     return
                 try:
-                    result = run_brave_probe_sync()
+                    result = run_search_probe_sync()
                     _BRAVE_PROBE_LAST = result
                 finally:
                     _BRAVE_PROBE_LOCK.release()

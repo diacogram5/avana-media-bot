@@ -23,7 +23,7 @@ Cases:
   B12 run_brave_probe: ok True only when BOTH queries ok; False when
       one is blocked.
   B13 /brave-probe route returns the probe JSON (real local HTTP server,
-      run_brave_probe_sync monkeypatched — no outbound traffic).
+      run_search_probe_sync monkeypatched — no outbound traffic).
   B14 Second concurrent call while a probe runs returns {"busy": true}
       (carrying the last result); a later call runs the probe fresh.
 
@@ -225,25 +225,44 @@ def _get(port: int, path: str) -> tuple[int, dict]:
 
 def _run_route_cases() -> None:
     canned = {
-        "probe": "brave",
+        "probe": "search",
         "temporary": True,
-        "queries": [
-            {"query": bp.PROBE_QUERIES[0], "status": "ok",
-             "result_count": 3, "blocked_reason": None, "ms": 120,
-             "sample_titles": ["T1", "T2", "T3"]},
-            {"query": bp.PROBE_QUERIES[1], "status": "ok",
-             "result_count": 2, "blocked_reason": None, "ms": 110,
-             "sample_titles": ["T1", "T2"]},
-        ],
-        "ms_total": 230,
+        "brave": {
+            "probe": "brave",
+            "temporary": True,
+            "queries": [
+                {"query": bp.PROBE_QUERIES[0], "status": "ok",
+                 "result_count": 3, "blocked_reason": None, "ms": 120,
+                 "sample_titles": ["T1", "T2", "T3"]},
+                {"query": bp.PROBE_QUERIES[1], "status": "ok",
+                 "result_count": 2, "blocked_reason": None, "ms": 110,
+                 "sample_titles": ["T1", "T2"]},
+            ],
+            "ms_total": 230,
+            "ok": True,
+        },
+        "google": {
+            "probe": "google",
+            "temporary": True,
+            "queries": [
+                {"query": bp.PROBE_QUERIES[0], "status": "ok",
+                 "result_count": 3, "blocked_reason": None, "ms": 130,
+                 "sample_titles": ["T1", "T2", "T3"]},
+                {"query": bp.PROBE_QUERIES[1], "status": "ok",
+                 "result_count": 2, "blocked_reason": None, "ms": 120,
+                 "sample_titles": ["T1", "T2"]},
+            ],
+            "ms_total": 250,
+            "ok": True,
+        },
         "ok": True,
     }
     handler_cls = webpanel.make_handler(
         ":memory:", types.SimpleNamespace(web_admin_token="x"))
-    orig = webpanel.run_brave_probe_sync
+    orig = webpanel.run_search_probe_sync
 
     # B13: route returns the probe JSON.
-    webpanel.run_brave_probe_sync = lambda: canned
+    webpanel.run_search_probe_sync = lambda: canned
     try:
         srv, port = _serve_once(handler_cls)
         try:
@@ -252,7 +271,7 @@ def _run_route_cases() -> None:
             srv.shutdown()
             srv.server_close()
     finally:
-        webpanel.run_brave_probe_sync = orig
+        webpanel.run_search_probe_sync = orig
     check("B13 route returns probe JSON",
           status == 200 and payload == canned, f"status={status}")
 
@@ -265,7 +284,7 @@ def _run_route_cases() -> None:
         _time.sleep(0.6)
         return canned
 
-    webpanel.run_brave_probe_sync = _slow
+    webpanel.run_search_probe_sync = _slow
     try:
         srv, port = _serve_once(handler_cls)
         try:
@@ -285,7 +304,7 @@ def _run_route_cases() -> None:
             srv.shutdown()
             srv.server_close()
     finally:
-        webpanel.run_brave_probe_sync = orig
+        webpanel.run_search_probe_sync = orig
     busy_seen = any(p.get("busy") is True for _, p in results)
     busy_last_ok = any(
         p.get("busy") is True and p.get("last") == canned
