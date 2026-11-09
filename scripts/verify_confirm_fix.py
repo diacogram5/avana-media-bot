@@ -342,8 +342,12 @@ async def main():
               kw.get("performer") == "Avano"
               and isinstance(kw.get("duration"), int) and kw["duration"] > 0,
               f"kwargs={kw}")
+        # Step 1b additions: the tap no longer sends the clip via
+        # _extract_and_send_clip_audio (it sends the bg's staged
+        # file), so the old `sent_extracted_audio` event is gone;
+        # the send is logged as the identify_stage "send" stage.
         check("C1g extracted-audio send is logged",
-              vs._log_has("sent_extracted_audio"),
+              vs._log_has("send"),
               f"lines={LOG_LINES[-3:] if LOG_LINES else []}")
     except Exception as exc:
         check("C1 unconfirmed handler response", False,

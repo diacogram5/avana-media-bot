@@ -26,11 +26,16 @@ Cases (each driven end-to-end through the real handlers unless noted):
       disk; corporate caption byte-exact; ONLY the retry button; the
       disk file is deleted and the returned file_id replaces the disk
       path in the cache; NO _identify_audio call.
-  C6  Tap cache-MISS: the normal flow runs (_identify_audio called
-      once), the full song is sent, and the store hook leaves the
-      FINAL result in the memory cache; name_sent cache_hit=false.
-  C7  Tap unconfirmed: the clip send is stored with the 10-min TTL
-      (status unconfirmed, kind clip) for the next tap.
+  C6  Tap cache-MISS: the tap spawns the ONE on-demand bg job (the
+      tap itself never downloads or identifies) and awaits it; the
+      bg identifies once + resolves the full song; the tap sends it
+      from the staged disk file; the store hook leaves the FINAL
+      result (sent file_id) in the memory cache; name_sent
+      cache_hit=false; the bg downloads the Telegram file once.
+  C7  Tap unconfirmed: the bg identifies (single-source) + stages
+      the clip; the tap sends it from disk with the corporate
+      caption; the clip send is stored with the 10-min TTL (status
+      unconfirmed, kind clip, sent file_id) for the next tap.
   C8  BG write (full song): _identify_bg_link, fed the merged video
       file on disk, identifies + resolves the file and writes the
       FINAL result (kind full, staged disk file) before any tap; a
@@ -42,13 +47,41 @@ Cases (each driven end-to-end through the real handlers unless noted):
       still holds the disputed name); the NEW result is stored under
       the same key; the old name is never re-sent.
   C11 Turso round-trip: store/get/delete, conditional delete
-      (atomic — a replaced row survives), expiry deletes the row.
+      (atomic — a replaced row survives), expiry deletes the row,
+      resolve_ms round-trips.
   C12 BG wait: _await_identify_bg returns True when the bg finishes
       in time and False on timeout WITHOUT cancelling the bg task;
-      _spawn_identify_bg reuses the in-flight task per key.
+      _spawn_identify_bg reuses the in-flight task per key; the
+      await ceiling is 120 s; a tap spawn with tg_file_id+bot
+      creates the bg task (direct-file path).
   C13 Wiring: the bg identify is spawned at resolve (not after the
       video is sent) and _send_link_video signals the video-ready
-      event (source checks, same precedent as F6).
+      event (source checks, same precedent as F6); the tap body
+      contains no video-download / inline-identify call (the miss
+      goes through the bg job only).
+  C14 Timing stages: wait_bg / search_file / send appear in the
+      identify_stage lines AND in log_total, on hit and miss;
+      wait_bg=0 on a pure hit; the total's search_file_ms equals
+      the stored entry's resolve_ms.
+  C15 File_id-only hit: the stored file_id is sent with NO download,
+      NO _identify_audio call and NO file-search call (find /
+      smart_search / exclusive).
+  C16 Miss awaits the SAME bg job: a pre-seeded in-flight bg task
+      is awaited (wait_bg proves the wait); no second job is
+      spawned, no second download/identify starts.
+  C17 Stale file_id: the stored file_id is attempted exactly once,
+      invalidated, the bg re-resolves and the fresh file is sent.
+  C18 Store guard: a file_id-less (disk-staged) store never
+      overwrites an entry that holds a SENT file_id — memory, and
+      the Turso row after a restart (memory empty); a store WITH a
+      file_id always goes through.
+  C19 BG early return on a Turso file_id row: after a restart the
+      bg does not re-identify when the Turso row already holds the
+      sent file_id.
+  C20 Wrong-song unconfirmed: a re-check that yields an unconfirmed
+      name stages the clip + stores it (kind clip, 10-min TTL) for
+      the next tap — the entry cleared at the start is not left
+      empty.
 
 Reuses the fake aiogram / fake libsql / fake message harness from
 scripts/verify_speedfix.py, the clip fixtures from
@@ -120,14 +153,43 @@ def _clear_cache():
 
 
 async def _run_tap(scripted, find_result, link=_IG_LINK,
-                   file_id="VID123", calls=None):
+                   file_id="VID123", calls=None, dl_calls=None,
+                   search_calls=None, fail_fid=None, fid_attempts=None):
     """Drive one video-button tap with a RECORDING _identify_audio
-    fake and a mocked full-song find. Returns (msg, cb, token)."""
+    fake and a mocked full-song find. Returns (msg, cb, token).
+    dl_calls records every Telegram-file download (the bg's ONE
+    download on a miss; the tap itself never downloads);
+    search_calls records every file-search call (find / smart_search
+    / exclusive); fail_fid makes the FIRST answer_audio of that
+    file_id raise (stale file_id simulation), recorded in
+    fid_attempts."""
     kb = h._video_identify_kb(572595158, file_id, "file", link_url=link)
     token = kb.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
     msg = vw._VideoMsg()
     msg.reply_markup = kb
     vm._attach_clip_video(msg)
+
+    async def _rec_get_file(_fid):
+        return SimpleNamespace(file_path="clip.mp4")
+
+    async def _rec_download(_path, buf):
+        if dl_calls is not None:
+            dl_calls.append(1)
+        buf.write(vm._MP4)
+
+    msg.bot.get_file = _rec_get_file
+    msg.bot.download_file = _rec_download
+    if fail_fid is not None:
+        _orig_answer_audio = msg.answer_audio
+
+        async def _flaky_answer_audio(audio, **kw):
+            if (audio == fail_fid and fid_attempts is not None
+                    and len(fid_attempts) == 0):
+                fid_attempts.append(audio)
+                raise RuntimeError("wrong file identifier (400)")
+            return await _orig_answer_audio(audio, **kw)
+
+        msg.answer_audio = _flaky_answer_audio
     orig_ident = h._identify_audio
     orig_find = adapters_mod.find_full_song_file_v2
     orig_search = h.smart_search
@@ -141,15 +203,24 @@ async def _run_tap(scripted, find_result, link=_IG_LINK,
         return scripted
 
     async def _fake_find(a, t):
+        if search_calls is not None:
+            search_calls.append(("find", a, t))
         return find_result
 
     async def _fake_search(engine, query, limit=10):
+        if search_calls is not None:
+            search_calls.append(("search", engine, query))
         return ([], "")
+
+    def _fake_excl(t, a):
+        if search_calls is not None:
+            search_calls.append(("exclusive", t, a))
+        return None
 
     h._identify_audio = _fake_ident
     adapters_mod.find_full_song_file_v2 = _fake_find
     h.smart_search = _fake_search
-    h._exclusive_song_for = lambda t, a: None
+    h._exclusive_song_for = _fake_excl
     try:
         conn = vs._make_conn()
         cb = vw._FakeCallback(msg, f"vid:id:{token}")
@@ -174,7 +245,8 @@ def _seed(key, **kw):
         duration_sec=kw.pop("duration_sec", 0),
         quality=kw.pop("quality", ""),
         extra=kw.pop("extra", ""),
-        cover_file_id=kw.pop("cover_file_id", ""))
+        cover_file_id=kw.pop("cover_file_id", ""),
+        resolve_ms=kw.pop("resolve_ms", 0))
     h._identify_result_put(key, ent)
     return ent
 
@@ -344,21 +416,22 @@ async def main():
     except Exception as exc:
         check("C5 tap cache-hit clip audio", False, f"{type(exc).__name__}: {exc}")
 
-    # ---- C6: tap cache-MISS runs the normal flow + stores --------------
+    # ---- C6: tap cache-MISS goes through the ON-DEMAND bg job --------
     try:
         _clear_cache()
         LOG_LINES.clear()
         mp3 = vm._make_mp3(_TITLE, _ARTIST, seconds=5)
         calls = []
+        dl = []
         msg, cb, token = await _run_tap(
             AudioIdResult(status="identified", title=_TITLE,
                           artist=_ARTIST, confirmed=True,
                           source="shazam+audd"),
             vm._full_dict(mp3, "persian_music:test", duration_sec=5.0),
-            calls=calls)
-        check("C6a cache miss: _identify_audio IS called once",
+            calls=calls, dl_calls=dl)
+        check("C6a cache miss: _identify_audio IS called once (by the bg job, never by the tap)",
               len(calls) == 1, f"calls={len(calls)}")
-        check("C6b full song is sent (bytes path)",
+        check("C6b full song is sent (from the bg's staged disk file)",
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"audio={msg.audio_calls}")
         _ent = h._identify_result_get(_IG_KEY)
@@ -370,6 +443,8 @@ async def main():
         check("C6d name_sent logged with cache_hit=false",
               _log_line_with("name_sent", '"cache_hit": false') != "",
               f"lines={[l for l in LOG_LINES if 'name_sent' in l]}")
+        check("C6e the Telegram file is downloaded exactly ONCE (by the bg job; the tap downloads nothing)",
+              len(dl) == 1, f"downloads={len(dl)}")
     except Exception as exc:
         check("C6 tap cache-miss", False, f"{type(exc).__name__}: {exc}")
 
@@ -378,20 +453,27 @@ async def main():
         _clear_cache()
         LOG_LINES.clear()
         calls = []
+        dl = []
         msg, cb, token = await _run_tap(
             AudioIdResult(status="unconfirmed", title=_TITLE,
                           artist=_ARTIST, confirmed=False,
                           source="shazam"),
-            None, calls=calls)
-        check("C7a unconfirmed tap sends exactly ONE extracted audio",
-              len(msg.audio_calls) == 1,
-              f"audio={msg.audio_calls}")
+            None, calls=calls, dl_calls=dl)
+        check("C7a unconfirmed tap sends exactly ONE extracted audio (bg identified once)",
+              len(msg.audio_calls) == 1 and len(calls) == 1,
+              f"audio={msg.audio_calls} calls={len(calls)}")
+        _akw7 = msg.audio_kwargs[0] if msg.audio_kwargs else {}
+        check("C7b the clip caption is the corporate caption byte-exact",
+              _akw7.get("caption", "") == _NEW_EXACT,
+              f"caption={_akw7.get('caption')!r}")
         _ent = h._identify_result_get(_IG_KEY)
-        check("C7b the clip result is stored (status unconfirmed, kind clip, 10-min TTL)",
+        check("C7c the clip result is stored (status unconfirmed, kind clip, 10-min TTL, sent file_id)",
               _ent is not None and _ent.get("status") == "unconfirmed"
               and _ent.get("kind") == "clip" and _ent.get("ttl") == 600
               and bool(_ent.get("file_id")),
               f"entry={_ent}")
+        check("C7d the Telegram file is downloaded exactly ONCE (by the bg job)",
+              len(dl) == 1, f"downloads={len(dl)}")
     except Exception as exc:
         check("C7 tap unconfirmed stores clip", False, f"{type(exc).__name__}: {exc}")
 
@@ -617,6 +699,15 @@ async def main():
         check("C11f an expired Turso row reads as a miss (and is deleted)",
               tc.get_identify_result("ig:EXP") is None
               and tc.get_identify_result("ig:EXP") is None)
+        _e2 = h._identify_result_entry(
+            "identified", _TITLE, _ARTIST, "shazam+audd", kind="full",
+            file_id="TFID2", duration_sec=200, resolve_ms=1234)
+        _stored2 = tc.store_identify_result("ig:TURSO2", _e2)
+        _g2 = tc.get_identify_result("ig:TURSO2")
+        check("C11g Turso round-trip keeps resolve_ms (the search_file stage)",
+              _stored2 is True and _g2 is not None
+              and _g2.get("resolve_ms") == 1234,
+              f"row={_g2}")
     except Exception as exc:
         check("C11 Turso round-trip", False, f"{type(exc).__name__}: {exc}")
     finally:
@@ -671,6 +762,30 @@ async def main():
                 await _spawned
             except asyncio.CancelledError:
                 pass
+        check("C12d the bg await ceiling is 120 s (the tap waits for the bg's natural completion)",
+              h._IDENTIFY_BG_AWAIT_CEILING == 120.0,
+              f"ceiling={h._IDENTIFY_BG_AWAIT_CEILING}")
+
+        async def _tg_get_file(_fid):
+            return SimpleNamespace(file_path="clip.mp4")
+
+        async def _tg_dl(_path, buf):
+            buf.write(vm._MP4)
+
+        _tgbot = SimpleNamespace(get_file=_tg_get_file,
+                                 download_file=_tg_dl)
+        _tg_task = h._spawn_identify_bg(
+            "ig:TGSPAWN", "", 572595158, None, vw._config(),
+            tg_file_id="VID123", bot=_tgbot)
+        check("C12e a tap spawn with tg_file_id+bot creates the bg task (direct-file path)",
+              _tg_task is not None
+              and h._IDENTIFY_BG_TASKS.get("ig:TGSPAWN") is _tg_task)
+        if _tg_task is not None:
+            _tg_task.cancel()
+            try:
+                await _tg_task
+            except asyncio.CancelledError:
+                pass
     except Exception as exc:
         check("C12 bg wait + spawn", False, f"{type(exc).__name__}: {exc}")
 
@@ -690,8 +805,312 @@ async def main():
         check("C13c _send_link_video signals the video-ready event",
               "_signal_identify_bg_video_ready(" in _src
               and _src.count("_signal_identify_bg_video_ready(") >= 3)
+        _i_tap = _src.find("async def video_identify")
+        _i_next = _src.find("\nasync def ", _i_tap + 1)
+        _tap_src = _src[_i_tap:_i_next] if _i_next > 0 else _src[_i_tap:]
+        check("C13d the tap body has no video-download / inline-identify call (the miss goes through the bg job only)",
+              "_download_link_audio(" not in _tap_src
+              and "download_file(" not in _tap_src
+              and "_identify_audio(" not in _tap_src
+              and "_bg_precompute_get(" not in _tap_src,
+              f"tap_has_download={'download_file(' in _tap_src} "
+              f"tap_has_identify={'_identify_audio(' in _tap_src}")
     except Exception as exc:
         check("C13 wiring", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C14: the three timing stages, hit + miss ----------------------
+    try:
+        # Hit: wait_bg=0, search_file == the stored resolve_ms.
+        _clear_cache()
+        LOG_LINES.clear()
+        _seed(_IG_KEY, source="bank", file_id="BANKFID1",
+              duration_sec=280, resolve_ms=1234)
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title="SHOULD-NOT-USE",
+                          artist="SHOULD-NOT-USE"),
+            None)
+        _tot = _log_line_with("total", '"wait_bg_ms"')
+        check("C14a hit: the total logs wait_bg_ms=0 (no bg wait on a pure hit)",
+              '"wait_bg_ms": 0' in _tot, f"total={_tot}")
+        check("C14b hit: the total's search_file_ms equals the stored entry's resolve_ms",
+              '"search_file_ms": 1234' in _tot, f"total={_tot}")
+        check("C14c hit: the total logs send_ms",
+              '"send_ms":' in _tot, f"total={_tot}")
+        check("C14d hit: the three identify_stage lines exist (wait_bg / search_file / send)",
+              _log_line_with("wait_bg", '"ms":') != ""
+              and _log_line_with("search_file", '"ms":') != ""
+              and _log_line_with("send", '"ms":') != "",
+              f"lines={[l for l in LOG_LINES if 'wait_bg' in l or 'search_file' in l]}")
+        # Miss: all three stages present; search_file == the bg entry's resolve_ms.
+        _clear_cache()
+        LOG_LINES.clear()
+        mp3 = vm._make_mp3(_TITLE, _ARTIST, seconds=5)
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title=_TITLE,
+                          artist=_ARTIST, confirmed=True,
+                          source="shazam+audd"),
+            vm._full_dict(mp3, "persian_music:test", duration_sec=5.0))
+        _tot2 = _log_line_with("total", '"wait_bg_ms"')
+        _ent2 = h._identify_result_get(_IG_KEY)
+        check("C14e miss: the total logs all three stages",
+              '"wait_bg_ms":' in _tot2 and '"search_file_ms":' in _tot2
+              and '"send_ms":' in _tot2, f"total={_tot2}")
+        check("C14f miss: the total's search_file_ms equals the bg entry's resolve_ms",
+              _ent2 is not None
+              and f'"search_file_ms": {_ent2.get("resolve_ms") or 0}' in _tot2,
+              f"total={_tot2} entry_resolve_ms={(_ent2 or {}).get('resolve_ms')}")
+        check("C14g miss: the three identify_stage lines exist",
+              _log_line_with("wait_bg", '"ms":') != ""
+              and _log_line_with("search_file", '"ms":') != ""
+              and _log_line_with("send", '"ms":') != "")
+    except Exception as exc:
+        check("C14 timing stages", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C15: file_id-only hit (no download, no identify, no file search) --
+    try:
+        _clear_cache()
+        LOG_LINES.clear()
+        _seed(_IG_KEY, source="bank", file_id="BANKFID1",
+              duration_sec=280, quality="کیفیت واقعی: 320kbps",
+              extra="💎 نسخه کامل اختصاصی آوانو")
+        calls = []
+        dl = []
+        searches = []
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title="SHOULD-NOT-USE",
+                          artist="SHOULD-NOT-USE"),
+            None, calls=calls, dl_calls=dl, search_calls=searches)
+        check("C15a file_id hit: _identify_audio is NEVER called",
+              calls == [], f"calls={len(calls)}")
+        check("C15b file_id hit: NO Telegram download (the tap downloads nothing)",
+              dl == [], f"downloads={len(dl)}")
+        check("C15c file_id hit: NO file search (no find / smart_search / exclusive call)",
+              searches == [], f"searches={searches}")
+        check("C15d file_id hit: exactly ONE audio send, of the STORED file_id",
+              len(msg.audio_calls) == 1 and msg.audio_calls[0] == ("str", "BANKFID1"),
+              f"audio={msg.audio_calls}")
+    except Exception as exc:
+        check("C15 file_id-only hit", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C16: the miss AWAITS the same bg job (no second spawn) --------
+    try:
+        _clear_cache()
+        LOG_LINES.clear()
+        _key16 = _IG_KEY
+
+        async def _slow_bg16():
+            await asyncio.sleep(0.3)
+            h._identify_result_put(
+                _key16, h._identify_result_entry(
+                    "identified", _TITLE, _ARTIST, "shazam+audd",
+                    kind="full", file_id="WAITFID", duration_sec=280,
+                    resolve_ms=42))
+
+        _t16 = asyncio.create_task(_slow_bg16())
+        h._IDENTIFY_BG_TASKS[_key16] = _t16
+        calls = []
+        dl = []
+        searches = []
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title="SHOULD-NOT-USE",
+                          artist="SHOULD-NOT-USE"),
+            None, calls=calls, dl_calls=dl, search_calls=searches)
+        check("C16a the tap reuses the in-flight bg task (same object, not replaced)",
+              h._IDENTIFY_BG_TASKS.get(_key16) is _t16,
+              f"task={h._IDENTIFY_BG_TASKS.get(_key16)}")
+        check("C16b the tap sends the bg job's file (WAITFID) — the SAME job's result",
+              len(msg.audio_calls) == 1 and msg.audio_calls[0] == ("str", "WAITFID"),
+              f"audio={msg.audio_calls}")
+        check("C16c NO second identify starts (_identify_audio never called)",
+              calls == [], f"calls={len(calls)}")
+        check("C16d NO second download starts (the tap downloads nothing)",
+              dl == [], f"downloads={len(dl)}")
+        check("C16e NO file search starts",
+              searches == [], f"searches={searches}")
+        _tot16 = _log_line_with("total", '"wait_bg_ms"')
+        _wb16 = 0
+        try:
+            import re as _re
+            _m16 = _re.search(r'"wait_bg_ms": (\d+)', _tot16)
+            _wb16 = int(_m16.group(1)) if _m16 else 0
+        except Exception:
+            _wb16 = 0
+        check("C16f wait_bg proves the wait (>=200 ms for the 0.3 s bg job)",
+              _wb16 >= 200, f"wait_bg_ms={_wb16} total={_tot16}")
+    except Exception as exc:
+        check("C16 miss awaits same bg job", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C17: stale file_id attempted once, invalidated, bg re-resolves --
+    try:
+        _clear_cache()
+        LOG_LINES.clear()
+        _seed(_IG_KEY, source="shazam+audd", file_id="STALEFID",
+              duration_sec=280)
+        calls = []
+        dl = []
+        attempts = []
+        mp3 = vm._make_mp3(_TITLE, _ARTIST, seconds=5)
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title=_TITLE,
+                          artist=_ARTIST, confirmed=True,
+                          source="shazam+audd"),
+            vm._full_dict(mp3, "persian_music:test", duration_sec=5.0),
+            calls=calls, dl_calls=dl, fail_fid="STALEFID",
+            fid_attempts=attempts)
+        check("C17a the stale file_id is attempted exactly ONCE",
+              attempts == ["STALEFID"], f"attempts={attempts}")
+        check("C17b exactly ONE successful audio send — the fresh file (bytes)",
+              len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
+              f"audio={msg.audio_calls}")
+        _ent17 = h._identify_result_get(_IG_KEY)
+        check("C17c the stale entry is replaced by the fresh result (new file_id)",
+              _ent17 is not None and _ent17.get("file_id") == "BYTES_FILE_ID"
+              and _ent17.get("title") == _TITLE,
+              f"entry={_ent17}")
+        check("C17d the bg re-resolves once (_identify_audio called once, by the bg)",
+              len(calls) == 1, f"calls={len(calls)}")
+        check("C17e the bg downloads the Telegram file exactly once (the tap downloads nothing)",
+              len(dl) == 1, f"downloads={len(dl)}")
+    except Exception as exc:
+        check("C17 stale file_id", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C18: a staged entry never clobbers a sent file_id ------------
+    try:
+        _clear_cache()
+        vs._turso_on()
+        _seed(_IG_KEY, source="bank", file_id="SENTFID1", duration_sec=280)
+        tc.store_identify_result(_IG_KEY, h._identify_result_get(_IG_KEY))
+        _diskless = h._identify_result_entry(
+            "identified", _TITLE, _ARTIST, "shazam+audd", kind="full",
+            file_id="", disk_path="/tmp/does-not-exist.mp3")
+        h._identify_result_store(_IG_KEY, _diskless)
+        _ent18 = h._identify_result_get(_IG_KEY)
+        check("C18a a file_id-less store does not overwrite a sent file_id (memory)",
+              _ent18 is not None and _ent18.get("file_id") == "SENTFID1",
+              f"entry={_ent18}")
+        _row18 = tc.get_identify_result(_IG_KEY)
+        check("C18b the Turso row still holds the sent file_id",
+              _row18 is not None and _row18.get("file_id") == "SENTFID1",
+              f"row={_row18}")
+        # Post-restart case: memory empty, Turso holds the sent file_id.
+        h._IDENTIFY_RESULT_CACHE.clear()
+        h._identify_result_store(_IG_KEY, _diskless)
+        check("C18c a file_id-less store is refused when the Turso row holds a sent file_id",
+              h._identify_result_get(_IG_KEY) is None
+              and (tc.get_identify_result(_IG_KEY) or {}).get("file_id") == "SENTFID1",
+              f"row={tc.get_identify_result(_IG_KEY)}")
+        _with_fid = h._identify_result_entry(
+            "identified", _TITLE, _ARTIST, "shazam+audd", kind="full",
+            file_id="SENTFID2")
+        h._identify_result_store(_IG_KEY, _with_fid)
+        check("C18d a store WITH a file_id always goes through",
+              (h._identify_result_get(_IG_KEY) or {}).get("file_id") == "SENTFID2",
+              f"entry={h._identify_result_get(_IG_KEY)}")
+    except Exception as exc:
+        check("C18 store guard", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        vs._turso_off()
+
+    # ---- C19: bg early return on a Turso file_id row -------------------
+    try:
+        _clear_cache()
+        vs._turso_on()
+        _key19 = "ig:TGROW"
+        _ent19 = h._identify_result_entry(
+            "identified", _TITLE, _ARTIST, "shazam+audd", kind="full",
+            file_id="TURSO_FID", duration_sec=280)
+        tc.store_identify_result(_key19, _ent19)
+        _vpath19 = os.path.join(tempfile.mkdtemp(prefix="ident_bg_"), "video.mp4")
+        with open(_vpath19, "wb") as _f:
+            _f.write(vm._MP4)
+        _ev19 = asyncio.Event()
+        _ev19.set()
+        h._IDENTIFY_BG_VIDEO_READY[_key19] = (_ev19, _vpath19)
+        orig_ident = h._identify_audio
+        calls19 = []
+
+        async def _fake_ident19(data, filename, config, conn=None,
+                                cache_url_key=None, req_id=None, t_req=None,
+                                **_kw):
+            calls19.append(1)
+            return AudioIdResult(status="identified", title=_TITLE,
+                                 artist=_ARTIST, confirmed=True,
+                                 source="shazam+audd")
+
+        h._identify_audio = _fake_ident19
+        try:
+            conn = vs._make_conn()
+            await h._identify_bg_link(
+                _key19, "https://example.invalid/audio.mp3", 572595158,
+                conn, vw._config())
+        finally:
+            h._identify_audio = orig_ident
+        check("C19a the bg does NOT re-identify when the Turso row already holds the sent file_id",
+              calls19 == [], f"calls={len(calls19)}")
+        check("C19b the bg stores nothing (memory stays empty — the Turso row serves the tap)",
+              h._identify_result_get(_key19) is None,
+              f"entry={h._identify_result_get(_key19)}")
+        check("C19c the Turso row is untouched (still the sent file_id)",
+              (tc.get_identify_result(_key19) or {}).get("file_id") == "TURSO_FID",
+              f"row={tc.get_identify_result(_key19)}")
+    except Exception as exc:
+        check("C19 bg early return on Turso file_id", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        vs._turso_off()
+
+    # ---- C20: wrong-song unconfirmed stores the clip ------------------
+    try:
+        _clear_cache()
+        vs._turso_on()
+        LOG_LINES.clear()
+        token, entry, _kb = vw._mint_video_token(link=_IG_LINK)
+        _seed(_IG_KEY, title=vw._WRONG_TITLE, artist=vw._WRONG_ARTIST,
+              source="shazam+audd", kind="full", file_id="WRONGFID")
+        tc.store_identify_result(_IG_KEY, h._identify_result_get(_IG_KEY))
+        msg = vw._VideoMsg()
+        msg.reply_markup = None
+        vm._attach_clip_video(msg)
+        orig_ident = h._identify_audio
+        orig_excl = h._exclusive_song_for
+        calls20 = []
+
+        async def _fake_ident20(data, filename, config, conn=None,
+                                cache_url_key=None, req_id=None, t_req=None,
+                                exclude=None, skip_bank=False, **_kw):
+            calls20.append({"exclude": list(exclude or [])})
+            return AudioIdResult(status="unconfirmed", title=_NEW_TITLE,
+                                 artist=_NEW_ARTIST, confirmed=False,
+                                 source="shazam")
+
+        h._identify_audio = _fake_ident20
+        h._exclusive_song_for = lambda t, a: None
+        try:
+            conn = vs._make_conn()
+            cb = vw._FakeCallback(msg, f"wrong:{token}")
+            await h.wrong_song(cb, conn, vw._config())
+            await vw._drain()
+        finally:
+            h._identify_audio = orig_ident
+            h._exclusive_song_for = orig_excl
+        _ent20 = h._identify_result_get(_IG_KEY)
+        check("C20a the unconfirmed re-check result is stored (not left empty)",
+              _ent20 is not None and _ent20.get("title") == _NEW_TITLE
+              and _ent20.get("artist") == _NEW_ARTIST,
+              f"entry={_ent20}")
+        check("C20b the stored entry is a staged clip (disk file exists, 10-min TTL)",
+              _ent20 is not None and _ent20.get("kind") == "clip"
+              and _ent20.get("status") == "unconfirmed"
+              and _ent20.get("ttl") == 600
+              and bool(_ent20.get("disk_path"))
+              and os.path.exists(_ent20.get("disk_path") or ""),
+              f"entry={_ent20}")
+        check("C20c the disputed name is gone (never re-served)",
+              _ent20 is not None and _ent20.get("title") != vw._WRONG_TITLE,
+              f"entry={_ent20}")
+    except Exception as exc:
+        check("C20 wrong-song unconfirmed stores clip", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        vs._turso_off()
 
     print(f"\nidentify_cache: {len(RESULTS)} checks run")
 

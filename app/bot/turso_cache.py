@@ -163,6 +163,7 @@ _IDENTIFY_RESULT_DDL = """
         quality TEXT NOT NULL DEFAULT '',
         extra TEXT NOT NULL DEFAULT '',
         cover_file_id TEXT NOT NULL DEFAULT '',
+        resolve_ms INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
     )
@@ -246,6 +247,7 @@ def _get_conn():
             "ALTER TABLE song_file_cache ADD COLUMN verified_title TEXT",
             "ALTER TABLE song_file_cache ADD COLUMN verified_artist TEXT",
             "ALTER TABLE song_file_cache ADD COLUMN duration_sec REAL",
+            "ALTER TABLE identify_result_cache ADD COLUMN resolve_ms INTEGER",
         ):
             try:
                 conn.execute(_ddl)
@@ -445,8 +447,8 @@ def get_identify_result(key: str, req_id: str | None = None) -> dict | None:
         _tq = time.perf_counter()
         cur = conn.execute(
             "SELECT status, title, artist, source, kind, file_id,"
-            " duration_sec, quality, extra, cover_file_id, created_at,"
-            " expires_at"
+            " duration_sec, quality, extra, cover_file_id, resolve_ms,"
+            " created_at, expires_at"
             " FROM identify_result_cache WHERE cache_key = ?",
             (key,))
         _timing.note_turso(req_id, "identify_result_cache.get",
@@ -455,7 +457,8 @@ def get_identify_result(key: str, req_id: str | None = None) -> dict | None:
         if not row:
             return None
         (status, title, artist, source, kind, file_id, duration_sec,
-         quality, extra, cover_file_id, created_at, expires_at) = row
+         quality, extra, cover_file_id, resolve_ms, created_at,
+         expires_at) = row
         if int(expires_at) < int(time.time()):
             try:
                 conn.execute("DELETE FROM identify_result_cache"
@@ -470,6 +473,7 @@ def get_identify_result(key: str, req_id: str | None = None) -> dict | None:
                 "duration_sec": duration_sec or 0,
                 "quality": quality or "", "extra": extra or "",
                 "cover_file_id": cover_file_id or "",
+                "resolve_ms": resolve_ms or 0,
                 "created_at": created_at,
                 "ttl": max(0, int(expires_at) - int(created_at))}
     except Exception as e:
@@ -482,10 +486,12 @@ def store_identify_result(key: str, entry: dict,
     """Step 1b: store the FINAL identify result under a shortcode key.
 
     ``entry`` carries status/title/artist/source/kind/file_id/
-    duration_sec/quality/extra/cover_file_id/created_at/ttl (ttl
-    seconds from created_at). Only the file_id is persisted — a disk
-    path never survives a restart. Never raises; returns True when
-    stored."""
+    duration_sec/quality/extra/cover_file_id/resolve_ms/created_at/ttl
+    (ttl seconds from created_at). Only the file_id is persisted — a
+    disk path never survives a restart. resolve_ms is the bg job's
+    file-resolution time for this entry (0 when unknown), so the tap
+    can log it as the search_file stage. Never raises; returns True
+    when stored."""
     conn = _get_conn()
     if not conn or not key or not isinstance(entry, dict):
         return False
@@ -498,14 +504,15 @@ def store_identify_result(key: str, entry: dict,
         conn.execute("""
             INSERT OR REPLACE INTO identify_result_cache
             (cache_key, status, title, artist, source, kind, file_id,
-             duration_sec, quality, extra, cover_file_id, created_at,
-             expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             duration_sec, quality, extra, cover_file_id, resolve_ms,
+             created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (key, entry.get("status") or "", entry.get("title") or "",
               entry.get("artist") or "", entry.get("source") or "",
               entry.get("kind") or "", entry.get("file_id") or "",
               entry.get("duration_sec") or 0, entry.get("quality") or "",
               entry.get("extra") or "", entry.get("cover_file_id") or "",
+              int(entry.get("resolve_ms") or 0),
               now, now + ttl))
         _timing.note_turso(req_id, "identify_result_cache.store",
                            (time.perf_counter() - _tq) * 1000, logger=_log)
