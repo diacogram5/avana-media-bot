@@ -94,6 +94,20 @@ Cases:
       Güzel Tesadüfüm (Tefo & SEKO, reel Dd1niVHN07n) is NOT FOUND
       with checked 0 — both v1 sources genuinely carry no Tefo
       post, so the failure there is upstream (identify), not search.
+  T30 (fix round 2 — retry-tap regression, live 268cb98a): a retry
+      tap on a non-eligible clip hit fell through to the
+      identify-tap cache-hit branch and re-sent the clip audio, and
+      _set_video_result_kb stamped the video keyboard onto the
+      AUDIO message. (a) retry on unconfirmed clip -> 0 audio
+      sends, honest m_identify_head_notfound text, exactly the
+      retry button; (a2) two SEQUENTIAL retry taps (the live
+      00:54 case: requests 3a0c1b0c + 7bfa1573, 4.6 s apart, each
+      one cache-hit send) -> each sends 0 audio; (b) retry on
+      identified clip still runs the smart search; (c) identify
+      tap from a VIDEO on a clip hit -> audio sent exactly once
+      and the video keyboard lands on the VIDEO message; (d)
+      video_identify never calls _set_video_result_kb with an
+      audio message.
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -1079,6 +1093,196 @@ async def main() -> int:
           any("javanmelody.ir" in u for _, u in client.calls)
           and any("melonmusic.ir" in u for _, u in client.calls))
     sf._NEGATIVE.clear()
+
+    # --- FIX ROUND 2 (2026-11-10): retry-tap regression ---------------
+    # Live 268cb98a: a retry tap on a non-eligible clip hit fell
+    # through to the identify-tap cache-hit branch and re-sent the
+    # clip audio, and _set_video_result_kb stamped the video
+    # keyboard onto the AUDIO message. Log corroboration (00:54
+    # test, "Disconnect" — Jopitoo, unconfirmed): TWO sequential
+    # requests 3a0c1b0c + 7bfa1573, 4.6 s apart, each exactly one
+    # cache-hit send — the fix makes EACH invocation send nothing;
+    # it never relies on the concurrent-only _VIDEO_IDENTIFY_RUNNING
+    # guard. The keyboard stamp is code-only: the logs record no
+    # keyboards at all.
+    def _kb_buttons(kb):
+        rows = getattr(kb, "inline_keyboard", None) or []
+        return [b for row in rows for b in row]
+
+    # T30a: retry tap on clip/unconfirmed/titled hit -> 0 audio sends.
+    token30 = "tok-fix2-t30a"
+    entry30 = _link_entry()
+    entry30["user_id"] = 572595158
+    h._VIDEO_IDENTIFY[token30] = entry30
+    key30 = h._identify_result_key(link=entry30["link"])
+    h._identify_result_put(key30, {**_clip_hit(status="unconfirmed"),
+                                   "created_at": time.time(), "ttl": 600})
+    vs.LOG_LINES.clear()
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data=f"vid:id:{token30}")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._VIDEO_IDENTIFY.pop(token30, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token30)
+    check("T30a retry on unconfirmed clip: ZERO audio sends",
+          msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+    check("T30a retry on unconfirmed clip: honest not-identified text sent",
+          msg.answers == [t("m_identify_searching", "fa"),
+                          t("m_identify_head_notfound", "fa")],
+          f"answers={msg.answers}")
+    check("T30a retry on unconfirmed clip: no smart-search / error text",
+          t("m_smart_not_found", "fa") not in msg.answers
+          and t("m_smart_error", "fa") not in msg.answers,
+          f"answers={msg.answers}")
+    retry_btns = _kb_buttons(
+        msg.edits_markup[-1] if msg.edits_markup else None)
+    check("T30a retry on unconfirmed clip: audio keeps exactly the retry button",
+          len(msg.edits_markup) == 2 and len(retry_btns) == 1
+          and retry_btns[0].callback_data == f"vid:id:{token30}"
+          and retry_btns[0].text == t("m_extracted_retry_btn", "fa"),
+          f"edits={len(msg.edits_markup)} "
+          f"btns={[(b.text, b.callback_data) for b in retry_btns]}")
+    check("T30a retry on unconfirmed clip: no video keyboard on the audio",
+          not any((b.url or "").startswith("https://www.google.com")
+                  or (b.url or "").startswith("https://www.youtube.com")
+                  or (b.callback_data or "").startswith("wrong:")
+                  for b in retry_btns),
+          f"btns={[(b.text, b.url, b.callback_data) for b in retry_btns]}")
+    total30 = [ln for ln in vs.LOG_LINES
+               if '"stage": "total"' in ln
+               and '"event": "identify_stage"' in ln]
+    check("T30a retry on unconfirmed clip: total status is 'unconfirmed', not 'error'",
+          any('"status": "unconfirmed"' in ln for ln in total30),
+          f"total={total30}")
+
+    # T30a2: TWO sequential retry taps on the same unconfirmed clip
+    # (the live 00:54 double-audio case) -> EACH tap sends 0 audio.
+    h._VIDEO_IDENTIFY[token30] = entry30
+    try:
+        for _tap in (1, 2):
+            msg = _Msg(with_audio=True)
+            cb = _Cb(msg, data=f"vid:id:{token30}")
+            await h.video_identify(cb, conn, SimpleNamespace())
+            check(f"T30a2 sequential retry tap {_tap}: ZERO audio sends",
+                  msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+            check(f"T30a2 sequential retry tap {_tap}: honest text sent",
+                  t("m_identify_head_notfound", "fa") in msg.answers,
+                  f"answers={msg.answers}")
+    finally:
+        h._VIDEO_IDENTIFY.pop(token30, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token30)
+
+    # T30b: retry tap on clip/IDENTIFIED hit still runs the smart search.
+    token31 = "tok-fix2-t30b"
+    entry31 = _link_entry()
+    entry31["user_id"] = 572595158
+    h._VIDEO_IDENTIFY[token31] = entry31
+    key31 = h._identify_result_key(link=entry31["link"])
+    h._identify_result_put(key31, {**_clip_hit(),
+                                   "created_at": time.time(), "ttl": 600})
+    sf.search_smart_full_version = _fake_not_found
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data=f"vid:id:{token31}")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        sf.search_smart_full_version = orig_search
+        h._VIDEO_IDENTIFY.pop(token31, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token31)
+    check("T30b retry on identified clip: smart search still runs (not-found text)",
+          t("m_smart_not_found", "fa") in msg.answers
+          and t("m_identify_head_notfound", "fa") not in msg.answers,
+          f"answers={msg.answers}")
+    check("T30b retry on identified clip: no audio re-sent",
+          msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+
+    # T30c: identify tap from a VIDEO on a clip hit -> audio once,
+    # video keyboard on the VIDEO message.
+    token32 = "tok-fix2-t30c"
+    entry32 = _link_entry()
+    entry32["user_id"] = 572595158
+    h._VIDEO_IDENTIFY[token32] = entry32
+    key32 = h._identify_result_key(link=entry32["link"])
+    h._identify_result_put(key32, {**_clip_hit(status="unconfirmed",
+                                               file_id="CLIP_FILE_ID"),
+                                   "created_at": time.time(), "ttl": 600})
+    try:
+        msg = _Msg(with_audio=False)
+        msg.video = SimpleNamespace(file_id="VID_FILE_ID")
+        cb = _Cb(msg, data=f"vid:id:{token32}")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._VIDEO_IDENTIFY.pop(token32, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token32)
+    check("T30c identify tap from video: clip audio sent exactly once",
+          len(msg.audio_calls) == 1
+          and msg.audio_calls[0][1] == "CLIP_FILE_ID",
+          f"audio_calls={msg.audio_calls}")
+    video_btns = _kb_buttons(
+        msg.edits_markup[-1] if msg.edits_markup else None)
+    check("T30c identify tap from video: video keyboard lands on the video message",
+          len(msg.edits_markup) == 2 and len(video_btns) == 2
+          and video_btns[0].text == t("m_video_google_btn", "fa")
+          and (video_btns[0].url or "").startswith(
+              "https://www.google.com/search?q=")
+          and video_btns[1].text == t("m_video_youtube_btn", "fa")
+          and (video_btns[1].url or "").startswith(
+              "https://www.youtube.com/results?search_query="),
+          f"edits={len(msg.edits_markup)} "
+          f"btns={[(b.text, b.url) for b in video_btns]}")
+
+    # T30d: _set_video_result_kb is never invoked for an audio message.
+    orig_set_kb = h._set_video_result_kb
+    kb_calls: list = []
+
+    async def _recording_set_kb(message, *a, **k):
+        kb_calls.append(getattr(message, "audio", None) is not None)
+        return await orig_set_kb(message, *a, **k)
+
+    h._set_video_result_kb = _recording_set_kb
+    try:
+        # Retry tap on the unconfirmed clip: the guard + early return
+        # mean the video-keyboard setter is never even called.
+        token33 = "tok-fix2-t30d"
+        entry33 = _link_entry()
+        entry33["user_id"] = 572595158
+        h._VIDEO_IDENTIFY[token33] = entry33
+        key33 = h._identify_result_key(link=entry33["link"])
+        h._identify_result_put(key33, {**_clip_hit(status="unconfirmed"),
+                                       "created_at": time.time(), "ttl": 600})
+        try:
+            msg = _Msg(with_audio=True)
+            cb = _Cb(msg, data=f"vid:id:{token33}")
+            await h.video_identify(cb, conn, SimpleNamespace())
+        finally:
+            h._VIDEO_IDENTIFY.pop(token33, None)
+            h._VIDEO_IDENTIFY_RUNNING.discard(token33)
+        check("T30d retry tap: _set_video_result_kb never called at all",
+              kb_calls == [], f"kb_calls={kb_calls}")
+        # Identify tap from a video: the setter IS called, on a video
+        # message (audio is None).
+        token34 = "tok-fix2-t30d2"
+        entry34 = _link_entry()
+        entry34["user_id"] = 572595158
+        h._VIDEO_IDENTIFY[token34] = entry34
+        key34 = h._identify_result_key(link=entry34["link"])
+        h._identify_result_put(key34, {**_clip_hit(status="unconfirmed",
+                                                   file_id="CLIP_FILE_ID"),
+                                       "created_at": time.time(), "ttl": 600})
+        try:
+            msg = _Msg(with_audio=False)
+            msg.video = SimpleNamespace(file_id="VID_FILE_ID")
+            cb = _Cb(msg, data=f"vid:id:{token34}")
+            await h.video_identify(cb, conn, SimpleNamespace())
+        finally:
+            h._VIDEO_IDENTIFY.pop(token34, None)
+            h._VIDEO_IDENTIFY_RUNNING.discard(token34)
+        check("T30d identify tap from video: setter called, never on audio",
+              len(kb_calls) == 1 and kb_calls[0] is False,
+              f"kb_calls={kb_calls}")
+    finally:
+        h._set_video_result_kb = orig_set_kb
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")

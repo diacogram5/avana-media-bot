@@ -2384,6 +2384,30 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
     return status_out
 
 
+async def _set_video_result_kb_if_video(message, title: str, artist: str,
+                                        ulang: str, file_id: str | None,
+                                        user_id: int | None, kind: str,
+                                        source: str = "") -> None:
+    """Video keyboard ONLY on a video message (fix round 2).
+
+    The cache-hit / BG branches in video_identify run for both the
+    identify tap (the bot-sent VIDEO message) and the retry tap (the
+    extracted AUDIO message); _set_video_result_kb edits
+    callback.message's markup, so on a retry tap it stamped the
+    [Google][YouTube] + [wrong-song report] keyboard onto the clip
+    audio. The early return below keeps retry taps out of those
+    branches, but the guard fixes the symptom even if one is ever
+    reached from a retry tap again. Never raises.
+    """
+    try:
+        if getattr(message, "video", None) is None:
+            return
+        await _set_video_result_kb(message, title, artist, ulang,
+                                   file_id, user_id, kind, source)
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("vid:id:"))
 async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     """One-click «🎵 شناسایی موسیقی» under a received video.
@@ -2523,6 +2547,55 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             _timing.log_stage(log, "identify_stage", _req_id, _t_req,
                               "result_send", _t_req, status="smart_search")
             return
+        # FIX ROUND 2 — retry-tap regression (2026-11-10): a retry tap
+        # on a NON-ELIGIBLE clip hit used to fall through to the
+        # identify-tap cache-hit branch below and re-send the clip
+        # audio that is already on screen (the 1B gate in
+        # _smart_search_eligible skips the smart branch for
+        # unconfirmed / not_found / title-less hits). The tap is on
+        # the AUDIO message (callback.message.audio is not None) and
+        # the clip is already in the chat, so this invocation sends
+        # ZERO audio messages: the honest not-identified status as a
+        # separate text message (existing key
+        # m_identify_head_notfound — no smart search ran, so
+        # m_smart_not_found would be inaccurate; h_clip_audio_failed
+        # / m_identify_error would falsely claim extraction failed /
+        # an error), the single retry button restored on the audio
+        # message, and the outcome logged. A rejected name is NOT
+        # caught here — it takes the BG re-identify path below, as
+        # before. Each invocation is independent: two sequential
+        # retry taps each send nothing (the _VIDEO_IDENTIFY_RUNNING
+        # guard only blocks concurrent duplicates, never relied on).
+        if (callback.message is not None
+                and getattr(callback.message, "audio", None) is not None
+                and _hit is not None
+                and (_hit.get("kind") or "clip") == "clip"
+                and not _smart_search_eligible(callback, entry, _hit)
+                and not _is_rejected(entry, _hit.get("title", ""),
+                                     _hit.get("artist", ""))):
+            result = AudioIdResult(
+                status=_hit.get("status") or "not_found",
+                title=_hit.get("title", ""),
+                artist=_hit.get("artist", ""),
+                confirmed=False,
+                source=_hit.get("source") or "cache")
+            try:
+                await callback.message.answer(
+                    t("m_identify_head_notfound", ulang))
+            except Exception:
+                pass
+            try:
+                _kb = _extracted_audio_kb(
+                    result.title, result.artist, ulang, token=token)
+                if _kb is not None:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=_kb)
+            except Exception:
+                pass
+            _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                              "result_send", _t_req, status=result.status)
+            _log_identify_timing()
+            return
         if _hit is not None and not _is_rejected(
                 entry, _hit.get("title", ""), _hit.get("artist", "")):
             if _hit.get("file_id") or _hit.get("disk_path"):
@@ -2542,7 +2615,7 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 if sent is not None:
                     # The final audio message IS the answer: the video
                     # gets the same result keyboard as the normal path.
-                    await _set_video_result_kb(
+                    await _set_video_result_kb_if_video(
                         callback.message, result.title, result.artist,
                         ulang, entry["file_id"], callback.from_user.id,
                         entry.get("kind") or "file", result.source)
@@ -2652,7 +2725,7 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                     _cache_key, req_id=_req_id)
                 _send_ms = int((_time.perf_counter() - _t_send) * 1000)
                 if sent is not None:
-                    await _set_video_result_kb(
+                    await _set_video_result_kb_if_video(
                         callback.message, result.title, result.artist,
                         ulang, entry["file_id"], callback.from_user.id,
                         entry.get("kind") or "file", result.source)
@@ -2683,7 +2756,7 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 status=(_known.get("status") or "not_found"),
                 title=_k_title, artist=_k_artist,
                 confirmed=False, source=_known.get("source") or "")
-        await _set_video_result_kb(
+        await _set_video_result_kb_if_video(
             callback.message, _kb_title, _kb_artist, ulang,
             entry["file_id"], callback.from_user.id,
             entry.get("kind") or "file",
