@@ -11,12 +11,19 @@ AUDD_API_TOKEN, AZURE_SPEECH_KEY) are NEVER shown or editable here.
 from __future__ import annotations
 
 import html
+import json
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db as dbmod
 from .bot import blocked_cache
+from .services.brave_probe import run_brave_probe_sync
+
+# TEMPORARY Brave probe guard (see app/services/brave_probe.py):
+# one probe run at a time; _BRAVE_PROBE_LAST holds the last result.
+_BRAVE_PROBE_LOCK = threading.Lock()
+_BRAVE_PROBE_LAST: dict | None = None
 
 
 def _esc(s) -> str:
@@ -54,6 +61,14 @@ def make_handler(db_path, config):
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_json(self, payload: dict, status: int = 200):
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             # Public liveness probe for an external uptime pinger
             # (logs deploy): NO auth, NO database, NO Turso — returns
@@ -65,6 +80,23 @@ def make_handler(db_path, config):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            # TEMPORARY Brave probe (see app/services/brave_probe.py):
+            # public like /health — NO auth, NO database, NO user data,
+            # NO state changes. One run at a time; a second call while
+            # running returns {"busy": true} plus the last result.
+            # The final smart-search implementation MUST remove this route.
+            if urllib.parse.urlparse(self.path).path == "/brave-probe":
+                global _BRAVE_PROBE_LAST
+                if not _BRAVE_PROBE_LOCK.acquire(blocking=False):
+                    self._send_json({"busy": True, "last": _BRAVE_PROBE_LAST})
+                    return
+                try:
+                    result = run_brave_probe_sync()
+                    _BRAVE_PROBE_LAST = result
+                finally:
+                    _BRAVE_PROBE_LOCK.release()
+                self._send_json(result)
                 return
             if not self._auth():
                 self._send("<h1>⛔ دسترسی غیرمجاز</h1>", 403); return
