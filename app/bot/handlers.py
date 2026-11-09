@@ -1446,7 +1446,24 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
                 audio_url = None
         _video_path, _has_audio, _tmpdir = await fetch_merged_video(
             video_url, audio_url, max_mb=max_mb, req_id=req_id)
+        # Step 1b: the merged file is on disk — wake the bg identify
+        # (spawned at resolve) so it can read this file instead of
+        # downloading the media a second time. It reads the file as
+        # soon as it wakes; the audio-stream fallback covers the race
+        # with the cleanup below.
+        try:
+            _signal_identify_bg_video_ready(
+                _identify_result_key(link=outcome.official_url), _video_path)
+        except Exception:
+            pass
     except Exception:
+        # Step 1b: download failed — wake the bg so it aborts instead
+        # of waiting out its timeout.
+        try:
+            _signal_identify_bg_video_ready(
+                _identify_result_key(link=outcome.official_url), None)
+        except Exception:
+            pass
         return None
     _size = 0
     try:
@@ -1460,6 +1477,12 @@ async def _send_instagram_video_file(message: Message, conn, outcome,
         try:
             if _tmpdir is not None:
                 _tmpdir.cleanup()
+        except Exception:
+            pass
+        # Step 1b: no usable file — wake the bg so it aborts.
+        try:
+            _signal_identify_bg_video_ready(
+                _identify_result_key(link=outcome.official_url), None)
         except Exception:
             pass
         return None
@@ -1968,6 +1991,113 @@ async def _answer_identify_clip_fallback(message, conn, config, data: bytes,
                   if rows else None)
 
 
+async def _send_identify_cache_hit(message, conn, hit: dict, token: str,
+                                   entry: dict, ulang: str,
+                                   cache_key: str,
+                                   req_id: str | None = None):
+    """Send a shortcode-cache hit with the SAME send as the fresh path:
+    full song -> identified caption + [playlist, lyrics] one row;
+    clip audio -> corporate caption + single retry button. A staged
+    disk file is sent via FSInputFile; the returned file_id then
+    replaces the disk path in the cache (memory + Turso) and the disk
+    file is deleted, so the NEXT tap is a file_id hit. A bank file_id
+    is sent without title/performer (exactly like
+    _send_exclusive_song); any other stored file_id is sent with
+    title/performer (exactly like the cached send in
+    _deliver_fullsong_bg). Returns the sent message, or None when
+    nothing sendable exists (the caller then falls through to the
+    normal flow). Never raises."""
+    try:
+        from aiogram.types import FSInputFile
+        import os as _os
+        title = hit.get("title", "")
+        artist = hit.get("artist", "")
+        source = hit.get("source") or "cache"
+        kind = hit.get("kind") or "clip"
+        fid = hit.get("file_id") or ""
+        disk = hit.get("disk_path") or ""
+        dur = hit.get("duration_sec") or 0
+        sent = None
+        if kind == "full":
+            kb, _key = _identified_song_kb(
+                message, conn, title, artist,
+                ("video", entry.get("file_id")), source, ulang)
+            caption = _final_audio_caption(
+                title, artist, ulang, duration_sec=dur,
+                quality=hit.get("quality") or "",
+                extra=hit.get("extra") or "")
+            if fid:
+                if source == "bank":
+                    # Exactly like _send_exclusive_song: cover first,
+                    # plain send on failure.
+                    _cover = hit.get("cover_file_id") or ""
+                    try:
+                        if _cover:
+                            sent = await message.answer_audio(
+                                fid, caption=caption, reply_markup=kb,
+                                thumbnail=_cover)
+                    except Exception:
+                        sent = None
+                    if sent is None:
+                        sent = await message.answer_audio(
+                            fid, caption=caption, reply_markup=kb)
+                else:
+                    sent = await message.answer_audio(
+                        fid, caption=caption, title=title,
+                        performer=artist, reply_markup=kb)
+            elif disk and _os.path.exists(disk):
+                sent = await message.answer_audio(
+                    FSInputFile(disk, filename=f"{title or 'song'}.mp3"),
+                    title=title, performer=artist,
+                    duration=int(dur) if dur else None,
+                    caption=caption, reply_markup=kb)
+        else:
+            kb = _extracted_audio_kb(title, artist, ulang, token=token)
+            caption = t("m_extracted_audio_new", ulang)
+            if fid:
+                sent = await message.answer_audio(
+                    fid, caption=caption, reply_markup=kb,
+                    title=t("m_extracted_audio_title", ulang),
+                    performer="Avano",
+                    duration=int(dur) if dur else None)
+            elif disk and _os.path.exists(disk):
+                sent = await message.answer_audio(
+                    FSInputFile(disk, filename="clip.mp3"),
+                    title=t("m_extracted_audio_title", ulang),
+                    performer="Avano",
+                    duration=int(dur) if dur else None,
+                    caption=caption, reply_markup=kb)
+        if sent is None:
+            return None
+        try:
+            _track(conn, message, sent)
+        except Exception:
+            pass
+        # Disk -> file_id upgrade: the next tap is a file_id hit.
+        try:
+            new_fid = ""
+            audio = getattr(sent, "audio", None)
+            if audio is not None:
+                new_fid = getattr(audio, "file_id", "") or ""
+            if new_fid and new_fid != fid:
+                if disk:
+                    try:
+                        _os.unlink(disk)
+                    except Exception:
+                        pass
+                _identify_result_store_send(
+                    cache_key, title, artist, source, kind, new_fid,
+                    duration_sec=dur,
+                    status=hit.get("status") or "identified",
+                    quality=hit.get("quality") or "",
+                    extra=hit.get("extra") or "", req_id=req_id)
+        except Exception:
+            pass
+        return sent
+    except Exception:
+        return None
+
+
 @router.callback_query(F.data.startswith("vid:id:"))
 async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     """One-click «🎵 شناسایی موسیقی» under a received video.
@@ -2012,44 +2142,104 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     except Exception:
         status_msg = None
     _bg_owns_status = False
+    _cache_hit = False
     # Timing instrumentation (logs only): one request id per tap.
     _req_id = _timing.new_req_id()
     _t_req = _time.perf_counter()
+    _t_wall = _time.time()
     _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
                       _t_req)
-    # URL-key cache pre-check: the same audio URL identified before ->
-    # skip the download AND the lookup for a stored "identified" result
-    # (the link flow stores its result under the reel's audio URL, so a
-    # tap right after a link identify answers instantly). A stored
-    # "not_found" still downloads: the fallback needs the real bytes to
-    # build the clip MP3, and _identify_audio's hash cache then skips
-    # the lookup itself.
-    audio_url = entry.get("audio_url")
-    cached_result = None
-    if audio_url and conn is not None:
-        try:
-            _ck = dbmod.get_identify_cache(conn, f"url:{audio_url}",
-                                           dbmod.IDENTIFY_CACHE_URL_TTL)
-        except Exception:
-            _ck = None
-        if _ck is not None and _ck["status"] == "identified":
-            # Batch F: a name the user already rejected for this video
-            # is never re-shown from the cache — fall through to the
-            # live pipeline with the exclusion active.
-            if not _is_rejected(entry, _ck["title"], _ck["artist"]):
-                log_event(log, "identify_stage", stage="cache_check", ms=0,
-                          req_id=_req_id,
-                          total_ms=int((_time.perf_counter() - _t_req) * 1000),
-                          hit=True, via="url")
-                cached_result = AudioIdResult(status="identified",
-                                              title=_ck["title"],
-                                              artist=_ck["artist"],
-                                              confirmed=True, source="cache")
     result = None
     data = b""
-    if cached_result is not None:
-        result = cached_result
     try:
+        # Step 1b: SHORTCODE cache fast path — FIRST, before the URL
+        # cache pre-check and before any download/validate work.
+        # Memory LRU first, then ONE indexed Turso read on a miss. A
+        # sendable hit sends the stored final message immediately: no
+        # bank match, no Shazam, no AudD. A name-only ("pending") hit
+        # waits boundedly on the in-flight bg identify and re-reads;
+        # if still pending it falls through to the normal flow (whose
+        # Stage-0 cache already holds the bg's identify result, so
+        # only file resolution remains). A rejected name never comes
+        # from the cache (batch F exclusion, same as the URL check).
+        _cache_key = _identify_result_key(link=entry.get("link"),
+                                          file_id=entry.get("file_id"))
+        _hit = None
+        if _cache_key:
+            _hit = _identify_result_get(_cache_key)
+            if _hit is None:
+                _hit = _identify_result_get_turso(_cache_key, req_id=_req_id)
+                if _hit is not None:
+                    _identify_result_put(_cache_key, _hit)
+        if _hit is not None and not _is_rejected(
+                entry, _hit.get("title", ""), _hit.get("artist", "")):
+            if _hit.get("kind") == "pending" or (
+                    not _hit.get("file_id") and not _hit.get("disk_path")):
+                if await _await_identify_bg(_cache_key, timeout=5.0):
+                    _hit = _identify_result_get(_cache_key)
+            if _hit is not None and (_hit.get("file_id")
+                                     or _hit.get("disk_path")):
+                _cache_hit = True
+                result = AudioIdResult(
+                    status=_hit.get("status") or "identified",
+                    title=_hit.get("title", ""),
+                    artist=_hit.get("artist", ""),
+                    confirmed=_hit.get("status") == "identified",
+                    source=_hit.get("source") or "cache")
+                sent = await _send_identify_cache_hit(
+                    callback.message, conn, _hit, token, entry, ulang,
+                    _cache_key, req_id=_req_id)
+                if sent is not None:
+                    # The final audio message IS the answer: the video
+                    # gets the same result keyboard as the normal path.
+                    await _set_video_result_kb(
+                        callback.message, result.title, result.artist,
+                        ulang, entry["file_id"], callback.from_user.id,
+                        entry.get("kind") or "file", result.source)
+                    _timing.log_stage(log, "identify_stage", _req_id,
+                                      _t_req, "name_sent", _t_req,
+                                      cache_hit=True, via="shortcode",
+                                      kind=_hit.get("kind") or "clip")
+                    _timing.log_stage(log, "identify_stage", _req_id,
+                                      _t_req, "result_send", _t_req,
+                                      status=result.status)
+                    return
+                # Stored file gone (stale file_id / missing disk file):
+                # fall through to the normal flow, which re-resolves.
+                _hit = None
+                _cache_hit = False
+                result = None
+        # URL-key cache pre-check: the same audio URL identified before ->
+        # skip the download AND the lookup for a stored "identified" result
+        # (the link flow stores its result under the reel's audio URL, so a
+        # tap right after a link identify answers instantly). A stored
+        # "not_found" still downloads: the fallback needs the real bytes to
+        # build the clip MP3, and _identify_audio's hash cache then skips
+        # the lookup itself.
+        audio_url = entry.get("audio_url")
+        cached_result = None
+        if audio_url and conn is not None:
+            try:
+                _ck = dbmod.get_identify_cache(conn, f"url:{audio_url}",
+                                               dbmod.IDENTIFY_CACHE_URL_TTL)
+            except Exception:
+                _ck = None
+            if _ck is not None and _ck["status"] == "identified":
+                # Batch F: a name the user already rejected for this video
+                # is never re-shown from the cache — fall through to the
+                # live pipeline with the exclusion active.
+                if not _is_rejected(entry, _ck["title"], _ck["artist"]):
+                    _cache_hit = True
+                    log_event(log, "identify_stage", stage="cache_check", ms=0,
+                              req_id=_req_id,
+                              total_ms=int((_time.perf_counter() - _t_req) * 1000),
+                              hit=True, via="url")
+                    cached_result = AudioIdResult(status="identified",
+                                                  title=_ck["title"],
+                                                  artist=_ck["artist"],
+                                                  confirmed=True, source="cache")
+        if cached_result is not None:
+            result = cached_result
         # Phase 2 batch 2: background pre-compute (spawned AFTER the video
         # was sent, never concurrent with the download/mux). A bank hit
         # answers instantly; a bank miss reuses the already-extracted 12 s
@@ -2134,7 +2324,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 req_id=_req_id,
                 arm=("video_button", entry["file_id"], data or None,
                      audio_url or "", ""),
-                source=result.source, status_msg=status_msg)
+                source=result.source, status_msg=status_msg,
+                cache_key=_cache_key, t_wall=_t_wall)
             # FINAL IDENTIFY UI (2026-11-09): the video now carries
             # the result keyboard — Google + YouTube row, report row
             # below it. The final audio message carries only
@@ -2153,6 +2344,27 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             sent = await _send_unconfirmed_audio(
                 callback.message, conn, data, result.title, result.artist,
                 ulang, token=token)
+            if sent is not None:
+                # Step 1b: the clip's own audio IS the final result for
+                # this shortcode — store it (10-min TTL: unconfirmed /
+                # not_found only; a lookup_error is an error and is
+                # never cached) so the next tap sends it immediately.
+                try:
+                    _a = getattr(sent, "audio", None)
+                    _fid = getattr(_a, "file_id", "") or "" if _a else ""
+                    if _fid and result.status in ("unconfirmed",
+                                                  "not_found"):
+                        _identify_result_store_send(
+                            _cache_key, result.title, result.artist,
+                            result.source, "clip", _fid,
+                            duration_sec=getattr(_a, "duration", 0) or 0,
+                            status=result.status, req_id=_req_id)
+                    log_event(log, "identify_stage", stage="name_sent",
+                              req_id=_req_id,
+                              ms=int((_time.time() - _t_wall) * 1000),
+                              cache_hit=False, kind="clip")
+                except Exception:
+                    pass
             # FINAL IDENTIFY UI (2026-11-09): a single-source name is
             # still a name to review — the video gets the Google +
             # YouTube + report rows; no name at all -> empty keyboard.
@@ -2189,7 +2401,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             await _delete_card(status_msg)
         _timing.log_total(log, "identify_stage", _req_id, _t_req,
                           result.status if result is not None else "error",
-                          headline_total="click_to_identify_ms")
+                          headline_total="click_to_identify_ms",
+                          cache_hit=_cache_hit)
 
 
 # --- «❌ آهنگ اشتباه» (batch F, wrong-song re-check) ---------------------------
@@ -2426,6 +2639,8 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
     _WRONG_SONG_RUNNING.add(token)
     _req_id = _timing.new_req_id()
     _t_req = _time.perf_counter()
+    _t_wall = _time.time()
+    _ws_key = None
     _timing.log_stage(log, "identify_stage", _req_id, _t_req, "receipt",
                       _t_req)
     await callback.answer(t("m_wrong_song_checking", ulang))
@@ -2443,6 +2658,13 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
         # re-check, so a second attempt also excludes it.
         rejected = list(entry.get("wrong") or []) + [(wrong_title, wrong_artist)]
         entry["wrong"] = rejected
+        # Step 1b: the cached result for this shortcode is disputed —
+        # clear it from memory NOW, so no concurrent tap can hit the
+        # stale entry; the Turso delete runs after the answer, next to
+        # the wrong-song report write.
+        _ws_key = _identify_result_key(link=entry.get("link"),
+                                       file_id=entry.get("file_id"))
+        _identify_result_clear(_ws_key, turso=False)
         data = await _wrong_song_fetch_audio(callback, entry, config,
                                              req_id=_req_id, t_req=_t_req)
         if not data or len(data) > config.max_file_mb * 1024 * 1024:
@@ -2473,7 +2695,8 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
                 req_id=_req_id,
                 arm=("video_button", entry["file_id"], data,
                      entry.get("audio_url") or "", ""),
-                source=result.source, status_msg=status_msg)
+                source=result.source, status_msg=status_msg,
+                cache_key=_ws_key, t_wall=_t_wall)
             if not _spawned:
                 await _delete_card(status_msg)
             # FINAL IDENTIFY UI (2026-11-09): the video keyboard
@@ -2561,6 +2784,16 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
         wrong_title, wrong_artist, wrong_source,
         new_title, new_artist, new_source, outcome,
         attempts=int(entry.get("attempts") or 0), req_id=_req_id)
+    # Step 1b: the Turso half of the clear (memory was cleared before
+    # the re-check). Atomic and conditional: the row is deleted ONLY
+    # when it still holds the disputed name, so a bg delivery that
+    # already stored the NEW result under the same key is never wiped.
+    if _ws_key:
+        try:
+            from .turso_cache import delete_identify_result_if as _t_del_if
+            _t_del_if(_ws_key, wrong_title, wrong_artist, req_id=_req_id)
+        except Exception:
+            pass
 
 
 async def _identify_audio(data: bytes, filename: str, config: Config,
@@ -3077,6 +3310,274 @@ _BG_PRECOMPUTE_MAX = 32  # entries; ~0.5 MB slice each -> <= ~16 MB
 _BG_PRECOMPUTE_TASKS: dict[int, asyncio.Task] = {}
 
 
+# --- Step 1b: shortcode-keyed identify-result cache (2026-11-09) -------
+# The Stage-0 hash cache answers only the IDENTIFY step (name only);
+# the tap still re-downloaded the video and re-resolved the file on
+# every tap, so click-to-name stayed 15-27 s. This cache stores the
+# FINAL result — title/artist/source, the file KIND (full song vs clip
+# audio) and a SENDABLE file reference — keyed by SHORTCODE, so a
+# repeat tap sends the stored file immediately: no download, no bank
+# match, no Shazam, no AudD. Memory LRU (cap 200) is the hot path;
+# Turso is read ONLY on a memory miss and written only after a send
+# or inside the bg task (hot-path gates). Disk staging holds a
+# prepared file until its first send, after which the returned
+# file_id replaces the path; disk files are never in RAM and never
+# stored in Turso (a path is meaningless on another instance).
+_IDENTIFY_RESULT_MAX = 200  # memory entries
+_IDENTIFY_RESULT_CONFIRMED_TTL = 7 * 86400  # confirmed: matches song_file_cache 7d
+_IDENTIFY_RESULT_NOTFOUND_TTL = 600  # not identified / single-source: 10 min, ordered
+_IDENTIFY_RESULT_DISK_TTL = 86400  # staged files: 24 h (the NAME stays cached 7 d)
+_IDENTIFY_RESULT_DISK_MAX_FILES = 50
+_IDENTIFY_RESULT_DISK_MAX_BYTES = 300 * 1024 * 1024
+_IDENTIFY_RESULT_CACHE: dict[str, dict] = {}
+_IDENTIFY_BG_TASKS: dict[str, asyncio.Task] = {}
+_IDENTIFY_BG_VIDEO_READY: dict[str, tuple] = {}
+
+_IG_SHORTCODE_RE = re.compile(
+    r"instagram\.com/(?:reel|p|tv|reels)/([A-Za-z0-9_-]+)")
+_APARAT_HASH_RE = re.compile(r"aparat\.com/v/([A-Za-z0-9]+)")
+
+
+def _identify_result_key(link=None, file_id=None, data=None):
+    """One key for an identify result, from the most stable source
+    available: Instagram shortcode > Aparat videohash > Telegram
+    file_id of the source video > content sha256. The shortcode is
+    stable across re-sends of the same reel (fresh link, cache-hit
+    link, and the bg task all derive the same key); a Telegram
+    file_id is content-based, so a re-sent direct file matches too.
+    Returns None when nothing is derivable."""
+    for _src in (link or "",):
+        _m = _IG_SHORTCODE_RE.search(_src)
+        if _m:
+            return "ig:" + _m.group(1)
+        _m = _APARAT_HASH_RE.search(_src)
+        if _m:
+            return "ap:" + _m.group(1)
+    if file_id:
+        return "tg:" + str(file_id)
+    if data:
+        try:
+            import hashlib as _hashlib
+            return "sha:" + _hashlib.sha256(data).hexdigest()
+        except Exception:
+            return None
+    return None
+
+
+def _identify_result_entry(status: str, title: str = "", artist: str = "",
+                           source: str = "", kind: str = "pending",
+                           file_id: str = "", disk_path: str = "",
+                           duration_sec: float = 0, quality: str = "",
+                           extra: str = "", cover_file_id: str = "",
+                           ttl: int | None = None) -> dict:
+    """One cache entry. kind: "full" | "clip" | "pending" (name known,
+    file not ready yet). Only CONFIRMED results get the long TTL;
+    anything else gets the ordered 10 minutes. quality/extra are the
+    caption's quality line and extra line (bank: measured kbps + the
+    💎 marker; adapter full songs: empty) and cover_file_id is the
+    bank song's cover thumbnail, so a cache hit reproduces the fresh
+    path's message exactly."""
+    if ttl is None:
+        ttl = (_IDENTIFY_RESULT_CONFIRMED_TTL if status == "identified"
+               else _IDENTIFY_RESULT_NOTFOUND_TTL)
+    return {"status": status, "title": title or "", "artist": artist or "",
+            "source": source or "", "kind": kind,
+            "file_id": file_id or "", "disk_path": disk_path or "",
+            "duration_sec": duration_sec or 0,
+            "quality": quality or "", "extra": extra or "",
+            "cover_file_id": cover_file_id or "",
+            "created_at": _time.time(), "ttl": ttl}
+
+
+def _identify_result_get(key: str) -> dict | None:
+    """Fresh memory entry, or None (miss/expired). A hit refreshes
+    the LRU position (plain dict: pop + reinsert)."""
+    if not key:
+        return None
+    ent = _IDENTIFY_RESULT_CACHE.get(key)
+    if ent is None:
+        return None
+    if _time.time() - ent.get("created_at", 0) > ent.get("ttl", 0):
+        _IDENTIFY_RESULT_CACHE.pop(key, None)
+        return None
+    _IDENTIFY_RESULT_CACHE.pop(key, None)
+    _IDENTIFY_RESULT_CACHE[key] = ent
+    return ent
+
+
+def _identify_result_put(key: str, entry: dict) -> None:
+    """Store in memory only (LRU, cap 200, oldest evicted first).
+    Never raises."""
+    try:
+        if not key or not isinstance(entry, dict):
+            return
+        _IDENTIFY_RESULT_CACHE.pop(key, None)
+        _IDENTIFY_RESULT_CACHE[key] = dict(entry)
+        while len(_IDENTIFY_RESULT_CACHE) > _IDENTIFY_RESULT_MAX:
+            _IDENTIFY_RESULT_CACHE.pop(next(iter(_IDENTIFY_RESULT_CACHE)))
+    except Exception:
+        pass
+
+
+def _identify_result_store(key: str, entry: dict,
+                           req_id: str | None = None) -> None:
+    """Store in memory + Turso. The Turso write is best-effort and
+    never in a tap's waiting path (callers store after a send, or
+    from the bg task). Never raises."""
+    try:
+        _identify_result_put(key, entry)
+    except Exception:
+        pass
+    try:
+        from .turso_cache import store_identify_result as _t_store
+        _t_store(key, entry, req_id=req_id)
+    except Exception:
+        pass
+
+
+def _identify_result_get_turso(key: str,
+                               req_id: str | None = None) -> dict | None:
+    """One indexed Turso read (memory-miss path only). A row without
+    a file_id is name-only: the tap still saves the whole lookup,
+    so it comes back as kind "pending". Never raises."""
+    if not key:
+        return None
+    try:
+        from .turso_cache import get_identify_result as _t_get
+        row = _t_get(key, req_id=req_id)
+    except Exception:
+        row = None
+    if not row:
+        return None
+    ent = dict(row)
+    if not ent.get("file_id"):
+        ent["kind"] = "pending"
+        ent["disk_path"] = ""
+    return ent
+
+
+def _identify_result_clear(key: str, turso: bool = True) -> None:
+    """Clear a cached result (wrong-song dispute). Memory is cleared
+    immediately; the Turso delete runs with turso=False deferred to
+    after the answer (same pattern as the wrong-song report write).
+    Never raises."""
+    try:
+        if key:
+            _IDENTIFY_RESULT_CACHE.pop(key, None)
+    except Exception:
+        pass
+    if turso and key:
+        try:
+            from .turso_cache import delete_identify_result as _t_del
+            _t_del(key)
+        except Exception:
+            pass
+
+
+def _identify_result_store_send(cache_key, title: str, artist: str,
+                                source: str, kind: str, file_id: str,
+                                duration_sec: float = 0,
+                                status: str = "identified",
+                                quality: str = "", extra: str = "",
+                                cover_file_id: str = "",
+                                req_id: str | None = None) -> None:
+    """Store the FINAL result right after a send (memory + Turso).
+    No-op without a key. Fire-and-forget-safe; never raises."""
+    if not cache_key or not file_id:
+        return
+    try:
+        _identify_result_store(
+            cache_key,
+            _identify_result_entry(status, title, artist, source, kind,
+                                   file_id=file_id,
+                                   duration_sec=duration_sec,
+                                   quality=quality, extra=extra,
+                                   cover_file_id=cover_file_id),
+            req_id=req_id)
+    except Exception:
+        pass
+
+
+def _ident_cache_dir() -> str:
+    """Staging dir for prepared audio files (never in RAM)."""
+    import os as _os
+    import tempfile as _tf
+    d = _os.path.join(_tf.gettempdir(), "avano_ident_cache")
+    try:
+        _os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _ident_disk_path(key: str, ext: str = "mp3") -> str:
+    """Staged-file path for a key (sanitized; ext from the file)."""
+    import hashlib as _hashlib
+    import os as _os
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", (key or "")[:64])
+    if not safe:
+        safe = _hashlib.sha256((key or "").encode()).hexdigest()[:16]
+    return _os.path.join(_ident_cache_dir(), f"{safe}.{ext}")
+
+
+def _ident_disk_write(key: str, data: bytes, ext: str = "mp3") -> str | None:
+    """Write bytes to the staged file; returns the path or None.
+    The caller's bytes are freed by the caller after this returns.
+    Never raises."""
+    try:
+        if not data:
+            return None
+        p = _ident_disk_path(key, ext)
+        with open(p, "wb") as f:
+            f.write(data)
+        _ident_disk_sweep()
+        return p
+    except Exception:
+        return None
+
+
+def _ident_disk_sweep() -> None:
+    """Delete staged files older than the disk TTL; enforce the file
+    and byte caps (oldest first). Never raises."""
+    try:
+        import os as _os
+        d = _ident_cache_dir()
+        now = _time.time()
+        try:
+            names = _os.listdir(d)
+        except Exception:
+            return
+        files = []
+        for _n in names:
+            try:
+                _p = _os.path.join(d, _n)
+                _st = _os.stat(_p)
+                files.append((_st.st_mtime, _st.st_size, _p))
+            except Exception:
+                continue
+        files.sort()
+        total = sum(_s for _m, _s, _p in files)
+        for _mtime, _size, _p in files:
+            if now - _mtime > _IDENTIFY_RESULT_DISK_TTL:
+                try:
+                    _os.unlink(_p)
+                    total -= _size
+                except Exception:
+                    pass
+        files = [(_m, _s, _p) for _m, _s, _p in files
+                 if _os.path.exists(_p)]
+        while (len(files) > _IDENTIFY_RESULT_DISK_MAX_FILES
+               or total > _IDENTIFY_RESULT_DISK_MAX_BYTES) and files:
+            _m, _s, _p = files.pop(0)
+            try:
+                _os.unlink(_p)
+                total -= _s
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _bg_precompute_key(audio_url: str) -> str:
     import hashlib as _hashlib
     return _hashlib.sha256((audio_url or "").encode()).hexdigest()
@@ -3272,6 +3773,373 @@ def _spawn_bg_precompute(audio_url: str, chat_id: int, conn,
         task.add_done_callback(_done)
     except Exception:
         pass
+
+
+def _signal_identify_bg_video_ready(key: str, video_path=None) -> None:
+    """Set the video-ready event for a shortcode key (called by
+    _send_link_video after the download, so the bg identify — spawned
+    at resolve — can reuse the merged file on disk). video_path=None
+    means the download failed: the bg aborts instead of waiting out
+    its timeout. Never raises."""
+    try:
+        if not key:
+            return
+        _ev, _old = _IDENTIFY_BG_VIDEO_READY.get(key, (None, None))
+        if _ev is None:
+            _ev = asyncio.Event()
+        _IDENTIFY_BG_VIDEO_READY[key] = (_ev, video_path)
+        _ev.set()
+    except Exception:
+        pass
+
+
+def _spawn_identify_bg(key: str, audio_url: str, chat_id: int, conn,
+                       config, req_id: str | None = None):
+    """Spawn the bg identify for one shortcode key (max 1 in flight
+    per key; a repeat spawn reuses the in-flight task instead of
+    starting a second lookup). Returns the task or None. Never raises."""
+    try:
+        if not key or not audio_url or not chat_id:
+            return None
+        prev = _IDENTIFY_BG_TASKS.get(key)
+        if prev is not None and not prev.done():
+            return prev
+        if key not in _IDENTIFY_BG_VIDEO_READY:
+            _IDENTIFY_BG_VIDEO_READY[key] = (asyncio.Event(), None)
+        task = asyncio.create_task(
+            _identify_bg_link(key, audio_url, chat_id, conn, config, req_id))
+        _IDENTIFY_BG_TASKS[key] = task
+
+        def _done(_t, _k=key):
+            if _IDENTIFY_BG_TASKS.get(_k) is _t:
+                _IDENTIFY_BG_TASKS.pop(_k, None)
+
+        task.add_done_callback(_done)
+        return task
+    except Exception:
+        return None
+
+
+async def _await_identify_bg(key: str, timeout: float = 5.0) -> bool:
+    """Wait (bounded) for the in-flight bg identify for a key. True
+    when it finished (re-read the cache after); False on timeout or
+    when no task exists. The timeout NEVER cancels the bg task — it
+    keeps running and populates the cache for the next tap. Never
+    raises."""
+    try:
+        task = _IDENTIFY_BG_TASKS.get(key)
+        if task is None:
+            return False
+        if task.done():
+            return True
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        return True
+    except (asyncio.TimeoutError, Exception):
+        return False
+
+
+async def _download_audio_to_disk(url: str, out_path: str, config,
+                                  req_id: str | None = None) -> bool:
+    """Stream an audio URL to disk (64 KB chunks, never held in RAM).
+    Same P1-8 media-URL validation as _download_link_audio. A partial
+    file is deleted. Returns True on success. Never raises."""
+    try:
+        if not await validate_media_url_for_fetch(url):
+            return False
+        import os as _os
+        headers = {"User-Agent": "Mozilla/5.0",
+                   "Referer": "https://www.instagram.com/"}
+        max_mb = getattr(config, "max_file_mb", 50)
+        async with httpx.AsyncClient(timeout=40) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                size = 0
+                with open(out_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(65536):
+                        size += len(chunk)
+                        if size > max_mb * 1024 * 1024:
+                            raise ValueError("audio too large")
+                        f.write(chunk)
+        return _os.path.getsize(out_path) > 0
+    except Exception:
+        try:
+            import os as _os
+            _os.unlink(out_path)
+        except Exception:
+            pass
+        return False
+
+
+async def _identify_bg_link(key: str, audio_url: str, chat_id: int, conn,
+                            config, req_id: str | None = None) -> None:
+    """Background full identify + file resolution for one link.
+
+    Spawned at RESOLVE (not after the video is sent): the task waits
+    for the video download to finish (event set by _send_link_video)
+    so its ffmpeg work never competes with the download/mux, then
+    identifies from the merged video file on disk — no second
+    download — falling back to the audio stream when the file is
+    already gone. When it finishes, the FINAL result (name + a
+    sendable file) is written to the shortcode cache even if the user
+    has not tapped yet; a tap then sends the stored file immediately.
+    The bg never messages and never holds song/video bytes in RAM
+    beyond the transient identify/transcode calls (freed right after);
+    the prepared file lives on DISK until its first send. Errors are
+    never cached. CancelledError is re-raised; anything else is
+    swallowed after logging."""
+    _req = req_id or _timing.new_req_id()
+    _t_req = _time.perf_counter()
+    _t_wall = _time.time()
+    _timing.log_stage(log, "identify_stage", _req, _t_req, "receipt",
+                      _t_req)
+    _audio_path = None
+    _clip_path = None
+    try:
+        if _identify_result_get(key) is not None:
+            return  # already answered (repeat link, earlier tap)
+        # Wait for the video download (bounded): the merged file is
+        # the identify input — no second download of the media.
+        _ev, _vpath = _IDENTIFY_BG_VIDEO_READY.get(key, (None, None))
+        if _ev is None:
+            return
+        try:
+            await asyncio.wait_for(_ev.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            _timing.log_stage(log, "identify_stage", _req, _t_req,
+                              "bg_video_wait", _t_req, ok=False,
+                              reason="timeout")
+            return
+        _ev, _vpath = _IDENTIFY_BG_VIDEO_READY.get(key, (None, None))
+        import os as _os
+        data = b""
+        if _vpath and _os.path.exists(_vpath):
+            # The merged file is on disk: read it transiently (the
+            # identify pipeline's contract is bytes-in; freed right
+            # after) and let the pipeline transcode it.
+            try:
+                with open(_vpath, "rb") as _f:
+                    data = _f.read()
+            except Exception:
+                data = b""
+        if not data:
+            # Merged file gone (cleanup raced us) or unreadable: the
+            # audio stream is the same content — stream it to disk.
+            _audio_path = _ident_disk_path(key, "src")
+            if not await _download_audio_to_disk(audio_url, _audio_path,
+                                                 config, req_id=_req):
+                return
+            try:
+                with open(_audio_path, "rb") as _f:
+                    data = _f.read()
+            except Exception:
+                data = b""
+            if not data:
+                return
+        _t_id = _time.perf_counter()
+        try:
+            result = await _identify_audio(
+                data, "clip.mp4", config, conn, cache_url_key=audio_url,
+                req_id=_req, t_req=_t_req)
+        except Exception:
+            result = None
+        _timing.log_stage(log, "identify_stage", _req, _t_req,
+                          "bg_identify", _t_id,
+                          status=result.status if result is not None
+                          else "error")
+        if result is None or result.status == "error":
+            return  # errors are never cached
+        # File resolution: a known file_id first (no download), then
+        # the bank, then the adapter search staged to disk.
+        _kind = "pending"
+        _fid = ""
+        _disk = None
+        _dur = 0.0
+        _quality = ""
+        _extra = ""
+        _cover = ""
+        if result.status == "identified":
+            _t_res = _time.perf_counter()
+            try:
+                from .file_cache import get_cached_song as _lc_get
+                from ..search.fullsong_verify import file_identity_matches as _fim
+                _lc = _lc_get(conn, result.artist, result.title)
+                if _lc:
+                    _vt, _va = _lc.get("verified_title"), _lc.get("verified_artist")
+                    if _vt and _fim(result.title, result.artist, _vt, _va or ""):
+                        _fid = _lc.get("file_id") or ""
+                        _dur = _lc.get("duration_sec") or 0
+            except Exception:
+                pass
+            if not _fid:
+                try:
+                    from .turso_cache import get_song_file as _t_get
+                    _tr = _t_get(result.artist, result.title, req_id=_req)
+                    if _tr:
+                        from ..search.fullsong_verify import file_identity_matches as _fim2
+                        _vt, _va = _tr.get("verified_title"), _tr.get("verified_artist")
+                        if _vt and _fim2(result.title, result.artist, _vt, _va or ""):
+                            _fid = _tr.get("file_id") or ""
+                            _dur = _tr.get("duration_sec") or 0
+                except Exception:
+                    pass
+            if not _fid:
+                try:
+                    _song = _exclusive_song_for(result.title, result.artist)
+                    if _song is not None:
+                        from .exclusive_bank import delivery_candidates as _dc
+                        _cands = _dc(_song)
+                        if _cands:
+                            _fid = _cands[0]
+                            _dur = _song.get("duration_sec") or 0
+                            # Same quality/marker as _send_exclusive_song.
+                            if _song.get("ready_file_id"):
+                                _kbps = int(_song.get("ready_bitrate_kbps")
+                                            or _song.get("bitrate_kbps") or 0)
+                            else:
+                                _kbps = int(_song.get("bitrate_kbps") or 0)
+                            _quality = (f"کیفیت واقعی: {_kbps}kbps"
+                                        if _kbps else "")
+                            _extra = "💎 نسخه کامل اختصاصی آوانو"
+                            _cover = _song.get("cover_file_id") or ""
+                except Exception:
+                    pass
+            if _fid:
+                _kind = "full"
+            else:
+                # Adapter search: the file bytes are written to DISK
+                # immediately and freed — never retained in RAM.
+                _full = None
+                try:
+                    from ..search.adapters import find_full_song_file_v2 as _find
+                    _full = await _find(result.artist, result.title)
+                except Exception:
+                    _full = None
+                _verified = False
+                if _full and _full.get("data"):
+                    try:
+                        from ..search.fullsong_verify import verify_fullsong_file as _vf
+                        _v = await asyncio.to_thread(
+                            _vf, _full.get("data") or b"",
+                            _full.get("ext") or "mp3",
+                            result.title, result.artist)
+                        _verified = _v.get("status") == "match"
+                        if _verified:
+                            _dur = _v.get("duration_sec") or 0
+                    except Exception:
+                        _verified = False
+                if _verified and _full is not None:
+                    _disk = _ident_disk_write(
+                        key, _full.get("data") or b"",
+                        _full.get("ext") or "mp3")
+                    try:
+                        _full["data"] = b""
+                    except Exception:
+                        pass
+                    if _disk:
+                        _kind = "full"
+                if _kind == "pending":
+                    # No verified full file: the clip's own audio,
+                    # transcoded to a staged MP3 on disk.
+                    _clip_path = await _bg_clip_to_disk(
+                        key, data, result, _req)
+                    if _clip_path:
+                        _kind = "clip"
+                        _disk = _clip_path
+                        try:
+                            _dur = _bg_clip_duration(_clip_path)
+                        except Exception:
+                            _dur = 0.0
+            _timing.log_stage(log, "identify_stage", _req, _t_req,
+                              "bg_resolve", _t_res, kind=_kind,
+                              file_ready=bool(_fid or _disk))
+        else:
+            # Unconfirmed / not_found: the clip's own audio staged to
+            # disk, so the tap sends it without re-downloading or
+            # re-extracting. Short TTL (ordered 10 min).
+            _clip_path = await _bg_clip_to_disk(key, data, result, _req)
+            if _clip_path:
+                _kind = "clip"
+                _disk = _clip_path
+                try:
+                    _dur = _bg_clip_duration(_clip_path)
+                except Exception:
+                    _dur = 0.0
+        try:
+            del data
+        except Exception:
+            pass
+        if _kind == "pending":
+            return  # nothing sendable staged; the name is already in Stage 0
+        _ent = _identify_result_entry(
+            result.status, result.title, result.artist, result.source,
+            kind=_kind, file_id=_fid, disk_path=_disk or "",
+            duration_sec=_dur, quality=_quality, extra=_extra,
+            cover_file_id=_cover)
+        _identify_result_store(key, _ent, req_id=_req)
+        _timing.log_stage(log, "identify_stage", _req, _t_req,
+                          "bg_cache_store", _t_req, kind=_kind,
+                          via="shortcode")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        try:
+            _timing.log_stage(log, "identify_stage", _req, _t_req,
+                              "bg_error", _t_req)
+        except Exception:
+            pass
+    finally:
+        # The downloaded/extracted source audio is not the staged
+        # file: remove it. The staged clip/full file stays (TTL sweep).
+        try:
+            import os as _os
+            if _audio_path and _os.path.exists(_audio_path):
+                _os.unlink(_audio_path)
+        except Exception:
+            pass
+        try:
+            _IDENTIFY_BG_VIDEO_READY.pop(key, None)
+        except Exception:
+            pass
+        try:
+            _timing.log_total(log, "identify_stage", _req, _t_req,
+                              "bg_done", headline_total="bg_identify_ms")
+        except Exception:
+            pass
+
+
+def _bg_clip_duration(path: str) -> float:
+    """Probed duration of a staged clip file (ffprobe, never raises)."""
+    try:
+        import subprocess as _sp
+        import json as _js
+        out = _sp.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                       "-show_format", path],
+                      capture_output=True, timeout=30)
+        info = _js.loads(out.stdout.decode("utf-8", "replace") or "{}")
+        return float((info.get("format") or {}).get("duration") or 0)
+    except Exception:
+        return 0.0
+
+
+async def _bg_clip_to_disk(key: str, data: bytes, result,
+                           req_id: str | None = None) -> str | None:
+    """Transcode the clip's own audio to a staged MP3 on disk (same
+    target-bitrate rule as _extract_and_send_clip_audio). Returns the
+    path or None. Never raises; the bytes are freed by the caller."""
+    try:
+        if not data:
+            return None
+        if await asyncio.to_thread(has_audio_stream, data) is False:
+            return None
+        src_br, _dur = await asyncio.to_thread(probe_audio, data, "mp4")
+        target = 320 if (src_br or 0) >= 300 else max(96, src_br or 128)
+        conv = await asyncio.to_thread(transcode_mp3, data, "mp4", target)
+        mp3 = conv[0] if conv and conv[0] else None
+        if not mp3:
+            return None
+        return _ident_disk_write(key, mp3, "mp3")
+    except Exception:
+        return None
 
 
 async def _identify_link_audio(outcome, config: Config, conn=None,
@@ -3719,7 +4587,7 @@ def _exclusive_song_for(title: str, artist: str):
 async def _send_exclusive_song(message, song, status_msg=None, kb=None,
                                title: str | None = None,
                                artist: str | None = None,
-                               ulang: str = "fa") -> bool:
+                               ulang: str = "fa") -> str:
     """Send an exclusive-bank song's full file as the ONE final message.
 
     Sends the PREPARED version's stored Telegram file_id when one is
@@ -3727,9 +4595,10 @@ async def _send_exclusive_song(message, song, status_msg=None, kb=None,
     at delivery time, and no bitrate error can block the send. When the
     prepared version's send fails (e.g. a stale file_id), the stored
     ORIGINAL file is tried before giving up — the bank file must reach
-    the user, not fall through to a public search. Returns True on
-    success; False only when every stored version failed (caller falls
-    back to the catalog card).
+    the user, not fall through to a public search. Returns the file_id
+    that was actually sent (Step 1b: the caller stores it under the
+    shortcode key), or "" when every stored version failed (caller
+    falls back to the catalog card).
 
     UNIFY FIX (2026-11-09): no «شناسایی شد» card is ever sent before
     the file status is known — the audio IS the one final message, with
@@ -3753,6 +4622,7 @@ async def _send_exclusive_song(message, song, status_msg=None, kb=None,
         quality=_quality, extra="💎 نسخه کامل اختصاصی آوانو")
     _cands = delivery_candidates(song)
     sent = None
+    _sent_fid = ""
     _last_err = None
     for fid in _cands:
         try:
@@ -3767,6 +4637,7 @@ async def _send_exclusive_song(message, song, status_msg=None, kb=None,
                 sent = await message.answer_audio(fid, caption=caption,
                                                   reply_markup=kb)
             if sent is not None:
+                _sent_fid = fid
                 break
         except Exception as e:
             _last_err = e
@@ -3775,7 +4646,7 @@ async def _send_exclusive_song(message, song, status_msg=None, kb=None,
         log_event(log, "exclusive_bank", stage="send_failed",
                   song_id=song.get("id"),
                   reason=type(_last_err).__name__ if _last_err else "no_file_id")
-        return False
+        return ""
     try:
         from .exclusive_bank import _get_conn as _xb_conn
         _c = _xb_conn()
@@ -3785,7 +4656,7 @@ async def _send_exclusive_song(message, song, status_msg=None, kb=None,
         pass
     if status_msg is not None:
         await _delete_card(status_msg)
-    return True
+    return _sent_fid
 
 
 async def _send_identified_song(message, conn, title: str, artist: str, config,
@@ -3794,7 +4665,9 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
                                 req_id: str | None = None,
                                 arm: tuple | None = None,
                                 source: str = "",
-                                status_msg=None):
+                                status_msg=None,
+                                cache_key: str | None = None,
+                                t_wall: float | None = None):
     """Deliver an identified song — WITHOUT an instant card (unify fix
     2026-11-09). The name is announced ONLY in the one final message,
     once the file status is known; the temporary status message (sent
@@ -3807,11 +4680,15 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
     (it owns the status message); False when nothing was spawned (the
     caller deletes the status). `source` is the identifying source
     ("bank" | "shazam+audd" | "cache" | "") — the wrong-song button
-    records it so the re-check knows which source was used."""
+    records it so the re-check knows which source was used.
+    `cache_key` (Step 1b) is the shortcode key the FINAL result is
+    stored under after the send; `t_wall` is the tap's wall-clock
+    receipt, for the click-to-name log."""
     return await _send_professional_song_card(
         message, conn, title, artist, bot_id=bot_id,
         own_media=own_media, config=config, arm=arm, source=source,
-        status_msg=status_msg)
+        status_msg=status_msg, cache_key=cache_key, req_id=req_id,
+        t_wall=t_wall)
 
 
 _FULLSONG_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
@@ -3848,7 +4725,10 @@ def _spawn_fullsong_task(key, coro_factory) -> bool:
 
 def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
                              own_media, bank_token, query, ulang,
-                             status_msg=None) -> bool:
+                             status_msg=None, cache_key: str | None = None,
+                             req_id: str | None = None,
+                             t_wall: float | None = None,
+                             source: str = "") -> bool:
     """Spawn the background full-version delivery for an identified
     song (guarded: one in flight per (chat, title, artist))."""
     chat_id = getattr(getattr(message, "chat", None), "id", None)
@@ -3856,12 +4736,18 @@ def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
         _fullsong_key(chat_id, title, artist),
         lambda: _deliver_fullsong_bg(message, conn, title, artist, config,
                                      kb, own_media, bank_token, query, ulang,
-                                     status_msg=status_msg))
+                                     status_msg=status_msg,
+                                     cache_key=cache_key, req_id=req_id,
+                                     t_wall=t_wall, source=source))
 
 
 async def _after_card_delivery(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang, key, arm,
-                               exclusive_check: bool = True, status_msg=None):
+                               exclusive_check: bool = True, status_msg=None,
+                               cache_key: str | None = None,
+                               req_id: str | None = None,
+                               t_wall: float | None = None,
+                               source: str = ""):
     """After-card work for an identified song (identify-fix 2026-11-09,
     reworked by the unify fix: NO card is sent anymore).
 
@@ -3888,13 +4774,48 @@ async def _after_card_delivery(message, conn, title, artist, config, kb,
                 pass
         if exclusive_check:
             song = _exclusive_song_for(title, artist)
-            if song is not None and await _send_exclusive_song(
+            _bank_fid = ""
+            if song is not None:
+                _bank_fid = await _send_exclusive_song(
                     message, song, status_msg=status_msg, kb=kb,
-                    title=title, artist=artist, ulang=ulang):
+                    title=title, artist=artist, ulang=ulang)
+            # Step 1b: any truthy return means the bank file was sent
+            # (live-base control flow, unchanged) — but only a real
+            # file_id STRING is stored under the shortcode key; a
+            # bool/other truthy return is never stored as the file_id.
+            if _bank_fid:
+                if isinstance(_bank_fid, str):
+                    try:
+                        if song.get("ready_file_id"):
+                            _kbps = int(song.get("ready_bitrate_kbps")
+                                        or song.get("bitrate_kbps") or 0)
+                        else:
+                            _kbps = int(song.get("bitrate_kbps") or 0)
+                        _identify_result_store_send(
+                            cache_key, title, artist, source="bank",
+                            kind="full", file_id=_bank_fid,
+                            duration_sec=song.get("duration_sec") or 0,
+                            quality=(f"کیفیت واقعی: {_kbps}kbps"
+                                     if _kbps else ""),
+                            extra="💎 نسخه کامل اختصاصی آوانو",
+                            cover_file_id=song.get("cover_file_id") or "",
+                            req_id=req_id)
+                    except Exception:
+                        pass
+                try:
+                    if t_wall is not None:
+                        log_event(log, "identify_stage", stage="name_sent",
+                                  req_id=req_id,
+                                  ms=int((_time.time() - t_wall) * 1000),
+                                  cache_hit=False, kind="full")
+                except Exception:
+                    pass
                 return
         if _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
                                     own_media, bank_token, query, ulang,
-                                    status_msg=status_msg):
+                                    status_msg=status_msg,
+                                    cache_key=cache_key, req_id=req_id,
+                                    t_wall=t_wall, source=source):
             _owns_status = True
         # Catalog enrichment (moved verbatim from the card path): the
         # match's url/preview_url feed the heart/playlist buttons.
@@ -3931,7 +4852,10 @@ async def _after_card_delivery(message, conn, title, artist, config, kb,
 def _spawn_after_card_delivery(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang, key, arm,
                                exclusive_check: bool = True,
-                               status_msg=None) -> bool:
+                               status_msg=None, cache_key: str | None = None,
+                               req_id: str | None = None,
+                               t_wall: float | None = None,
+                               source: str = "") -> bool:
     """Spawn the after-card background task (at most one in flight per
     (chat, title, artist)); a repeat tap reuses the in-flight task."""
     try:
@@ -3943,7 +4867,8 @@ def _spawn_after_card_delivery(message, conn, title, artist, config, kb,
         task = asyncio.create_task(_after_card_delivery(
             message, conn, title, artist, config, kb,
             own_media, bank_token, query, ulang, key, arm, exclusive_check,
-            status_msg=status_msg))
+            status_msg=status_msg, cache_key=cache_key, req_id=req_id,
+            t_wall=t_wall, source=source))
         _AFTER_CARD_TASKS[task_key] = task
 
         def _done(_t, _k=task_key):
@@ -3963,7 +4888,10 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                                        config=None, arm: tuple | None = None,
                                        exclusive_check: bool = True,
                                        source: str = "",
-                                       status_msg=None):
+                                       status_msg=None,
+                                       cache_key: str | None = None,
+                                       req_id: str | None = None,
+                                       t_wall: float | None = None):
     """Deliver an identified song — WITHOUT an instant card (unify fix
     2026-11-09). No «شناسایی شد» card is sent before the file status
     is known: the name is announced ONLY in the one final message,
@@ -4000,7 +4928,9 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                                   source, ulang)
     return _spawn_after_card_delivery(message, conn, title, artist, config, kb,
                                       own_media, bank_token, query, ulang, key, arm,
-                                      exclusive_check, status_msg=status_msg)
+                                      exclusive_check, status_msg=status_msg,
+                                      cache_key=cache_key, req_id=req_id,
+                                      t_wall=t_wall, source=source)
 
 
 def _fullsong_duration_label(dur, ulang):
@@ -4118,7 +5048,10 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
 
 async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang,
-                               status_msg=None):
+                               status_msg=None, cache_key: str | None = None,
+                               req_id: str | None = None,
+                               t_wall: float | None = None,
+                               source: str = ""):
     """Background full-version delivery for an identified song.
 
     Runs the EXISTING lookup chain (cached file_id fast path first,
@@ -4139,6 +5072,12 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
     آهنگ...» wait message is gone: the entry point's temporary status
     is the only waiting message in the identify path.
     """
+    # Step 1b: the time import lives at the top of this function, so
+    # the _store_and_log helper (defined below) and every use below it
+    # see a bound _time — a use before the inner import is the
+    # cf1360cd UnboundLocalError class (ruff F823).
+    import time as _time
+
     async def _drop_status():
         """Delete the temporary status after the final message is out.
         Best-effort; a failed delete never blocks the answer."""
@@ -4152,6 +5091,40 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
         return _final_audio_caption(title, artist, ulang,
                                     duration_sec or 0)
 
+    def _store_and_log(kind: str, sent=None, dur: float = 0,
+                       source_override: str | None = None) -> None:
+        """Step 1b: after a final send, store the result under the
+        shortcode key (memory + Turso) and log the click-to-name time
+        for this tap (stage name_sent, cache_hit=False). The file_id
+        and duration come from the sent message when not given.
+        Best-effort; never raises; no-op without a key (store) or a
+        t_wall (log). A bank file is stored with source "bank" so the
+        fast path re-sends it exactly like the bank path."""
+        try:
+            if sent is not None:
+                fid = ""
+                _a = getattr(sent, "audio", None)
+                if _a is not None:
+                    fid = getattr(_a, "file_id", "") or ""
+                    if not dur:
+                        dur = getattr(_a, "duration", 0) or 0
+                if fid:
+                    _identify_result_store_send(
+                        cache_key, title, artist,
+                        source_override if source_override is not None
+                        else (source or ""), kind, fid,
+                        duration_sec=dur, req_id=req_id)
+        except Exception:
+            pass
+        try:
+            if t_wall is not None:
+                log_event(log, "identify_stage", stage="name_sent",
+                          req_id=req_id,
+                          ms=int((_time.time() - t_wall) * 1000),
+                          cache_hit=False, kind=kind)
+        except Exception:
+            pass
+
     try:
         # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
         # (Argument order is (artist, title); a swapped call silently searched
@@ -4160,7 +5133,6 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
         # Requirement #3: Check Telegram file_id cache first. If this song was
         # previously sent by the bot, reuse the file_id instead of re-downloading.
         # This is instant and saves bandwidth.
-        import time as _time
         _t_start = _time.time()
         _cache_hit = False
         # IDENTITY GUARD (2026-11-09 mismatch fix): a cached file_id is
@@ -4188,6 +5160,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms)
+                            _store_and_log("full", sent,
+                                           _cached.get("duration_sec") or 0)
                             # Speed measurement (Requirement #7)
                             try:
                                 conn.execute(
@@ -4249,6 +5223,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms, turso=True)
+                            _store_and_log("full", sent,
+                                           _turso_row.get("duration_sec") or 0)
                             try:
                                 _store_local(conn, artist, title, _turso_row["file_id"],
                                              "audio", 0,
@@ -4377,6 +5353,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                         pass
                             except Exception:
                                 pass
+                            _store_and_log("full", sent, full["duration_sec"])
                             return
                     except asyncio.TimeoutError:
                         log_event(log, "fullsong", stage="sent_url_failed",
@@ -4436,6 +5413,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             pass
                     except:
                         pass
+                    _store_and_log("full", sent, full["duration_sec"])
                     return
             except Exception as exc:
                 # NEVER silent: log the real error so delivery failures are visible
@@ -4458,6 +5436,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     if sent is not None:
                         _track(conn, message, sent)
                         await _drop_status()
+                        _store_and_log("full", sent, 0,
+                                       source_override="bank")
                         return
                 elif hit:
                     log_event(log, "bank_text", stage="no_file_id",
@@ -4480,6 +5460,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             if sent is not None:
                 _track(conn, message, sent)
                 await _drop_status()
+                _store_and_log("full", sent, dur)
                 return
         # EXTRACTED-AUDIO KEYBOARD + CAPTION (2026-11-09): the keyboard
         # is chosen by the FILE'S ORIGIN, not by whether a name is
@@ -4523,6 +5504,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         _sent_copy = None
             if _sent_copy is not None:
                 await _drop_status()
+                _store_and_log("clip", _sent_copy)
                 return
         # 2) No full file: case (b) — the ONE final message is the user's
         # own media as the clip's audio, with the corporate
@@ -4574,6 +5556,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                 if sent is not None:
                     _track(conn, message, sent)
                     await _drop_status()
+                    _store_and_log("clip", sent)
                     return
             except Exception:
                 pass
@@ -4609,6 +5592,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
         await _answer(message, conn,
                       t("h_song_no_full", ulang).format(title=title, artist=artist),
                       reply_markup=InlineKeyboardMarkup(inline_keyboard=more_kb_rows))
+        _store_and_log("text", None)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -5251,6 +6235,21 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
             _timing.log_stage(log, "link_stage", _req_id, _t_req, "resolve",
                               _rt,
                               strategy=_resolved[3] if _resolved else "error")
+        # Step 1b: bg identify spawns at RESOLVE (not after the video
+        # is sent): the task waits for the video download to finish
+        # (event set by _send_link_video), then identifies + resolves
+        # the file and writes the FINAL result to the shortcode cache
+        # even if the user never taps. The old _spawn_bg_precompute
+        # (bank-only slice) is superseded by this full pipeline.
+        try:
+            _bg_key = _identify_result_key(link=outcome.official_url)
+            _cid = getattr(getattr(message, "chat", None), "id", None) \
+                or getattr(getattr(message, "from_user", None), "id", None)
+            if _bg_key and _resolved is not None and _resolved[0]:
+                _spawn_identify_bg(_bg_key, _resolved[0], _cid, conn,
+                                   config, _req_id)
+        except Exception:
+            pass
         # SPEED: Time the video send stage.
         import time as _ptime
         _vs = _ptime.perf_counter()
@@ -5318,19 +6317,10 @@ async def text_handler(message: Message, conn: sqlite3.Connection, config: Confi
                     dbmod.flush_dirty_to_turso, config.db_path))
         except Exception:
             pass
-        # Phase 2 batch 2 (2026-11-08): background identify pre-compute,
-        # spawned ONLY AFTER the video is sent — never at resolve-done,
-        # never concurrent with the download/mux (Render is 0.1 CPU).
-        # One light task (12 s extract + bank match, cached ~10 min) so
-        # a tap on «🎵 شناسایی موسیقی» answers from the cache.
-        # Fire-and-forget: never blocks, never messages.
-        try:
-            _cid = getattr(getattr(message, "chat", None), "id", None) \
-                or getattr(getattr(message, "from_user", None), "id", None)
-            if _resolved is not None and _resolved[0]:
-                _spawn_bg_precompute(_resolved[0], _cid, conn, _req_id)
-        except Exception:
-            pass
+        # Step 1b: _spawn_bg_precompute (bank-only slice) is SUPERSEDED
+        # by the bg identify spawned at resolve above (full identify +
+        # file resolution, shortcode cache). The functions stay in
+        # place (dead-code precedent); this call site is retired.
         _timing.log_total(log, "link_stage", _req_id, _t_req, "sent",
                           headline_total="link_to_video_ms")
         return
@@ -5773,6 +6763,7 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
     # Intent from a film is deterministic (no button needed): identify
     # its audio — Shazam signature first (no token), AudD as fallback —
     # then show one professional card, never a nearest song.
+    _media_t_wall = _time.time()
     try:
         result = await _identify_audio(data, "clip.mp4", config, conn)
     except Exception:
@@ -5804,6 +6795,26 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             media_kind=media_kind,
             file_id=media.file_id if media is not None else None,
             user_id=message.from_user.id)
+        if sent is not None and media_kind == "video":
+            # Step 1b: the clip's own audio IS the final result for
+            # this file — store it (10-min TTL) so a later tap on the
+            # video button sends it immediately. Audio/voice sends
+            # carry NO caption, so storing them would wrongly add the
+            # corporate caption on a later tap.
+            try:
+                _a = getattr(sent, "audio", None)
+                _fid = getattr(_a, "file_id", "") or "" if _a else ""
+                if _fid:
+                    _identify_result_store_send(
+                        _identify_result_key(
+                            file_id=media.file_id
+                            if media is not None else None),
+                        result.title, result.artist, result.source,
+                        "clip", _fid,
+                        duration_sec=getattr(_a, "duration", 0) or 0,
+                        status=result.status)
+            except Exception:
+                pass
         # FINAL IDENTIFY UI (2026-11-09): best-effort video keyboard
         # (a user-sent video's markup cannot be edited — the edit
         # silently fails there; see _set_video_result_kb).
@@ -5875,7 +6886,10 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         own_media=(media_kind, media.file_id),
         arm=("file", __import__("hashlib").sha256(data).hexdigest(),
              data, "", caption),
-        source=result.source, status_msg=status_msg)
+        source=result.source, status_msg=status_msg,
+        cache_key=_identify_result_key(
+            file_id=media.file_id if media is not None else None),
+        t_wall=_media_t_wall)
     if not _spawned:
         await _delete_card(status_msg)
     # FINAL IDENTIFY UI (2026-11-09): best-effort video keyboard (a

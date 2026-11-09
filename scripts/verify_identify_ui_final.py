@@ -133,6 +133,14 @@ def _fresh_video_msg():
 async def _run_video_identify(scripted, find_result, msg=None, token=None):
     """Drive one video-button tap with a scripted _identify_audio
     result and a mocked full-song find. Returns (msg, cb, token)."""
+    # Step 1b: the shortcode cache persists across taps in this
+    # process by design — clear it per driven tap so each case starts
+    # from its own scripted result (mirrors the _VIDEO_IDENTIFY
+    # clear in main); otherwise an earlier case's stored result
+    # would answer a later case's tap.
+    h._IDENTIFY_RESULT_CACHE.clear()
+    h._IDENTIFY_BG_TASKS.clear()
+    h._IDENTIFY_BG_VIDEO_READY.clear()
     if msg is None:
         msg, token = _fresh_video_msg()
     orig_ident = h._identify_audio

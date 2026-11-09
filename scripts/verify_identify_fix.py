@@ -177,7 +177,7 @@ async def _run_identified(events, conn, arm, exclusive_song, search_results,
 
     async def _fake_fullsong(message, c, title, artist, config, kb,
                              own_media, bank_token, query, ulang,
-                             status_msg=None):
+                             status_msg=None, **_kw):
         events.append(("fullsong_start", title))
         events.append(("fullsong_status_msg", status_msg is not None))
         await asyncio.sleep(fullsong_sleep)

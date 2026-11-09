@@ -142,7 +142,31 @@ def ensure_user_tables(conn) -> None:
     _USER_TABLES_OK = True
 
 
-# Wrong-song reports (batch F, 2026-11-09): one row per tap on
+# Step 1b identify-result cache (2026-11-09): the FINAL identification
+# result keyed by SHORTCODE (ig:<shortcode> | ap:<videohash> |
+# tg:<telegram file_id> | sha:<content hash>) — title/artist/source,
+# the file KIND (full song vs clip audio) and a SENDABLE file_id, so a
+# repeat tap sends the stored file immediately with no bank/Shazam/
+# AudD call. Disk paths are NEVER stored here: a path is meaningless
+# on another instance/restart — only the file_id survives. A row
+# without a file_id is name-only (the tap still saves the lookup).
+_IDENTIFY_RESULT_DDL = """
+    CREATE TABLE IF NOT EXISTS identify_result_cache (
+        cache_key TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        artist TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL DEFAULT '',
+        file_id TEXT NOT NULL DEFAULT '',
+        duration_sec REAL NOT NULL DEFAULT 0,
+        quality TEXT NOT NULL DEFAULT '',
+        extra TEXT NOT NULL DEFAULT '',
+        cover_file_id TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    )
+"""
 # «❌ آهنگ اشتباه» — the disputed name + its source, the link, and
 # what the re-check found. Admin analytics only; written
 # fire-and-forget AFTER the answer, never in a waiting path. The
@@ -213,6 +237,7 @@ def _get_conn():
             )
         """)
         conn.execute(_WRONG_SONG_REPORTS_DDL)
+        conn.execute(_IDENTIFY_RESULT_DDL)
         # Full-song mismatch fix (2026-11-09): the file's own verified
         # identity (ID3 title/artist) + probed duration, stored next to
         # the file_id so a cache hit can be re-checked before send.
@@ -402,6 +427,131 @@ def store_song_file_id(artist: str, title: str, file_id: str, file_type: str = "
         return True
     except Exception as e:
         _log.debug("turso_cache: store_song_file_id failed: %s", e)
+        return False
+
+
+def get_identify_result(key: str, req_id: str | None = None) -> dict | None:
+    """Step 1b: the cached FINAL identify result for a shortcode key.
+
+    Returns {status, title, artist, source, kind, file_id,
+    duration_sec, quality, extra, cover_file_id, created_at, ttl}
+    or None on miss/expired/error. A row without a file_id is
+    name-only (kind "pending" is left to the caller): the tap still
+    saves the whole lookup. Expired rows are deleted. Never raises."""
+    conn = _get_conn()
+    if not conn or not key:
+        return None
+    try:
+        _tq = time.perf_counter()
+        cur = conn.execute(
+            "SELECT status, title, artist, source, kind, file_id,"
+            " duration_sec, quality, extra, cover_file_id, created_at,"
+            " expires_at"
+            " FROM identify_result_cache WHERE cache_key = ?",
+            (key,))
+        _timing.note_turso(req_id, "identify_result_cache.get",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
+        row = cur.fetchone()
+        if not row:
+            return None
+        (status, title, artist, source, kind, file_id, duration_sec,
+         quality, extra, cover_file_id, created_at, expires_at) = row
+        if int(expires_at) < int(time.time()):
+            try:
+                conn.execute("DELETE FROM identify_result_cache"
+                             " WHERE cache_key = ?", (key,))
+                conn.commit()
+            except Exception:
+                pass
+            return None
+        return {"status": status, "title": title or "",
+                "artist": artist or "", "source": source or "",
+                "kind": kind or "", "file_id": file_id or "",
+                "duration_sec": duration_sec or 0,
+                "quality": quality or "", "extra": extra or "",
+                "cover_file_id": cover_file_id or "",
+                "created_at": created_at,
+                "ttl": max(0, int(expires_at) - int(created_at))}
+    except Exception as e:
+        _log.debug("turso_cache: get_identify_result failed: %s", e)
+        return None
+
+
+def store_identify_result(key: str, entry: dict,
+                          req_id: str | None = None) -> bool:
+    """Step 1b: store the FINAL identify result under a shortcode key.
+
+    ``entry`` carries status/title/artist/source/kind/file_id/
+    duration_sec/quality/extra/cover_file_id/created_at/ttl (ttl
+    seconds from created_at). Only the file_id is persisted — a disk
+    path never survives a restart. Never raises; returns True when
+    stored."""
+    conn = _get_conn()
+    if not conn or not key or not isinstance(entry, dict):
+        return False
+    try:
+        now = int(entry.get("created_at") or time.time())
+        ttl = int(entry.get("ttl") or 0)
+        if ttl <= 0:
+            return False
+        _tq = time.perf_counter()
+        conn.execute("""
+            INSERT OR REPLACE INTO identify_result_cache
+            (cache_key, status, title, artist, source, kind, file_id,
+             duration_sec, quality, extra, cover_file_id, created_at,
+             expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (key, entry.get("status") or "", entry.get("title") or "",
+              entry.get("artist") or "", entry.get("source") or "",
+              entry.get("kind") or "", entry.get("file_id") or "",
+              entry.get("duration_sec") or 0, entry.get("quality") or "",
+              entry.get("extra") or "", entry.get("cover_file_id") or "",
+              now, now + ttl))
+        _timing.note_turso(req_id, "identify_result_cache.store",
+                           (time.perf_counter() - _tq) * 1000, logger=_log)
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.debug("turso_cache: store_identify_result failed: %s", e)
+        return False
+
+
+def delete_identify_result(key: str, req_id: str | None = None) -> bool:
+    """Step 1b: delete the cached result for a shortcode key
+    (wrong-song dispute: the rejected name must never be re-shown).
+    Never raises."""
+    conn = _get_conn()
+    if not conn or not key:
+        return False
+    try:
+        conn.execute("DELETE FROM identify_result_cache WHERE cache_key = ?",
+                     (key,))
+        conn.commit()
+        return True
+    except Exception as e:
+        _log.debug("turso_cache: delete_identify_result failed: %s", e)
+        return False
+
+
+def delete_identify_result_if(key: str, title: str, artist: str,
+                              req_id: str | None = None) -> bool:
+    """Step 1b: delete the cached result ONLY when the row still holds
+    the given (title, artist) — the wrong-song dispute's Turso half.
+    One atomic statement, so a bg delivery that already stored the
+    NEW result under the same key is never wiped by the delete.
+    Never raises."""
+    conn = _get_conn()
+    if not conn or not key:
+        return False
+    try:
+        cur = conn.execute(
+            "DELETE FROM identify_result_cache"
+            " WHERE cache_key = ? AND title = ? AND artist = ?",
+            (key, title or "", artist or ""))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        _log.debug("turso_cache: delete_identify_result_if failed: %s", e)
         return False
 
 
