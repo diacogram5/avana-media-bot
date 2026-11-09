@@ -1828,6 +1828,89 @@ async def _send_unconfirmed_media(message, conn, data: bytes,
     return None
 
 
+def _shorten_name(name: str, max_len: int) -> str:
+    """Shorten one name with an ellipsis so it fits max_len chars."""
+    name = (name or "").strip()
+    if max_len <= 1:
+        return "…"
+    if len(name) <= max_len:
+        return name
+    return name[:max_len - 1].rstrip() + "…"
+
+
+def _fit_caption(fmt, title: str, artist: str,
+                 max_len: int = 1024) -> str:
+    """Format a caption from (title, artist), never exceeding max_len
+    (Telegram's 1024-char caption limit). The names are shortened with
+    an ellipsis — the title first, then the artist — so the fixed
+    wording is never cut. A last-resort hard cut covers pathological
+    fixed text."""
+    title = (title or "").strip()
+    artist = (artist or "").strip()
+    text = fmt(title, artist)
+    if len(text) <= max_len:
+        return text
+    overhead = len(fmt("", ""))
+    budget = max_len - overhead
+    if budget <= 0:
+        return text[:max_len - 1] + "…"
+    t_budget = min(len(title), max(1, (budget * 2) // 3))
+    a_budget = budget - t_budget
+    if a_budget < 1:
+        a_budget = 1
+        t_budget = max(1, budget - 1)
+    elif len(artist) < a_budget:
+        # A short artist frees its share to the title.
+        a_budget = len(artist)
+        t_budget = min(len(title), budget - a_budget)
+    title = _shorten_name(title, t_budget)
+    artist = _shorten_name(artist, a_budget)
+    text = fmt(title, artist)
+    if len(text) > max_len:
+        text = text[:max_len - 1] + "…"
+    return text
+
+
+def _identified_no_full_caption(title: str, artist: str, ulang) -> str:
+    """Case (b) caption: the name IS confirmed, but no verified full
+    file exists — the clip's own audio is the one final message."""
+    return _fit_caption(
+        lambda _t, _a: t("m_identified_no_full_clip", ulang).format(
+            title=_t, artist=_a),
+        title, artist)
+
+
+def _identified_song_kb(message, conn, title: str, artist: str,
+                        own_media, source: str, ulang):
+    """The identified-song keyboard (unify fix, 2026-11-09).
+
+    Lyrics + add-to-playlist, with «❌ آهنگ اشتباه» in place of the
+    heart: the favorites feature itself is untouched (its handler and
+    callbacks stay), only this keyboard drops the heart button. The
+    wrong-song button is wired only when the song came from a video /
+    file the user can dispute (own_media) — same token mechanism as
+    batch F. Returns (keyboard, result_key)."""
+    key = profeat.remember_result(title, artist, "", "", own_media=own_media)
+    is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
+    rows = [list(r) for r in profeat.build_song_card_buttons(key, is_fav)]
+    rows = [r for r in rows if not any(
+        (getattr(b, "callback_data", "") or "").startswith("fav:toggle:")
+        for b in r)]
+    if own_media is not None:
+        try:
+            _wrong_cb = _wrong_song_button_data(
+                own_media[1], message.from_user.id,
+                "audio" if own_media[0] == "audio" else "file",
+                title, artist, source)
+        except Exception:
+            _wrong_cb = None
+        if _wrong_cb:
+            rows.insert(0, [InlineKeyboardButton(
+                text=t("m_wrong_song_btn", ulang),
+                callback_data=_wrong_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows), key
+
+
 def _final_audio_caption(title: str, artist: str, ulang,
                          duration_sec: float = 0, quality: str = "",
                          extra: str = "") -> str:
@@ -1836,21 +1919,23 @@ def _final_audio_caption(title: str, artist: str, ulang,
     info (and the bank marker for exclusive files). The card text is
     the caption — a text message cannot be edited into an audio
     message, so the card is deleted and this audio is sent instead."""
-    text = t("h_song_identified", ulang).format(title=title, artist=artist)
-    label = _fullsong_duration_label(duration_sec, ulang)
-    if label:
-        text += label
-    if extra:
-        text += "\n" + extra
-    if quality:
-        text += "\n🎧 " + quality
-    return text
+    def _fmt(_t, _a):
+        text = t("h_song_identified", ulang).format(title=_t, artist=_a)
+        label = _fullsong_duration_label(duration_sec, ulang)
+        if label:
+            text += label
+        if extra:
+            text += "\n" + extra
+        if quality:
+            text += "\n🎧 " + quality
+        return text
+    return _fit_caption(_fmt, title, artist)
 
 
 async def _delete_card(card_msg) -> None:
-    """Best-effort delete of the instant name card after its file was
-    sent as the one final message. Never raises; a failed delete
-    leaves the card in place (the file is already sent)."""
+    """Best-effort delete of the temporary status message after the
+    one final message was sent. Never raises; a failed delete leaves
+    the status in place (the final message is already sent)."""
     if card_msg is None:
         return
     try:
@@ -1917,6 +2002,17 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         return
     _VIDEO_IDENTIFY_RUNNING.add(token)
     await callback.answer(t("m_identifying_video", ulang))
+    # UNIFY FIX (2026-11-09): the temporary «در حال جستجوی موسیقی...»
+    # status stays until the ONE final message is sent. The background
+    # delivery deletes it (identified path); every other path deletes
+    # it in the finally below — it is never left behind.
+    status_msg = None
+    try:
+        status_msg = await callback.message.answer(
+            t("m_identify_searching", ulang))
+    except Exception:
+        status_msg = None
+    _bg_owns_status = False
     # Timing instrumentation (logs only): one request id per tap.
     _req_id = _timing.new_req_id()
     _t_req = _time.perf_counter()
@@ -2026,22 +2122,24 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         if result.status == "identified":
             # CONFIRMED name only (confirm fix 2026-11-09): _identify_audio
             # returns "identified" solely for a bank match or a
-            # Shazam+AudD agreement. The name card goes out FIRST — the
-            # bank sample is armed AFTER the card (the cache-hit path
-            # arms from the audio URL, which downloads it, and must
-            # never delay the answer).
-            await _send_identified_song(
+            # Shazam+AudD agreement. UNIFY FIX: no instant card — the
+            # background delivery owns the temporary status and deletes
+            # it when the ONE final message is sent. The bank sample is
+            # armed in the background (the cache-hit path arms from the
+            # audio URL, which downloads it, and must never delay the
+            # answer).
+            _bg_owns_status = await _send_identified_song(
                 callback.message, conn, result.title, result.artist,
                 config, bot_id=dbmod.get_bot_id(conn, config),
                 own_media=("video", entry["file_id"]),
                 req_id=_req_id,
                 arm=("video_button", entry["file_id"], data or None,
                      audio_url or "", ""),
-                source=result.source)
+                source=result.source, status_msg=status_msg)
             # Batch F: the video message keeps its identify button and
             # gains «❌ آهنگ اشتباه» next to it, so the user can dispute
-            # the shown name without waiting for the card. The card
-            # itself carries the same button (same token).
+            # the shown name. The final audio message carries the same
+            # button (same token).
             await _edit_video_wrong_song_row(callback.message, token, ulang,
                                              add=True)
         elif result.status in ("unconfirmed", "not_found") \
@@ -2076,6 +2174,11 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                           status=result.status if result is not None else "error")
     finally:
         _VIDEO_IDENTIFY_RUNNING.discard(token)
+        if not _bg_owns_status:
+            # The background delivery owns (and deletes) the status when
+            # it was spawned; every other path deletes it here, so the
+            # temporary message is never left behind.
+            await _delete_card(status_msg)
         _timing.log_total(log, "identify_stage", _req_id, _t_req,
                           result.status if result is not None else "error",
                           headline_total="click_to_identify_ms")
@@ -2303,19 +2406,19 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
                 result.title, result.artist, result.source)
             entry["last_title"], entry["last_artist"], entry["last_source"] = (
                 new_title, new_artist, new_source)
-            if status_msg is not None:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            await _send_identified_song(
+            # UNIFY FIX: no instant card — the searching message IS the
+            # temporary status; the background delivery deletes it when
+            # the ONE final message is sent.
+            _spawned = await _send_identified_song(
                 callback.message, conn, result.title, result.artist,
                 config, bot_id=dbmod.get_bot_id(conn, config),
                 own_media=(_om_kind, entry["file_id"]),
                 req_id=_req_id,
                 arm=("video_button", entry["file_id"], data,
                      entry.get("audio_url") or "", ""),
-                source=result.source)
+                source=result.source, status_msg=status_msg)
+            if not _spawned:
+                await _delete_card(status_msg)
         elif result.status == "unconfirmed" and result.title:
             # A DIFFERENT single-source name: a «شاید...» lead, never a
             # «شناسایی شد» card. Heart/lyrics/playlist stay available;
@@ -3387,13 +3490,35 @@ async def _answer_link_identify_result(message, conn, config, outcome,
         dbmod.set_cached_search(
             conn, f"link:{outcome.official_url}",
             _json.dumps({"title": title, "artist": artist}, ensure_ascii=False))
+        # UNIFY FIX (2026-11-09): no instant card — the temporary
+        # «در حال جستجوی موسیقی...» status stays until the ONE final
+        # message is sent; the background delivery owns and deletes
+        # it. own_media comes from the delivered video when available,
+        # so the wrong-song button is wired to it.
+        status_msg = None
+        try:
+            status_msg = await message.answer(t("m_identify_searching", ulang))
+        except Exception:
+            status_msg = None
+        _own = None
+        if video_msg is not None:
+            _vm = (getattr(video_msg, "video", None)
+                   or getattr(video_msg, "audio", None))
+            if _vm is not None and getattr(_vm, "file_id", None):
+                _own = ("video" if getattr(video_msg, "video", None)
+                        else "audio", _vm.file_id)
         # Arm the bank sample too: if the catalog card later proves
         # unusable, the second search can still run on this audio.
-        # (Armed AFTER the card, inside _send_identified_song.)
-        await _send_identified_song(message, conn, title, artist, config,
-                                    bot_id=dbmod.get_bot_id(conn, config),
-                                    arm=("link", outcome.official_url,
-                                         heard or None, media_hint, page_text))
+        # (Armed AFTER the call, inside _send_identified_song.)
+        _spawned = await _send_identified_song(
+            message, conn, title, artist, config,
+            bot_id=dbmod.get_bot_id(conn, config),
+            own_media=_own,
+            arm=("link", outcome.official_url,
+                 heard or None, media_hint, page_text),
+            status_msg=status_msg)
+        if not _spawned:
+            await _delete_card(status_msg)
     elif needs_file:
         _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                       heard or None, media_hint, page_text)
@@ -3514,11 +3639,11 @@ def _exclusive_song_for(title: str, artist: str):
         return None
 
 
-async def _send_exclusive_song(message, song, card_msg=None, kb=None,
+async def _send_exclusive_song(message, song, status_msg=None, kb=None,
                                title: str | None = None,
                                artist: str | None = None,
                                ulang: str = "fa") -> bool:
-    """Send an exclusive-bank song's full file with the exclusive card.
+    """Send an exclusive-bank song's full file as the ONE final message.
 
     Sends the PREPARED version's stored Telegram file_id when one is
     stored, else the original file_id — no re-download, no re-conversion
@@ -3529,30 +3654,26 @@ async def _send_exclusive_song(message, song, card_msg=None, kb=None,
     success; False only when every stored version failed (caller falls
     back to the catalog card).
 
-    CONFIRM FIX (2026-11-09): when the instant name card was sent
-    (card_msg), the file REPLACES it — the audio is sent FIRST with the
-    card text as its caption (identified line + real duration + the
-    bank marker + measured bitrate) and the card's buttons, then the
-    card is deleted: ONE final message. Without a card the old
-    exclusive card text is kept. A failed send leaves the card in
-    place (the caller then falls back to the catalog delivery).
+    UNIFY FIX (2026-11-09): no «شناسایی شد» card is ever sent before
+    the file status is known — the audio IS the one final message, with
+    the identified caption (real duration + the bank marker + measured
+    bitrate) and the card's buttons, and the temporary status message
+    is deleted right after the send. A failed send leaves the status
+    in place (the caller then falls back to the catalog delivery,
+    which owns the status from there).
     """
-    from .exclusive_bank import (exclusive_card_text, inc_download,
-                                 delivery_candidates)
-    if card_msg is not None:
-        if song.get("ready_file_id"):
-            _kbps = int(song.get("ready_bitrate_kbps")
-                        or song.get("bitrate_kbps") or 0)
-        else:
-            _kbps = int(song.get("bitrate_kbps") or 0)
-        _quality = f"کیفیت واقعی: {_kbps}kbps" if _kbps else ""
-        caption = _final_audio_caption(
-            title if title is not None else song.get("title", ""),
-            artist if artist is not None else song.get("artist", ""),
-            ulang, duration_sec=song.get("duration_sec") or 0,
-            quality=_quality, extra="💎 نسخه کامل اختصاصی آوانو")
+    from .exclusive_bank import (inc_download, delivery_candidates)
+    if song.get("ready_file_id"):
+        _kbps = int(song.get("ready_bitrate_kbps")
+                    or song.get("bitrate_kbps") or 0)
     else:
-        caption = exclusive_card_text(song)
+        _kbps = int(song.get("bitrate_kbps") or 0)
+    _quality = f"کیفیت واقعی: {_kbps}kbps" if _kbps else ""
+    caption = _final_audio_caption(
+        title if title is not None else song.get("title", ""),
+        artist if artist is not None else song.get("artist", ""),
+        ulang, duration_sec=song.get("duration_sec") or 0,
+        quality=_quality, extra="💎 نسخه کامل اختصاصی آوانو")
     _cands = delivery_candidates(song)
     sent = None
     _last_err = None
@@ -3585,8 +3706,8 @@ async def _send_exclusive_song(message, song, card_msg=None, kb=None,
             inc_download(_c, song["id"])
     except Exception:
         pass
-    if card_msg is not None:
-        await _delete_card(card_msg)
+    if status_msg is not None:
+        await _delete_card(status_msg)
     return True
 
 
@@ -3595,21 +3716,25 @@ async def _send_identified_song(message, conn, title: str, artist: str, config,
                                 own_media: tuple | None = None,
                                 req_id: str | None = None,
                                 arm: tuple | None = None,
-                                source: str = ""):
-    """Deliver an identified song: the name card goes out FIRST, then the
-    bank check / catalog enrichment / full-version delivery run after the
-    card (identify-fix 2026-11-09). `arm` is the _arm_bank_sample
-    argument tuple (kind, seed, data, url, clue) — the sample is armed
-    after the card, never before it. One routing point for all three
-    identify entry points (video button, link, direct file/voice).
-    Returns the sent card message (or None when the card send failed) —
-    the background delivery deletes it when the file is ready (confirm
-    fix 2026-11-09: one final message). `source` is the identifying
-    source ("bank" | "shazam+audd" | "cache" | "") — the wrong-song
-    button records it so the re-check knows which source was used."""
+                                source: str = "",
+                                status_msg=None):
+    """Deliver an identified song — WITHOUT an instant card (unify fix
+    2026-11-09). The name is announced ONLY in the one final message,
+    once the file status is known; the temporary status message (sent
+    by the entry point, passed as status_msg) stays until that final
+    send deletes it. `arm` is the _arm_bank_sample argument tuple
+    (kind, seed, data, url, clue) — the sample is armed in the
+    background, never before the answer. One routing point for all
+    three identify entry points (video button, link, direct
+    file/voice). Returns True when the background delivery was spawned
+    (it owns the status message); False when nothing was spawned (the
+    caller deletes the status). `source` is the identifying source
+    ("bank" | "shazam+audd" | "cache" | "") — the wrong-song button
+    records it so the re-check knows which source was used."""
     return await _send_professional_song_card(
         message, conn, title, artist, bot_id=bot_id,
-        own_media=own_media, config=config, arm=arm, source=source)
+        own_media=own_media, config=config, arm=arm, source=source,
+        status_msg=status_msg)
 
 
 _FULLSONG_TASKS: dict[tuple[int, str, str], asyncio.Task] = {}
@@ -3646,7 +3771,7 @@ def _spawn_fullsong_task(key, coro_factory) -> bool:
 
 def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
                              own_media, bank_token, query, ulang,
-                             card_msg=None) -> bool:
+                             status_msg=None) -> bool:
     """Spawn the background full-version delivery for an identified
     song (guarded: one in flight per (chat, title, artist))."""
     chat_id = getattr(getattr(message, "chat", None), "id", None)
@@ -3654,27 +3779,30 @@ def _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
         _fullsong_key(chat_id, title, artist),
         lambda: _deliver_fullsong_bg(message, conn, title, artist, config,
                                      kb, own_media, bank_token, query, ulang,
-                                     card_msg=card_msg))
+                                     status_msg=status_msg))
 
 
 async def _after_card_delivery(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang, key, arm,
-                               exclusive_check: bool = True, card_msg=None):
-    """After-card work for an identified song (identify-fix 2026-11-09).
+                               exclusive_check: bool = True, status_msg=None):
+    """After-card work for an identified song (identify-fix 2026-11-09,
+    reworked by the unify fix: NO card is sent anymore).
 
-    Runs in the background, AFTER the name card is already with the
-    user — nothing here can delay the answer. Order:
-    1) arm the bank sample (was before the card; now after it);
+    Runs in the background — nothing here can delay the answer. Order:
+    1) arm the bank sample;
     2) exclusive-bank check: a bank song's stored file IS the full
        version — send it and stop (no catalog enrichment, no separate
        full-song lookup, so a bank song is never sent twice);
     3) otherwise spawn the full-version background delivery AND enrich
-       the stored card result with the catalog match (smart_search runs
-       here, after the card — its iTunes/Deezer calls can no longer
-       delay the name). The card itself is never edited: its keyboard
-       has no catalog element (heart/lyrics/playlist only).
-    Fire-and-forget: never raises.
+       the stored result with the catalog match (smart_search runs
+       here — its iTunes/Deezer calls can no longer delay the name).
+    The temporary status message stays until the one final message is
+    sent: the exclusive send deletes it on success, the full-song
+    delivery owns it when spawned, and this task deletes it when
+    nothing was spawned (a duplicate delivery already in flight owns
+    its own status). Fire-and-forget: never raises.
     """
+    _owns_status = False
     try:
         if arm is not None:
             try:
@@ -3684,12 +3812,13 @@ async def _after_card_delivery(message, conn, title, artist, config, kb,
         if exclusive_check:
             song = _exclusive_song_for(title, artist)
             if song is not None and await _send_exclusive_song(
-                    message, song, card_msg=card_msg, kb=kb,
+                    message, song, status_msg=status_msg, kb=kb,
                     title=title, artist=artist, ulang=ulang):
                 return
-        _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
-                                 own_media, bank_token, query, ulang,
-                                 card_msg=card_msg)
+        if _spawn_fullsong_delivery(message, conn, title, artist, config, kb,
+                                    own_media, bank_token, query, ulang,
+                                    status_msg=status_msg):
+            _owns_status = True
         # Catalog enrichment (moved verbatim from the card path): the
         # match's url/preview_url feed the heart/playlist buttons.
         try:
@@ -3717,12 +3846,15 @@ async def _after_card_delivery(message, conn, title, artist, config, kb,
         raise
     except Exception:
         pass
+    finally:
+        if not _owns_status:
+            await _delete_card(status_msg)
 
 
 def _spawn_after_card_delivery(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang, key, arm,
                                exclusive_check: bool = True,
-                               card_msg=None) -> bool:
+                               status_msg=None) -> bool:
     """Spawn the after-card background task (at most one in flight per
     (chat, title, artist)); a repeat tap reuses the in-flight task."""
     try:
@@ -3734,7 +3866,7 @@ def _spawn_after_card_delivery(message, conn, title, artist, config, kb,
         task = asyncio.create_task(_after_card_delivery(
             message, conn, title, artist, config, kb,
             own_media, bank_token, query, ulang, key, arm, exclusive_check,
-            card_msg=card_msg))
+            status_msg=status_msg))
         _AFTER_CARD_TASKS[task_key] = task
 
         def _done(_t, _k=task_key):
@@ -3753,74 +3885,44 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
                                        own_media: tuple[str, str] | None = None,
                                        config=None, arm: tuple | None = None,
                                        exclusive_check: bool = True,
-                                       source: str = ""):
-    """One clean card for an identified song.
-
-    INSTANT CARD (identify-fix 2026-11-09): the name card (title +
-    artist + heart/lyrics/playlist buttons) is sent FIRST — before the
-    bank-sample arming, before the exclusive-bank lookup, before the
-    iTunes/Deezer catalog search. The keyboard does not depend on the
-    catalog match (build_song_card_buttons only needs the result key),
-    so the card is complete without it. Everything else runs AFTER the
-    card in one background task (_after_card_delivery): the sample
-    arming, the exclusive-bank file (which IS the full version for a
-    bank song), the catalog enrichment of the stored result, and the
-    full-version background delivery. The full-song delivery itself is
-    unchanged (same _deliver_fullsong_bg, same guard, same tag-match
-    bug fix) — it just starts after the card now.
+                                       source: str = "",
+                                       status_msg=None):
+    """Deliver an identified song — WITHOUT an instant card (unify fix
+    2026-11-09). No «شناسایی شد» card is sent before the file status
+    is known: the name is announced ONLY in the one final message,
+    once the file (or the clip-audio fallback) is ready. The
+    temporary status message (sent by the entry point) stays until
+    that final send deletes it. The keyboard is the identified-song
+    set (lyrics + playlist, wrong-song in place of the heart — the
+    favorites feature itself is untouched). Everything else runs in
+    the background after this call returns
+    (_after_card_delivery): the sample arming, the exclusive-bank
+    file (which IS the full version for a bank song), the catalog
+    enrichment of the stored result, and the full-version background
+    delivery. The full-song delivery itself is unchanged (same
+    _deliver_fullsong_bg, same guard, same tag-match bug fix) — it
+    just starts without a card now.
 
     A short catalog preview is never presented as the song. Exact
     catalog match (version-aware) -> the stored result keeps the pro
-    buttons working (heart / lyrics / add-to-playlist). Never a
-    nearest song. exclusive_check=False keeps the suggestion flow's
-    delivery routing exactly as before (no bank-file send there).
+    buttons working (lyrics / add-to-playlist). Never a nearest song.
+    exclusive_check=False keeps the suggestion flow's delivery routing
+    exactly as before (no bank-file send there).
+
+    Returns True when the background delivery was spawned (it owns
+    the status message); False when nothing was spawned (the caller
+    deletes the status).
     """
     ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
     query = f"{title} {artist}".strip()
-    # Minimal card first: the key needs no catalog match — the buttons
-    # are heart/lyrics/playlist only. The match enriches the stored
-    # result after the card (preview/catalog URLs for the buttons).
-    key = profeat.remember_result(title, artist, "", "", own_media=own_media)
-    is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
-    kb = InlineKeyboardMarkup(inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-    # Batch F (wrong song): the card for a VIDEO identification also
-    # carries «❌ آهنگ اشتباه» — same token as the video's identify
-    # button, so the dispute resolves to the same video. own_media is
-    # None for catalog results (suggest flow): no video, no button.
-    # The keyboard object is reused by the final audio message, so the
-    # button survives the card replacement.
-    if own_media is not None:
-        try:
-            _wrong_cb = _wrong_song_button_data(
-                own_media[1], message.from_user.id,
-                "audio" if own_media[0] == "audio" else "file",
-                title, artist, source)
-        except Exception:
-            _wrong_cb = None
-        if _wrong_cb:
-            kb.inline_keyboard.append([InlineKeyboardButton(
-                text=t("m_wrong_song_btn", ulang),
-                callback_data=_wrong_cb)])
-    # INSTANT CARD: the identification IS the answer — the card goes out
-    # NOW with the pro buttons. Nothing slow runs before this line.
-    # CONFIRM FIX (2026-11-09): the card is sent ONLY for a confirmed
-    # name (the gate lives in _identify_audio); when the file is ready
-    # the card is DELETED and the file is sent with this card's text as
-    # its caption — one final message (a text message cannot be edited
-    # into an audio message). The card message is threaded through the
-    # background delivery for that replacement.
-    card_msg = None
-    try:
-        card_msg = await _answer(message, conn,
-                                 t("h_song_identified", ulang).format(
-                                     title=title, artist=artist),
-                                 reply_markup=kb)
-    except Exception:
-        pass
-    _spawn_after_card_delivery(message, conn, title, artist, config, kb,
-                               own_media, bank_token, query, ulang, key, arm,
-                               exclusive_check, card_msg=card_msg)
-    return card_msg
+    # The keyboard needs no catalog match — lyrics/playlist only need
+    # the result key; the match enriches the stored result after the
+    # call (preview/catalog URLs for the buttons).
+    kb, key = _identified_song_kb(message, conn, title, artist, own_media,
+                                  source, ulang)
+    return _spawn_after_card_delivery(message, conn, title, artist, config, kb,
+                                      own_media, bank_token, query, ulang, key, arm,
+                                      exclusive_check, status_msg=status_msg)
 
 
 def _fullsong_duration_label(dur, ulang):
@@ -3938,54 +4040,39 @@ async def _extract_and_send_clip_audio_copy(message, conn, data: bytes,
 
 async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                own_media, bank_token, query, ulang,
-                               card_msg=None):
+                               status_msg=None):
     """Background full-version delivery for an identified song.
 
     Runs the EXISTING lookup chain (cached file_id fast path first,
     then find_full_song_file_v2, then the bank) and sends the audio
     with the existing caption/keyboard, the user's own media as a
-    labelled replacement, or the honest no-full message. The result
-    card was already sent by _send_professional_song_card — this task
-    only delivers the file. Fire-and-forget: never raises.
+    labelled replacement, or the honest no-full message. Fire-and-
+    forget: never raises.
 
-    CONFIRM FIX (2026-11-09): when the card was sent (card_msg), a
-    successful file send REPLACES it — the audio goes out with the
-    card text as its caption (identified line + real duration) and
-    the card's buttons, then the card is deleted: ONE final message.
-    When the file delivery fails after the card was sent, the card
-    stays as-is (the name IS confirmed) and the extracted-audio
-    fallback follows with the new caption (no contradiction, because
-    the new caption says «official version not found», not
-    «not identified»).
+    UNIFY FIX (2026-11-09): no «شناسایی شد» card is ever sent before
+    the file status is known — the audio IS the one final message
+    (identified caption + real duration + the same buttons), and the
+    temporary status message is deleted right after it is sent. When
+    no verified full file exists, the ONE final message is the clip's
+    own audio with the case-(b) caption (the confirmed name + "full
+    version not found") and the identified buttons — never the
+    corporate "official version not found" caption, which is reserved
+    for the not-identified case. The old «⏳ در حال ارسال نسخه کامل
+    آهنگ...» wait message is gone: the entry point's temporary status
+    is the only waiting message in the identify path.
     """
-    _wait_msg = None
-
-    async def _drop_wait():
-        nonlocal _wait_msg
-        if _wait_msg is not None:
-            try:
-                await _wait_msg.delete()
-            except Exception:
-                pass
-            _wait_msg = None
+    async def _drop_status():
+        """Delete the temporary status after the final message is out.
+        Best-effort; a failed delete never blocks the answer."""
+        if status_msg is not None:
+            await _delete_card(status_msg)
 
     def _cap(duration_sec):
-        """Caption for a successful full-file send: with a card, the
-        card's text (one final message); without one, the old full-song
-        caption."""
-        if card_msg is not None:
-            return _final_audio_caption(title, artist, ulang,
-                                        duration_sec or 0)
-        return t("h_song_full_caption", ulang).format(
-            label=_fullsong_duration_label(duration_sec or 0, ulang),
-            title=title, artist=artist)
-
-    async def _replace_card():
-        """Delete the instant card after its file was sent (one final
-        message). No-op without a card; a failed delete leaves the
-        card in place."""
-        if card_msg is not None:
-            await _delete_card(card_msg)
+        """Caption for a successful full-file send: always the
+        identified caption (name + artist + real duration) — the audio
+        message IS the one final message."""
+        return _final_audio_caption(title, artist, ulang,
+                                    duration_sec or 0)
 
     try:
         # 1) FULL VERSION FIRST via parallel adapters (v2 architecture).
@@ -4019,7 +4106,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             reply_markup=kb)
                         if sent is not None:
                             _track(conn, message, sent)
-                            await _replace_card()
+                            await _drop_status()
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms)
@@ -4080,7 +4167,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             reply_markup=kb)
                         if sent is not None:
                             _track(conn, message, sent)
-                            await _replace_card()
+                            await _drop_status()
                             _t_ms = int((_time.time() - _t_start) * 1000)
                             log_event(log, "fullsong", stage="sent_cached",
                                       title=title[:40], ms=_t_ms, turso=True)
@@ -4118,12 +4205,6 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                               title=title[:40], turso=True)
         except Exception:
             pass
-        # Background delivery: the result card was already sent —
-        # this message only marks the wait for the full version.
-        try:
-            _wait_msg = await message.answer(t("h_song_sending_full", ulang))
-        except Exception:
-            _wait_msg = None
         from ..search.adapters import find_full_song_file_v2
         full = None
         _verify_failed = False
@@ -4193,7 +4274,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             timeout=8.0)
                         if sent is not None:
                             _track(conn, message, sent)
-                            await _replace_card()
+                            await _drop_status()
                             log_event(log, "fullsong", stage="sent_url",
                                       title=title[:40],
                                       source=full.get("source", "")[:40],
@@ -4240,7 +4321,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     reply_markup=kb)
                 if sent is not None:
                     _track(conn, message, sent)
-                    await _replace_card()
+                    await _drop_status()
                     log_event(log, "fullsong", stage="sent",
                               title=title[:40], bytes=len(full["data"]))
                     # Requirement #3: Store the Telegram file_id for future reuse.
@@ -4298,7 +4379,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         reply_markup=kb)
                     if sent is not None:
                         _track(conn, message, sent)
-                        await _replace_card()
+                        await _drop_status()
                         return
                 elif hit:
                     log_event(log, "bank_text", stage="no_file_id",
@@ -4320,17 +4401,15 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                     reply_markup=kb, duration=int(dur) if dur else None)
             if sent is not None:
                 _track(conn, message, sent)
-                await _replace_card()
+                await _drop_status()
                 return
         # 1c) IDENTITY CHECK FAILED: the fresh lookup's file was not the
         # identified song (or could not be verified). The wrong file is
-        # never sent. The user gets the clip's ORIGINAL audio (stream
-        # copy, no re-encode) with the new caption + Google/retry
-        # buttons; the card (if sent) stays — the name IS confirmed, and
-        # the new caption says «official version not found», not «not
-        # identified», so there is no contradiction. Only when the clip
-        # itself is unavailable does the honest no-full message below
-        # run.
+        # never sent. Case (b): the ONE final message is the clip's
+        # ORIGINAL audio (stream copy, no re-encode) with the confirmed
+        # name + "full version not found" caption and the identified
+        # buttons. Only when the clip itself is unavailable does the
+        # honest no-full message below run.
         if _verify_failed:
             _sent_copy = None
             if own_media is not None:
@@ -4342,29 +4421,25 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         await message.bot.download_file(tg_file.file_path, buf)
                         _sent_copy = await _extract_and_send_clip_audio_copy(
                             message, conn, buf.getvalue(),
-                            t("m_extracted_audio_new", ulang), ulang,
-                            reply_markup=_extracted_audio_kb(
-                                title, artist, ulang, file_id=file_id,
-                                user_id=getattr(getattr(message, "from_user", None), "id", None),
-                                kind="file"),
-                            caption_key="m_extracted_audio_new")
+                            _identified_no_full_caption(title, artist, ulang),
+                            ulang,
+                            reply_markup=kb,
+                            caption_key="m_identified_no_full_clip")
                     except Exception:
                         _sent_copy = None
             if _sent_copy is not None:
+                await _drop_status()
                 return
-        # 2) No full file: the user's own media as a labelled replacement (if any).
-        # Video: the clip's own extracted audio with the new caption +
-        # Google/retry buttons (confirmed name, no file — the card
-        # stays). Other kinds go back as-is with the old identified-clip
-        # caption (nothing was extracted from them) and no buttons.
+        # 2) No full file: case (b) — the ONE final message is the user's
+        # own media as the clip's audio, with the confirmed name +
+        # "full version not found" caption and the identified buttons.
+        # Video: the clip's own extracted audio. Other kinds go back
+        # as-is (nothing was extracted from them). Only when extraction
+        # is impossible does the video go back with a caption that says
+        # exactly that.
         if own_media is not None and not _verify_failed:
             kind, file_id = own_media
-            cap = (t("m_extracted_audio_new", ulang) if kind == "video"
-                   else t("m_identified_clip_audio", ulang))
-            _ex_kb = (_extracted_audio_kb(
-                title, artist, ulang, file_id=file_id,
-                user_id=getattr(getattr(message, "from_user", None), "id", None),
-                kind="file") if kind == "video" else None)
+            cap = _identified_no_full_caption(title, artist, ulang)
             try:
                 if kind == "video":
                     # The caption promises an audio file, so one must really
@@ -4383,19 +4458,22 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                         data = None
                     sent = await _extract_and_send_clip_audio(
                         message, conn, data or b"", caption=cap,
-                        reply_markup=_ex_kb,
-                        caption_key="m_extracted_audio_new")
+                        reply_markup=kb,
+                        caption_key="m_identified_no_full_clip")
                     if sent is None:
                         sent = await send_video(
                             message, file_id,
                             caption=t("m_identified_no_audio_resend", ulang))
                 elif kind == "voice":
-                    sent = await message.answer_voice(file_id, caption=cap)
+                    sent = await message.answer_voice(file_id, caption=cap,
+                                                      reply_markup=kb)
                 else:
                     sent = await send_song_audio(
-                        message, file_id, title, artist, caption=cap)
+                        message, file_id, title, artist, caption=cap,
+                        reply_markup=kb)
                 if sent is not None:
                     _track(conn, message, sent)
+                    await _drop_status()
                     return
             except Exception:
                 pass
@@ -4427,7 +4505,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             more_kb_rows.append([InlineKeyboardButton(
                 text=t("m_bank_search_btn", ulang),
                 callback_data=f"bank:search:{bank_token}")])
-        await _drop_wait()
+        await _drop_status()
         await _answer(message, conn,
                       t("h_song_no_full", ulang).format(title=title, artist=artist),
                       reply_markup=InlineKeyboardMarkup(inline_keyboard=more_kb_rows))
@@ -4440,7 +4518,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
         except Exception:
             pass
     finally:
-        await _drop_wait()
+        await _drop_status()
 
 
 def _openai_ready(conn, config) -> tuple[str, bool]:
@@ -5568,7 +5646,15 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         await message.answer(t(reason, ulang)); return
     # A caption, if present, is also a search query (name / lyric line).
     caption = (message.caption or "").strip()
-    await message.answer(t("audio_identifying", ulang))
+    # UNIFY FIX (2026-11-09): the temporary «در حال جستجوی موسیقی...»
+    # status replaces the old «در حال شناسایی آهنگ...» line and is
+    # deleted before every final message below — it is never left
+    # behind.
+    status_msg = None
+    try:
+        status_msg = await message.answer(t("m_identify_searching", ulang))
+    except Exception:
+        status_msg = None
     try:
         file = await message.bot.get_file(
             (message.video or message.audio or message.voice or message.document).file_id)
@@ -5579,13 +5665,21 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         # A failed download is not an identification error: say so.
         _dl_msg = (t("m_video_fetch_fail", ulang)
                    if message.video is not None else t("audio_error", ulang))
+        await _delete_card(status_msg)
         await message.answer(_dl_msg); return
     if len(data) > config.max_file_mb * 1024 * 1024:
+        await _delete_card(status_msg)
         await message.answer(t("m_file_too_large", ulang)); return
     # Intent from a film is deterministic (no button needed): identify
     # its audio — Shazam signature first (no token), AudD as fallback —
     # then show one professional card, never a nearest song.
-    result = await _identify_audio(data, "clip.mp4", config, conn)
+    try:
+        result = await _identify_audio(data, "clip.mp4", config, conn)
+    except Exception:
+        # A crashed identification must not leave the status behind or
+        # hang the user: delete it and answer the generic error.
+        await _delete_card(status_msg)
+        await message.answer(t("audio_error", ulang)); return
     media = message.video or message.audio or message.voice or message.document
     media_kind = ("video" if message.video is not None
                   else "voice" if message.voice is not None
@@ -5604,6 +5698,7 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
                 dbmod.index_audio_file(
                     conn, audio_fingerprint(data), title=caption, artist="",
                     channel=_forward_channel(message), caption=caption)
+        await _delete_card(status_msg)
         sent = await _send_unconfirmed_media(
             message, conn, data, result.title, result.artist, ulang,
             media_kind=media_kind,
@@ -5622,6 +5717,7 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             await _do_search(message, conn, sanitize_text(caption, 300), config=config)
         return
     if result.status != "identified":
+        await _delete_card(status_msg)
         _err_kb = None
         if message.video is not None:
             _err_kb = _video_identify_kb(
@@ -5658,14 +5754,19 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             }.get(getattr(result, "detail", ""), _err_msg)
         await _answer(message, conn, _err_msg, reply_markup=_err_kb)
         return
-    # Bank sample is armed AFTER the card, inside _send_identified_song.
-    await _send_identified_song(
+    # Bank sample is armed AFTER the call, inside _send_identified_song
+    # (unify fix: no instant card — the background delivery owns the
+    # temporary status and deletes it when the ONE final message is
+    # sent; a failed spawn deletes it here).
+    _spawned = await _send_identified_song(
         message, conn, result.title, result.artist, config,
         bot_id=dbmod.get_bot_id(conn, config),
         own_media=(media_kind, media.file_id),
         arm=("file", __import__("hashlib").sha256(data).hexdigest(),
              data, "", caption),
-        source=result.source)
+        source=result.source, status_msg=status_msg)
+    if not _spawned:
+        await _delete_card(status_msg)
 
 
 
@@ -5814,12 +5915,24 @@ async def suggest_get(callback, conn: sqlite3.Connection, config: Config):
             show_alert=True)
         return
     await callback.answer()
+    # UNIFY FIX (2026-11-09): the shared delivery no longer sends an
+    # instant card — the temporary status stays until the ONE final
+    # message is sent, so the tap is still acknowledged at once.
+    status_msg = None
     try:
-        await _send_professional_song_card(
+        status_msg = await callback.message.answer(
+            t("m_identify_searching", ulang))
+    except Exception:
+        status_msg = None
+    try:
+        _spawned = await _send_professional_song_card(
             callback.message, conn, res["title"], res.get("artist", ""),
             bot_id=dbmod.get_bot_id(conn, config),
-            config=config, exclusive_check=False)
+            config=config, exclusive_check=False, status_msg=status_msg)
+        if not _spawned:
+            await _delete_card(status_msg)
     except Exception:
+        await _delete_card(status_msg)
         await callback.message.answer(
             t("m_suggest_send_fail", ulang))
 

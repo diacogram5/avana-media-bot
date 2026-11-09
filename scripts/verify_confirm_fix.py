@@ -1,10 +1,14 @@
-"""Sandbox tests for the confirm fix (2026-11-09): a song name is shown
-as «شناسایی شد» ONLY when TWO sources agree (exclusive bank, or
+"""Sandbox tests for the confirm fix (2026-11-09) as reworked by the
+result-unification fix (2026-11-09): a song name is shown as
+«شناسایی شد» ONLY when TWO sources agree (exclusive bank, or
 Shazam+AudD). A single source, a disagreement, or no identification
 never gets a card — ONLY the clip's own audio with the new caption +
-Google/retry buttons. A confirmed file REPLACES the card (delete +
-send audio with the card text as caption + the same buttons): ONE
-final message.
+Google/retry buttons. NO card is ever sent before the file status is
+known: a temporary «در حال جستجوی موسیقی...» status stays until the
+ONE final message, then is deleted. A confirmed song's ONE final
+message is the audio with the identified caption + real duration +
+the identified buttons (lyrics/playlist, wrong-song in place of the
+heart when the song came from a video).
 
 Cases:
   C1  Two-source gate in _identify_audio: Shazam-only -> "unconfirmed"
@@ -16,14 +20,16 @@ Cases:
       end-to-end handler proof: a video-button tap on an unconfirmed
       result sends NO card, only the extracted audio with the new
       caption + both buttons.
-  C2  Agreement -> card IS sent instantly, and when the file is ready
-      the card is replaced by ONE audio message carrying the card text
-      as caption + the SAME buttons (identical keyboard object); the
-      card is deleted; no second card.
-  C3  Bank match -> card + bank file as one final message: the real
-      _send_exclusive_song sends the stored file_id with the card
-      text + real duration + bank marker + measured bitrate, the
-      card's buttons, and deletes the card.
+  C2  Agreement -> NO card is sent; the temporary status is deleted
+      when the file is ready and ONE audio message carries the
+      identified caption + real duration + the identified buttons
+      (lyrics/playlist here — no video, so no wrong-song button).
+  C3  Bank match -> the bank file IS the one final message: the real
+      _send_exclusive_song sends the stored file_id with the
+      identified caption + real duration + bank marker + measured
+      bitrate, the passed buttons, and deletes the status. The
+      caption is ALWAYS the final identified caption — with or
+      without a status (the old exclusive card text is gone).
   C4  Extracted audio has performer "Avano" and a real (non-zero)
       duration — both the stream-copy helper and the MP3 re-encode
       helper — and each send writes one `sent_extracted_audio` log
@@ -34,10 +40,9 @@ Cases:
       callback_data is the video's registered vid:id token (same token
       the original identify button carries), resolvable in
       _VIDEO_IDENTIFY.
-  C7  Identified/bank sends keep their old caption and buttons, with
-      NEITHER new button: the replacement caption (C2/C3) and the
-      no-card paths (exclusive card text, full-song caption) contain
-      neither the new caption nor the Google/retry labels.
+  C7  Identified/bank sends use the identified caption (never the old
+      full-song caption, never the new extracted caption) and
+      NEITHER new button.
 
 Reuses the fake aiogram / fake libsql / fake message harness from
 scripts/verify_speedfix.py and the clip fixtures from
@@ -344,7 +349,7 @@ async def main():
         check("C1 unconfirmed handler response", False,
               f"{type(exc).__name__}: {exc}")
 
-    # ---- C2: agreement -> card, then ONE final message -------------------
+    # ---- C2: agreement -> NO card, status deleted, ONE final audio -----
     try:
         LOG_LINES.clear()
         msg = _CardMsg()
@@ -364,49 +369,45 @@ async def main():
 
         h.smart_search = _fake_search
         h._exclusive_song_for = lambda t, a: None
+        status = _CardSent()
         try:
-            card_msg = await h._send_professional_song_card(
+            spawned = await h._send_professional_song_card(
                 msg, conn, _TITLE, _ARTIST, bot_id="@AvanoMediaBot",
-                config=None, arm=None)
-            card_sent = msg.card_sent
-            card_kb = msg.card_kb
-            card_text = msg.card_text
+                config=None, arm=None, status_msg=status)
             drained = await _drain()
         finally:
             adapters_mod.find_full_song_file_v2 = orig_find
             h.smart_search = orig_search
             h._exclusive_song_for = orig_excl
-        check("C2 card IS sent for a confirmed name",
-              card_msg is not None and card_sent is not None
-              and _TITLE in card_text and _ARTIST in card_text
-              and "شناسایی شد" in card_text,
-              f"card_text={card_text!r}")
+        check("C2 NO card is sent for a confirmed name",
+              spawned and msg.card_sent is None and msg.card_text == "",
+              f"card_text={msg.card_text!r}")
         check("C2 background delivery drained", drained)
-        check("C2 card is deleted once the file is ready",
-              card_sent is not None and card_sent.deleted,
-              f"deleted={card_sent.deleted if card_sent else None}")
+        check("C2 status is deleted once the file is ready",
+              status.deleted, f"deleted={status.deleted}")
         check("C2 exactly one audio message (the file) is sent",
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("C2 final audio carries the card text as caption + real duration",
+        check("C2 final audio carries the identified caption + real duration",
               _TITLE in cap and _ARTIST in cap and "شناسایی شد" in cap
               and "0:05" in cap, f"caption={cap!r}")
-        check("C2 final audio has the SAME buttons as the card",
-              msg.audio_kwargs and msg.audio_kwargs[0].get("reply_markup") is card_kb,
-              "reply_markup is not the card keyboard object")
+        _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
+        check("C2 final audio has the identified buttons (lyrics/playlist, no heart)",
+              "📝 متن آهنگ" in _btns and "🎶 افزودن به پلی‌لیست" in _btns
+              and not any("❤️" in b for b in _btns),
+              f"buttons={_btns}")
         check("C2 final audio has NEITHER new button",
               msg.audio_kwargs
-              and _GOOGLE_FA not in _kb_texts(msg.audio_kwargs[0].get("reply_markup"))
-              and _RETRY_FA not in _kb_texts(msg.audio_kwargs[0].get("reply_markup")),
-              f"buttons={_kb_texts(msg.audio_kwargs[0].get('reply_markup')) if msg.audio_kwargs else []}")
+              and _GOOGLE_FA not in _btns and _RETRY_FA not in _btns,
+              f"buttons={_btns}")
         check("C2 final audio caption is not the new extracted caption",
               _NEW_FA not in cap, f"caption={cap!r}")
     except Exception as exc:
         check("C2 confirmed card replacement", False,
               f"{type(exc).__name__}: {exc}")
 
-    # ---- C3: bank match -> card + bank file, one final message -----------
+    # ---- C3: bank match -> bank file IS the one final message -----------
     try:
         msg = _CardMsg()
         conn = vs._make_conn()
@@ -417,37 +418,39 @@ async def main():
         key = profeat.remember_result("Bank Song", "Bank Artist", "", "")
         kb = __import__("aiogram.types", fromlist=["InlineKeyboardMarkup"]).InlineKeyboardMarkup(
             inline_keyboard=profeat.build_song_card_buttons(key, False))
-        card = _CardSent()
-        ok = await h._send_exclusive_song(msg, song, card_msg=card, kb=kb,
+        status = _CardSent()
+        ok = await h._send_exclusive_song(msg, song, status_msg=status, kb=kb,
                                           title="Bank Song",
                                           artist="Bank Artist", ulang="fa")
         check("C3 bank file is sent", ok and len(msg.audio_calls) == 1
               and msg.audio_calls[0] == ("str", "bankfid123"),
               f"ok={ok} calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("C3 bank audio caption is the card text + duration + bank marker + bitrate",
+        check("C3 bank audio caption is the identified caption + duration + bank marker + bitrate",
               "Bank Song" in cap and "Bank Artist" in cap
               and "شناسایی شد" in cap and "3:20" in cap
               and "💎 نسخه کامل اختصاصی آوانو" in cap
               and "320kbps" in cap, f"caption={cap!r}")
-        check("C3 bank audio has the card's buttons",
+        check("C3 bank audio has the passed buttons",
               msg.audio_kwargs
               and msg.audio_kwargs[0].get("reply_markup") is kb,
-              "reply_markup is not the card keyboard")
+              "reply_markup is not the passed keyboard")
         check("C3 bank audio has NEITHER new button",
               msg.audio_kwargs
               and _GOOGLE_FA not in _kb_texts(msg.audio_kwargs[0].get("reply_markup"))
               and _RETRY_FA not in _kb_texts(msg.audio_kwargs[0].get("reply_markup")),
               f"buttons={_kb_texts(msg.audio_kwargs[0].get('reply_markup')) if msg.audio_kwargs else []}")
-        check("C3 card is deleted once the bank file is sent",
-              card.deleted, f"deleted={card.deleted}")
-        # Without a card the old exclusive card text is kept (C7).
+        check("C3 status is deleted once the bank file is sent",
+              status.deleted, f"deleted={status.deleted}")
+        # Without a status the caption is STILL the final identified
+        # caption (unify fix: the old exclusive card text is gone).
         msg2 = _CardMsg()
         ok2 = await h._send_exclusive_song(msg2, song)
         cap2 = msg2.audio_kwargs[0].get("caption", "") if msg2.audio_kwargs else ""
-        check("C7 bank send without a card keeps the exclusive card text",
-              ok2 and "بانک اختصاصی آوانو" in cap2
-              and "💎 نسخه کامل اختصاصی آوانو" in cap2,
+        check("C7 bank send without a status still uses the final identified caption",
+              ok2 and "Bank Song" in cap2 and "شناسایی شد" in cap2
+              and "3:20" in cap2 and "💎 نسخه کامل اختصاصی آوانو" in cap2
+              and "320kbps" in cap2,
               f"caption={cap2!r}")
     except Exception as exc:
         check("C3 bank one-final-message", False, f"{type(exc).__name__}: {exc}")
@@ -544,7 +547,7 @@ async def main():
     except Exception as exc:
         check("C6 retry button", False, f"{type(exc).__name__}: {exc}")
 
-    # ---- C7: identified sends keep the old caption/buttons ---------------
+    # ---- C7: identified sends use the identified caption ----------------
     try:
         msg = vm._Msg()
         conn = vs._make_conn()
@@ -554,8 +557,9 @@ async def main():
                                         duration_sec=5.0),
                           _TITLE, _ARTIST)
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("C7 full-song send without a card keeps the old caption",
-              "نسخه کامل آهنگ پیدا" in cap and _NEW_FA not in cap,
+        check("C7 full-song send uses the identified caption (not the old full-song caption)",
+              "شناسایی شد" in cap and _TITLE in cap and "0:05" in cap
+              and "نسخه کامل آهنگ پیدا" not in cap and _NEW_FA not in cap,
               f"caption={cap!r}")
         check("C7 full-song send has NEITHER new button",
               _GOOGLE_FA not in _kb_texts(msg.audio_kwargs[0].get("reply_markup"))

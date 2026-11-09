@@ -1,5 +1,7 @@
-"""Sandbox tests for the wrong-song button (batch F, 2026-11-09):
-«❌ آهنگ اشتباه» under a sent video and under the result card.
+"""Sandbox tests for the wrong-song button (batch F, 2026-11-09) as
+reworked by the result-unification fix (2026-11-09): «❌ آهنگ اشتباه»
+under a sent video and under the ONE final audio message (no card is
+ever sent before the file status is known).
 
 Cases:
   W1  Engine exclusion in _identify_audio: a rejected name is dropped
@@ -7,22 +9,23 @@ Cases:
       and as a single-source name; a different name still confirms;
       all-excluded answers "not_found" WITHOUT caching it; without
       exclude/skip_bank the behavior is unchanged.
-  W2  Button placement: the card for a video identification carries
-      «❌ آهنگ اشتباه» (same token as the video's identify button);
-      a catalog card (no own_media) carries none; a video-button tap
-      on a confirmed result edits the video message to [identify,
-      wrong-song]; the button records the shown result on the entry.
-  W3  Handler outcomes: different confirmed -> instant card + full
-      song (status message deleted); different single-source -> the
-      searching message becomes a «شاید...» lead (never a
-      «شناسایی شد» card); nothing different -> the searching message
-      becomes «پیدا نشد» + the type-the-name invitation; audio-fetch
-      failure -> the honest error line; cap 2 -> limit alert, no
-      re-check, button removed; expired token / wrong user -> honest
-      alerts, no re-check; a second attempt excludes BOTH rejected
-      names; skip_bank follows the disputed source (bank -> skip,
-      shazam+audd -> run); exactly one outcome message per tap (no
-      automatic follow-up).
+  W2  Button placement: the final audio for a video identification
+      carries «❌ آهنگ اشتباه» (same token as the video's identify
+      button); a catalog delivery (no own_media) carries none; a
+      video-button tap on a confirmed result edits the video message
+      to [identify, wrong-song]; the button records the shown result
+      on the entry.
+  W3  Handler outcomes: different confirmed -> ONE final audio with
+      the identified caption + wrong-song button (status message
+      deleted); different single-source -> the searching message
+      becomes a «شاید...» lead (never a «شناسایی شد» card); nothing
+      different -> the searching message becomes «پیدا نشد» + the
+      type-the-name invitation; audio-fetch failure -> the honest
+      error line; cap 2 -> limit alert, no re-check, button removed;
+      expired token / wrong user -> honest alerts, no re-check; a
+      second attempt excludes BOTH rejected names; skip_bank follows
+      the disputed source (bank -> skip, shazam+audd -> run); exactly
+      one outcome message per tap (no automatic follow-up).
   W4  Turso report: one row per tap (link, wrong result, source,
       outcome, new result) via the fire-and-forget store; Turso
       unconfigured -> False, never raises. Each outcome also writes
@@ -371,10 +374,12 @@ async def main():
         orig_find = adapters_mod.find_full_song_file_v2
         orig_search = h.smart_search
         orig_excl = h._exclusive_song_for
+        _WRONG_MP3 = vm._make_mp3(_WRONG_TITLE, _WRONG_ARTIST, seconds=5)
         adapters_mod.find_full_song_file_v2 = None  # restored below; unused here
 
         async def _fake_find(a, t):
-            return None
+            return vm._full_dict(_WRONG_MP3, "persian_music:test",
+                                 duration_sec=5.0)
 
         async def _fake_search(engine, query, limit=10):
             return ([], "")
@@ -383,45 +388,55 @@ async def main():
         h.smart_search = _fake_search
         h._exclusive_song_for = lambda t, a: None
         try:
-            # W2a: card WITH own_media carries the wrong-song button.
+            # W2a: final audio WITH own_media carries the wrong-song button.
             h._VIDEO_IDENTIFY.clear()
             kb0 = h._video_identify_kb(572595158, "VID123", "file")
             token0 = kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
             msg = _VideoMsg()
             conn = vs._make_conn()
-            card_msg = await h._send_professional_song_card(
+            spawned = await h._send_professional_song_card(
                 msg, conn, _WRONG_TITLE, _WRONG_ARTIST,
                 bot_id="@AvanoMediaBot", own_media=("video", "VID123"),
                 config=None, arm=None, source="shazam+audd")
-            # Snapshot NOW: the background full-song delivery runs after
-            # this and may send its own text answer (overwriting
-            # last_answer_kb).
-            card_kb = msg.last_answer_kb
             drained = await _drain()
-            _texts = _kb_texts(card_kb)
-            _cbs = _kb_callbacks(card_kb)
-            check("W2a video card carries «❌ آهنگ اشتباه»",
+            _akw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
+            _texts = _kb_texts(_akw.get("reply_markup"))
+            _cbs = _kb_callbacks(_akw.get("reply_markup"))
+            check("W2a final audio carries «❌ آهنگ اشتباه»",
                   _WRONG_FA in _texts,
                   f"buttons={_texts}")
-            check("W2a card button reuses the video's identify token",
+            check("W2a button reuses the video's identify token",
                   f"wrong:{token0}" in _cbs,
                   f"callbacks={_cbs} token={token0}")
-            check("W2a card button records the shown result on the entry",
+            check("W2a button records the shown result on the entry",
                   h._VIDEO_IDENTIFY.get(token0, {}).get("last_title") == _WRONG_TITLE
                   and h._VIDEO_IDENTIFY.get(token0, {}).get("last_source") == "shazam+audd",
                   f"entry={h._VIDEO_IDENTIFY.get(token0)}")
-            # W2b: catalog card (no own_media) carries NO wrong-song button.
+            check("W2a NO card text is sent (one final audio only)",
+                  spawned and msg.answers == [] and len(msg.audio_calls) == 1,
+                  f"answers={msg.answers} audio={msg.audio_calls}")
+            # W2b: catalog delivery (no own_media) carries NO wrong-song button.
+            # A FRESH title/artist: W2a's successful send cached its
+            # file_id, and the same song would answer from the cache.
+            async def _fake_find_none(a, t):
+                return None
+
+            adapters_mod.find_full_song_file_v2 = _fake_find_none
             msg2 = _VideoMsg()
             await h._send_professional_song_card(
-                msg2, conn, _WRONG_TITLE, _WRONG_ARTIST,
+                msg2, conn, "Catalog Song", "Catalog Artist",
                 bot_id="@AvanoMediaBot", config=None, arm=None,
                 exclusive_check=False)
-            card_kb2 = msg2.last_answer_kb  # snapshot before the bg task
             await _drain()
-            _texts2 = _kb_texts(card_kb2)
-            check("W2b catalog card (no video) has NO wrong-song button",
+            _texts2 = _kb_texts(msg2.last_answer_kb)
+            check("W2b catalog delivery (no video) has NO wrong-song button",
                   _WRONG_FA not in _texts2,
                   f"buttons={_texts2}")
+            check("W2b exactly one final text (the no-full message), no card",
+                  len(msg2.answers) == 1
+                  and "Catalog Song" in msg2.answers[0]
+                  and "نسخه کامل" in msg2.answers[0],
+                  f"answers={msg2.answers}")
         finally:
             adapters_mod.find_full_song_file_v2 = orig_find
             h.smart_search = orig_search
@@ -463,7 +478,6 @@ async def main():
             conn = vs._make_conn()
             cb = _FakeCallback(msg, f"vid:id:{token}")
             await h.video_identify(cb, conn, _config())
-            card_kb = msg.last_answer_kb  # snapshot before the bg task
             await _drain()
             check("W2c video tap answers the identify tap at once",
                   any("در حال شناسایی" in a[0] for a in cb.answered),
@@ -473,9 +487,13 @@ async def main():
                   and _kb_callbacks(msg.markup_edits[-1]) == [f"vid:id:{token}",
                                                              f"wrong:{token}"],
                   f"edits={[_kb_callbacks(k) for k in msg.markup_edits]}")
-            check("W2c card for the same video carries the same wrong token",
-                  f"wrong:{token}" in _kb_callbacks(card_kb),
-                  f"card_callbacks={_kb_callbacks(card_kb)}")
+            _akw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
+            check("W2c final audio for the same video carries the same wrong token",
+                  f"wrong:{token}" in _kb_callbacks(_akw.get("reply_markup")),
+                  f"audio_callbacks={_kb_callbacks(_akw.get('reply_markup'))}")
+            check("W2c temp status is deleted once the final audio is out",
+                  msg.sent_messages and msg.sent_messages[0].deleted,
+                  f"deleted={[s.deleted for s in msg.sent_messages]}")
         finally:
             adapters_mod.find_full_song_file_v2 = orig_find
             h.smart_search = orig_search
@@ -508,17 +526,14 @@ async def main():
         try:
             cb = _FakeCallback(msg, f"wrong:{token}", user_id=user_id)
             await h.wrong_song(cb, conn, _config())
-            # Snapshot the card NOW: the background full-song delivery
-            # runs after this and may send its own text answer
-            # (overwriting last_answer_text/_kb).
-            msg.card_text_snapshot = msg.last_answer_text
-            msg.card_kb_snapshot = msg.last_answer_kb
+            # No card snapshot: under unification the final message is
+            # the audio (read from msg.audio_kwargs after the drain).
             await _drain()
         finally:
             h._identify_audio = orig_ident
         return msg, cb, calls, conn
 
-    # W3a: different confirmed -> card + full song, status deleted.
+    # W3a: different confirmed -> ONE final audio, status deleted.
     try:
         LOG_LINES.clear()
         orig_find = adapters_mod.find_full_song_file_v2
@@ -550,12 +565,15 @@ async def main():
                   and calls[0]["exclude"] == [(_WRONG_TITLE, _WRONG_ARTIST)]
                   and calls[0]["skip_bank"] is False,
                   f"calls={calls}")
-            check("W3a different confirmed name gets its «شناسایی شد» card",
-                  "شناسایی شد" in msg.card_text_snapshot
-                  and _NEW_TITLE in msg.card_text_snapshot
-                  and _WRONG_TITLE not in msg.card_text_snapshot,
-                  f"card={msg.card_text_snapshot!r}")
-            check("W3a searching message is deleted once the card is out",
+            _akw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
+            _cap = _akw.get("caption", "")
+            check("W3a different confirmed name arrives as ONE final audio",
+                  len(msg.audio_calls) == 1
+                  and msg.answers == [_CHECKING_FA]
+                  and "شناسایی شد" in _cap and _NEW_TITLE in _cap
+                  and _WRONG_TITLE not in _cap,
+                  f"caption={_cap!r} answers={msg.answers} audio={msg.audio_calls}")
+            check("W3a searching message is deleted once the final audio is out",
                   msg.sent_messages and msg.sent_messages[0].deleted,
                   f"deleted={[s.deleted for s in msg.sent_messages]}")
             check("W3a entry now disputes the NEW result, attempts == 1",
@@ -564,9 +582,9 @@ async def main():
                   and entry.get("attempts") == 1
                   and entry.get("wrong") == [(_WRONG_TITLE, _WRONG_ARTIST)],
                   f"entry={entry}")
-            check("W3a new card carries the wrong-song button (same token)",
-                  f"wrong:{token}" in _kb_callbacks(msg.card_kb_snapshot),
-                  f"callbacks={_kb_callbacks(msg.card_kb_snapshot)}")
+            check("W3a final audio carries the wrong-song button (same token)",
+                  f"wrong:{token}" in _kb_callbacks(_akw.get("reply_markup")),
+                  f"callbacks={_kb_callbacks(_akw.get('reply_markup'))}")
             rows = await _rows_with("different_confirmed")
             check("W3a Turso report row: wrong result + source + outcome",
                   any(r[2] == _WRONG_TITLE and r[3] == _WRONG_ARTIST

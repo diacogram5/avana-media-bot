@@ -13,11 +13,15 @@ Cases:
   F2  Mismatched tags (the literal 23:54 pair) are NEVER sent; no
       own_media -> the honest no-full message.
   F2b Mismatched tags + own_media video -> the clip's original audio
-      (stream copy) with the exact corporate text.
+      (stream copy) with the case-(b) caption (unify fix 2026-11-09:
+      the name IS confirmed, so the corporate caption no longer
+      applies to this path).
   F2c/F2d The same guard + fallback in the download-full flow
       (_download_full_bg): matching tags send, mismatch -> clip audio.
+      (Untouched by the unify fix — the download-full flow still
+      carries the corporate caption.)
   F3  Untagged file is NEVER sent; own_media video -> the clip's
-      original audio + the corporate text.
+      original audio + the case-(b) caption.
   F4  Duration label: real m:ss; unit checks on _fullsong_duration_label.
   F5  Missing duration omits the label entirely (unit + cache-hit send).
   F6  Cache-hit guard: verified match sends; verified mismatch blocks
@@ -66,6 +70,10 @@ LOG_LINES = vs.LOG_LINES
 adapters_mod = vs.adapters_mod
 
 _NEW_FA = t("m_extracted_audio_new", "fa")
+# Case-(b) caption template (unify fix 2026-11-09): the name IS
+# confirmed but no verified full file exists — the clip's own audio
+# is the one final message.
+_B_FA = t("m_identified_no_full_clip", "fa")
 _STATIC_FA = t("m_full_duration_long", "fa")
 _EXTRACTED_TITLE_FA = t("m_extracted_audio_title", "fa")
 
@@ -315,8 +323,9 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F2b clip audio carries the new caption",
-              cap == _NEW_FA, f"caption={cap!r}")
+        check("F2b clip audio carries the case-(b) caption",
+              cap == _B_FA.format(title="ATM", artist="Tiem & Salii"),
+              f"caption={cap!r}")
         check("F2b clip audio is titled as extracted audio",
               (msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else "")
               == _EXTRACTED_TITLE_FA)
@@ -392,8 +401,9 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F3 clip audio carries the new caption",
-              cap == _NEW_FA, f"caption={cap!r}")
+        check("F3 clip audio carries the case-(b) caption",
+              cap == _B_FA.format(title="Terror", artist="Tiem & Salii"),
+              f"caption={cap!r}")
         title_kw = msg.audio_kwargs[0].get("title", "") if msg.audio_kwargs else ""
         check("F3 clip audio is titled as extracted audio",
               title_kw == _EXTRACTED_TITLE_FA, f"title={title_kw!r}")
@@ -577,9 +587,9 @@ async def main():
     # The cached file is poisoned, the fresh lookup finds nothing: the
     # user still gets the clip's own audio (the honest own-media path),
     # never the wrong cached file. The identification itself stands,
-    # but the confirmed-name-but-no-file path now carries the NEW
-    # extracted-audio caption (user order 2026-11-09 01:24 — the old
-    # identified-clip caption is superseded for this path too).
+    # so the fallback now carries the case-(b) caption (unify fix
+    # 2026-11-09 — the corporate caption no longer applies to a
+    # confirmed name).
     try:
         LOG_LINES.clear()
         msg = _Msg()
@@ -595,8 +605,8 @@ async def main():
               len(msg.audio_calls) == 1 and msg.audio_calls[0][0] == "bytes",
               f"calls={msg.audio_calls}")
         cap = msg.audio_kwargs[0].get("caption", "") if msg.audio_kwargs else ""
-        check("F6g original audio carries the new caption",
-              cap == _NEW_FA,
+        check("F6g original audio carries the case-(b) caption",
+              cap == _B_FA.format(title="Aramazsan Arama", artist="Maviler"),
               f"caption={cap!r}")
         check("F6g cache mismatch is logged",
               vs._log_has("fullsong_cache_mismatch"))
