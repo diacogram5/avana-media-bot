@@ -346,11 +346,15 @@ async def main():
               f"clip-kb sites={_seg.count('reply_markup=_clip_kb')}")
         # Step 1b: 3 = the def + TWO call sites — the normal delivery
         # (_send_professional_song_card) and the cache-hit full-song
-        # send (_send_identify_cache_hit). Both build the keyboard for
-        # an IDENTIFIED full song only; no clip-audio site builds it
-        # (the neighboring check proves the clip sites use _clip_kb).
+        # send (_send_identify_cache_hit). Smart search (2026-11-09)
+        # adds a FOURTH occurrence: the smart-search FOUND path
+        # (_run_smart_search_tap) builds it for a VERIFIED full song
+        # only, with the locked identified layout. All three call
+        # sites build the keyboard for an IDENTIFIED full song only;
+        # no clip-audio site builds it (the neighboring check proves
+        # the clip sites use _clip_kb).
         check("X7 the identified keyboard is built at exactly the identified-song sites (never at a clip-audio site)",
-              src.count("_identified_song_kb(") == 3,
+              src.count("_identified_song_kb(") == 4,
               f"sites={src.count('_identified_song_kb(')}")
     except Exception as exc:
         check("X7 i18n", False, f"{type(exc).__name__}: {exc}")

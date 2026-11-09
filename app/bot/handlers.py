@@ -2099,6 +2099,259 @@ async def _send_identify_cache_hit(message, conn, hit: dict, token: str,
         return None
 
 
+def _smart_search_eligible(callback, entry, hit) -> bool:
+    """Gate for the smart full-version search (retry button only).
+
+    True ONLY when all of these hold:
+    - the tap is on an AUDIO message (the extracted audio's single
+      retry button — the identify button lives under a video message);
+    - the registry entry is a link/file video (never a user-sent
+      audio/voice file, kind "audio");
+    - the 1b cache hit is a clip result (kind "clip") with a known
+      title (the search reuses the prior identify info — it never
+      re-runs identification, and it cannot run without a title).
+    A kind "full" hit already HAS the full version; a title-less hit
+    has nothing to search for. Never raises.
+    """
+    try:
+        if not isinstance(hit, dict) or not (hit.get("title") or "").strip():
+            return False
+        if (hit.get("kind") or "clip") != "clip":
+            return False
+        if (entry or {}).get("kind") not in ("link", "file"):
+            return False
+        msg = getattr(callback, "message", None)
+        if msg is None or getattr(msg, "audio", None) is None:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _smart_clip_fingerprint(callback, entry, hit):
+    """Chromaprint of the extracted clip audio, or None (unavailable).
+
+    Prefers the 1b cache's staged disk file; else downloads the sent
+    clip audio from Telegram (capped at 10 MB, timed out). The
+    fingerprint is an ADVISORY confirm only — None never blocks the
+    search. Never raises.
+    """
+    try:
+        from ..search.smart_validate import fingerprint_file_items
+    except Exception:
+        return None
+    disk = (hit or {}).get("disk_path") or ""
+    if disk:
+        try:
+            import os as _os
+            if _os.path.isfile(disk):
+                items = fingerprint_file_items(disk)
+                if items:
+                    return items
+        except Exception:
+            pass
+    fid = (hit or {}).get("file_id") or ""
+    if not fid:
+        return None
+    tmp = ""
+    try:
+        import os as _os
+        import tempfile as _tf
+        tg_file = await asyncio.wait_for(
+            callback.bot.get_file(fid), timeout=15)
+        buf = io.BytesIO()
+        await asyncio.wait_for(
+            callback.bot.download_file(tg_file.file_path, buf), timeout=20)
+        data = buf.getvalue()
+        if not data or len(data) > 10 * 1024 * 1024:
+            return None
+        fd, tmp = _tf.mkstemp(suffix=".mp3", prefix="avano_clip_")
+        try:
+            _os.write(fd, data)
+            _os.close(fd)
+            fd = None
+        except Exception:
+            pass
+        return fingerprint_file_items(tmp)
+    except Exception:
+        return None
+    finally:
+        if tmp:
+            try:
+                import os as _os
+                _os.unlink(tmp)
+            except Exception:
+                pass
+
+
+async def _run_smart_search_tap(callback, conn, entry, hit,
+                                cache_key, token, ulang, req_id=None):
+    """Smart full-version search for ONE retry tap. Never raises.
+
+    Sends exactly one outcome and restores the retry button on the
+    extracted audio message (the tap cleared it):
+    - found: the full file with the LOCKED full-song layout
+      (identified caption + [playlist, lyrics] one row); the file_id
+      is stored in the 1b cache + song_file_cache and the disk file
+      deleted — the extracted file stays until this send succeeds.
+    - not found: the exact not-found text, then the satisfaction
+      survey hook (when the survey module exists — it does not yet;
+      see the SURVEY HOOK comment below). Streaming-link URL
+      buttons and the iTunes preview are DEFERRED to a later
+      version (user order 22:19) and are never sent in v1.
+    - error: the honest error text.
+    The extracted clip audio is never re-sent here: it is already in
+    the chat, and the not-found text says so.
+    """
+    import os as _os
+    from aiogram.types import FSInputFile as _FSInputFile
+    from aiogram.types import InlineKeyboardButton as _IKB
+    from aiogram.types import InlineKeyboardMarkup as _IKM
+    from ..search.smart_fullsong import search_smart_full_version as _smart_search
+    message = callback.message
+    title = (hit.get("title") or "").strip()
+    artist = (hit.get("artist") or "").strip()
+    t0 = _time.monotonic()
+    clip_fp = await _smart_clip_fingerprint(callback, entry, hit)
+    outcome = await _smart_search(artist, title, clip_fingerprint=clip_fp)
+    try:
+        if outcome.status == "found" and outcome.file is not None:
+            f = outcome.file
+            sent = None
+            try:
+                kb, _key = _identified_song_kb(
+                    message, conn, title, artist,
+                    ("video", entry.get("file_id")), f.source, ulang)
+                caption = _final_audio_caption(
+                    title, artist, ulang, duration_sec=f.duration_sec)
+                sent = await message.answer_audio(
+                    _FSInputFile(f.disk_path,
+                                 filename=f"{title or 'song'}.mp3"),
+                    title=title, performer=artist,
+                    duration=int(f.duration_sec) if f.duration_sec else None,
+                    caption=caption, reply_markup=kb)
+            except Exception:
+                sent = None
+            try:
+                if sent is not None:
+                    try:
+                        _track(conn, message, sent)
+                    except Exception:
+                        pass
+                    fid = ""
+                    _a = getattr(sent, "audio", None)
+                    if _a is not None:
+                        fid = getattr(_a, "file_id", "") or ""
+                    if fid:
+                        _identify_result_store_send(
+                            cache_key, title, artist, f.source, "full", fid,
+                            duration_sec=f.duration_sec, req_id=req_id)
+                        try:
+                            from .file_cache import store_file_id as _store_fid
+                            _store_fid(conn, artist, title, fid,
+                                       file_type="audio", file_size=f.size,
+                                       duration_sec=f.duration_sec,
+                                       source=f.source,
+                                       verified_title=f.title,
+                                       verified_artist=f.artist)
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    _os.unlink(f.disk_path)
+                except Exception:
+                    pass
+            if sent is None:
+                # The verified file could not be sent: honest error —
+                # the extracted clip stays in the chat.
+                try:
+                    await message.answer(t("m_smart_error", ulang))
+                except Exception:
+                    pass
+            log_event(log, "smart_search", stage="sent",
+                      ms=int((_time.monotonic() - t0) * 1000),
+                      source=f.source, sent=bool(sent))
+        elif outcome.status == "error":
+            await message.answer(t("m_smart_error", ulang))
+            log_event(log, "smart_search", stage="error",
+                      ms=int((_time.monotonic() - t0) * 1000),
+                      detail=outcome.detail)
+        else:  # not_found
+            stream = outcome.stream
+            link_kb = None
+            if stream is not None and stream.links:
+                rows = [[_IKB(text=label, url=url)]
+                        for label, url in stream.links[:5]]
+                link_kb = _IKM(inline_keyboard=rows)
+            await message.answer(t("m_smart_not_found", ulang),
+                                 reply_markup=link_kb)
+            # SURVEY HOOK (user order 22:19 §4; design study 79ff1987):
+            # the satisfaction survey follows the not-found message.
+            # The survey module does NOT exist yet (design done, build
+            # pending the user's thank-you-form answer), so the helper
+            # is imported LAZILY and guarded: while the module is
+            # absent this is skipped silently — never a crash, never a
+            # delay to the answer. send_survey(message, conn,
+            # op_context) is the shape the design study specified; the
+            # broad guard also absorbs a signature mismatch when the
+            # module lands. Answering is OPTIONAL and never affects
+            # using the bot (user order 21:31).
+            survey_sent = False
+            try:
+                from ..features.survey import send_survey as _send_survey
+                await _send_survey(message, conn, {
+                    "cache_key": cache_key,
+                    "title": title,
+                    "artist": artist,
+                    "search_result": "not_found",
+                    "file_type": "extracted_clip_audio",
+                })
+                survey_sent = True
+            except ImportError:
+                pass
+            except Exception:
+                pass
+            # v2 only (DEFERRED — user order 22:19): a verified iTunes
+            # preview would follow here as a clearly-labelled 30 s
+            # preview audio — never as the song. Never sent in v1.
+            if stream is not None and stream.preview_disk_path:
+                try:
+                    await message.answer_audio(
+                        _FSInputFile(stream.preview_disk_path,
+                                     filename="preview.m4a"),
+                        title=title, performer=artist,
+                        duration=int(stream.preview_duration_sec)
+                        if stream.preview_duration_sec else None,
+                        caption=t("m_smart_preview_caption", ulang).format(
+                            title=title, artist=artist))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        _os.unlink(stream.preview_disk_path)
+                    except Exception:
+                        pass
+            log_event(log, "smart_search", stage="not_found",
+                      ms=int((_time.monotonic() - t0) * 1000),
+                      checked=outcome.checked,
+                      links=len(stream.links) if stream else 0,
+                      preview=bool(stream and stream.preview_disk_path),
+                      survey=survey_sent)
+    except Exception:
+        # Never leave the user without an answer: the honest error.
+        try:
+            await message.answer(t("m_smart_error", ulang))
+        except Exception:
+            pass
+    # Restore the single retry button under the extracted audio.
+    try:
+        kb = _extracted_audio_kb(title, artist, ulang, token=token)
+        if kb is not None:
+            await message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("vid:id:"))
 async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     """One-click «🎵 شناسایی موسیقی» under a received video.
@@ -2200,6 +2453,33 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 if _hit is not None:
                     _identify_result_put(_cache_key, _hit)
         _failed_fid = ""
+        # SMART SEARCH (2026-11-09, free-only): the retry button under
+        # an extracted audio message, with a cached clip result and a
+        # known title, runs the smart full-version search INSTEAD of
+        # the normal identify flow — the prior identify info is reused,
+        # never re-run. The temp status becomes the exact smart-search
+        # text; the finally below deletes it once the outcome is sent.
+        if _smart_search_eligible(callback, entry, _hit) and not _is_rejected(
+                entry, _hit.get("title", ""), _hit.get("artist", "")):
+            try:
+                if status_msg is not None:
+                    await status_msg.edit_text(t("m_smart_searching", ulang))
+            except Exception:
+                try:
+                    await _delete_card(status_msg)
+                    status_msg = await callback.message.answer(
+                        t("m_smart_searching", ulang))
+                except Exception:
+                    pass
+            _t_smart = _time.perf_counter()
+            await _run_smart_search_tap(
+                callback, conn, entry, _hit, _cache_key, token,
+                ulang, req_id=_req_id)
+            _send_ms = int((_time.perf_counter() - _t_smart) * 1000)
+            _log_identify_timing()
+            _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                              "result_send", _t_req, status="smart_search")
+            return
         if _hit is not None and not _is_rejected(
                 entry, _hit.get("title", ""), _hit.get("artist", "")):
             if _hit.get("file_id") or _hit.get("disk_path"):
