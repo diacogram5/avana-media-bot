@@ -71,11 +71,13 @@ adapters_mod = vs.adapters_mod
 _TITLE = "Test Song"
 _ARTIST = "Test Artist"
 _NEW_FA = vm._NEW_FA
-_WRONG_FA = "❌ آهنگ اشتباه"
-_LYRICS_FA = "📝 متن آهنگ"
-_PLAYLIST_FA = "🎶 افزودن به پلی‌لیست"
+_REPORT_FA = "⚠️ گزارش شناسایی اشتباه ⚠️"
+_LYRICS_FA = "📝 متن آهنگ و ترجمه"
+_PLAYLIST_FA = "🎵 افزودن به پلی‌لیست"
 _GOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
-_RETRY_FA = "🎧 تلاش مجدد برای شناسایی آهنگ"
+_RETRY_FA = "🔄 شناسایی مجدد"
+_VIDEO_GOOGLE_FA = "🌐 جستجو در Google"
+_VIDEO_YT_FA = "▶️ جستجو در YouTube"
 _SEARCHING_FA = "در حال جستجوی موسیقی..."
 _B_FA = "«{title}» از {artist} شناسایی شد، اما نسخه کامل در منابع پیدا نشد؛ صدای همین کلیپ را فرستادیم."
 
@@ -219,17 +221,16 @@ async def main():
                   and "0:05" in cap and _NEW_FA not in cap,
                   f"caption={cap!r}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U1 final audio has the 3 identified buttons (wrong-song/lyrics/playlist)",
-                  _WRONG_FA in _btns and _LYRICS_FA in _btns
-                  and _PLAYLIST_FA in _btns,
+            check("U1 final audio has exactly the 2 identified buttons (playlist/lyrics), one row",
+                  _btns == [_PLAYLIST_FA, _LYRICS_FA]
+                  and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_btns}")
-            check("U1 final audio has NO heart and NEITHER new button",
+            check("U1 final audio has NO heart, NO wrong-song, NEITHER new button",
                   not any("❤️" in b for b in _btns)
+                  and _REPORT_FA not in _btns
+                  and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup")))
                   and _GOOGLE_FA not in _btns and _RETRY_FA not in _btns,
                   f"buttons={_btns}")
-            check("U1 wrong-song button reuses the video's token",
-                  f"wrong:{token}" in _kb_callbacks(msg.audio_kwargs[0].get("reply_markup")),
-                  f"callbacks={_kb_callbacks(msg.audio_kwargs[0].get('reply_markup'))}")
             check("U1 temp status is deleted once the final audio is out",
                   status.deleted, f"deleted={status.deleted}")
         except Exception as exc:
@@ -258,10 +259,11 @@ async def main():
             check("U2 clip audio carries the case-(b) caption",
                   cap == _b, f"caption={cap!r}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U2 clip audio has the 3 identified buttons, no heart, no new buttons",
-                  _WRONG_FA in _btns and _LYRICS_FA in _btns
-                  and _PLAYLIST_FA in _btns
+            check("U2 clip audio has exactly the 2 identified buttons (one row), no heart, no wrong-song, no new buttons",
+                  _btns == [_PLAYLIST_FA, _LYRICS_FA]
+                  and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
                   and not any("❤️" in b for b in _btns)
+                  and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup")))
                   and _GOOGLE_FA not in _btns and _RETRY_FA not in _btns,
                   f"buttons={_btns}")
             kw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
@@ -295,9 +297,10 @@ async def main():
             check("U3 clip audio carries the case-(b) caption",
                   cap == _b, f"caption={cap!r}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U3 clip audio has the 3 identified buttons",
-                  _WRONG_FA in _btns and _LYRICS_FA in _btns
-                  and _PLAYLIST_FA in _btns,
+            check("U3 clip audio has exactly the 2 identified buttons (one row), no wrong-song",
+                  _btns == [_PLAYLIST_FA, _LYRICS_FA]
+                  and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
+                  and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup"))),
                   f"buttons={_btns}")
             kw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
             check("U3 clip audio performer is Avano with a real duration",
@@ -327,8 +330,9 @@ async def main():
                   kw.get("caption", "") == _NEW_FA,
                   f"caption={kw.get('caption')!r}")
             _btns = _kb_texts(kw.get("reply_markup"))
-            check("U4 ONLY Google + retry (no identified buttons)",
-                  _btns == [_GOOGLE_FA, _RETRY_FA],
+            check("U4 ONLY Google + retry in ONE row (no identified buttons)",
+                  _btns == [_GOOGLE_FA, _RETRY_FA]
+                  and len(kw.get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_btns}")
             check("U4 no name in the caption",
                   "Flick Shot!" not in kw.get("caption", "")
@@ -375,8 +379,9 @@ async def main():
                   and msg.audio_kwargs[0].get("caption", "") == _NEW_FA,
                   f"calls={msg.audio_calls}")
             _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-            check("U5 single-source audio has ONLY Google + retry",
-                  _btns == [_GOOGLE_FA, _RETRY_FA],
+            check("U5 single-source audio has ONLY Google + retry, in ONE row",
+                  _btns == [_GOOGLE_FA, _RETRY_FA]
+                  and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_btns}")
             check("U5 temp status was sent once and deleted",
                   len(msg.answers) == 1
@@ -479,6 +484,27 @@ async def main():
                   TRANSLATIONS["fa"]["m_identified_no_full_clip"].format(
                       title="X", artist="Y") == _B_FA.format(title="X", artist="Y"),
                   f"value={TRANSLATIONS['fa']['m_identified_no_full_clip']!r}")
+            # Final identify UI (2026-11-09 14:54): the 5 new keys exist
+            # in fa/en/ar with the exact ordered texts.
+            _new_keys = ("m_video_google_btn", "m_video_youtube_btn",
+                         "m_video_wrong_btn", "m_id_pl_btn",
+                         "m_id_lyrics_btn")
+            for lang in ("fa", "en", "ar"):
+                for _k in _new_keys:
+                    check(f"U8 {_k} exists in {lang}",
+                          _k in TRANSLATIONS[lang],
+                          f"keys={list(TRANSLATIONS[lang])[:5]}...")
+            check("U8 fa video + identified-audio button texts are byte-exact",
+                  TRANSLATIONS["fa"]["m_video_google_btn"] == _VIDEO_GOOGLE_FA
+                  and TRANSLATIONS["fa"]["m_video_youtube_btn"] == _VIDEO_YT_FA
+                  and TRANSLATIONS["fa"]["m_video_wrong_btn"] == _REPORT_FA
+                  and TRANSLATIONS["fa"]["m_id_pl_btn"] == _PLAYLIST_FA
+                  and TRANSLATIONS["fa"]["m_id_lyrics_btn"] == _LYRICS_FA,
+                  f"fa={ {k: TRANSLATIONS['fa'].get(k) for k in _new_keys} }")
+            check("U8 fa extracted caption has NO middle line (exact new text)",
+                  TRANSLATIONS["fa"]["m_extracted_audio_new"] == _NEW_FA
+                  and "آماده شنیدن" not in TRANSLATIONS["fa"]["m_extracted_audio_new"],
+                  f"value={TRANSLATIONS['fa']['m_extracted_audio_new']!r}")
         except Exception as exc:
             check("U8 new i18n keys", False, f"{type(exc).__name__}: {exc}")
     finally:

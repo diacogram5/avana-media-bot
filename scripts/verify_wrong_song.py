@@ -9,23 +9,28 @@ Cases:
       and as a single-source name; a different name still confirms;
       all-excluded answers "not_found" WITHOUT caching it; without
       exclude/skip_bank the behavior is unchanged.
-  W2  Button placement: the final audio for a video identification
-      carries «❌ آهنگ اشتباه» (same token as the video's identify
-      button); a catalog delivery (no own_media) carries none; a
-      video-button tap on a confirmed result edits the video message
-      to [identify, wrong-song]; the button records the shown result
-      on the entry.
+  W2  Button placement (final identify UI, 2026-11-09 14:54): the
+      final audio for a video identification carries ONLY
+      [playlist, lyrics] in one row (wrong-song lives ONLY under
+      the video); a catalog delivery (no own_media) carries none;
+      a video-button tap first CLEARS the video keyboard, then sets
+      [Google, YouTube] + [report wrong identification] (same token
+      as the video's identify button) once the result is known; the
+      video keyboard records the shown result on the entry.
   W3  Handler outcomes: different confirmed -> ONE final audio with
-      the identified caption + wrong-song button (status message
-      deleted); different single-source -> the searching message
-      becomes a «شاید...» lead (never a «شناسایی شد» card); nothing
-      different -> the searching message becomes «پیدا نشد» + the
-      type-the-name invitation; audio-fetch failure -> the honest
-      error line; cap 2 -> limit alert, no re-check, button removed;
-      expired token / wrong user -> honest alerts, no re-check; a
-      second attempt excludes BOTH rejected names; skip_bank follows
-      the disputed source (bank -> skip, shazam+audd -> run); exactly
-      one outcome message per tap (no automatic follow-up).
+      the identified caption (wrong-song under the VIDEO, same token)
+      (status message deleted); different single-source -> the
+      searching message becomes a «شاید...» lead (never a
+      «شناسایی شد» card) with the identified buttons, wrong-song
+      under the video; nothing different -> the searching message
+      becomes «پیدا نشد» + the type-the-name invitation;
+      audio-fetch failure -> the honest error line; cap 2 -> limit
+      alert, no re-check, report button removed (Google/YouTube
+      remain); expired token / wrong user -> honest alerts, no
+      re-check; a second attempt excludes BOTH rejected names;
+      skip_bank follows the disputed source (bank -> skip,
+      shazam+audd -> run); exactly one outcome message per tap
+      (no automatic follow-up).
   W4  Turso report: one row per tap (link, wrong result, source,
       outcome, new result) via the fire-and-forget store; Turso
       unconfigured -> False, never raises. Each outcome also writes
@@ -61,7 +66,12 @@ RESULTS = vs.RESULTS
 LOG_LINES = vs.LOG_LINES
 adapters_mod = vs.adapters_mod
 
-_WRONG_FA = "❌ آهنگ اشتباه"
+_WRONG_FA = "❌ آهنگ اشتباه"  # legacy text; no longer on any keyboard
+_REPORT_FA = "⚠️ گزارش شناسایی اشتباه ⚠️"
+_PL_FA = "🎵 افزودن به پلی‌لیست"
+_LYRICS_FA = "📝 متن آهنگ و ترجمه"
+_GOOGLE_FA = "🌐 جستجو در Google"
+_YT_FA = "▶️ جستجو در YouTube"
 _CHECKING_FA = "دوباره بررسی می‌کنم…"
 _NOTFOUND_FA = "پیدا نشد. اگر نام آهنگ یا خواننده را می‌دانید، بنویسید تا جستجو کنیم."
 _LIMIT_FA = "برای این ویدیو دو بار بررسی مجدد انجام شد."
@@ -88,6 +98,14 @@ def _kb_callbacks(kb) -> list:
         for b in row:
             cbs.append(getattr(b, "callback_data", "") or "")
     return cbs
+
+
+def _kb_urls(kb) -> list:
+    urls = []
+    for row in getattr(kb, "inline_keyboard", []) or []:
+        for b in row:
+            urls.append(getattr(b, "url", "") or "")
+    return urls
 
 
 def _config(audd_token="tok"):
@@ -388,7 +406,9 @@ async def main():
         h.smart_search = _fake_search
         h._exclusive_song_for = lambda t, a: None
         try:
-            # W2a: final audio WITH own_media carries the wrong-song button.
+            # W2a: final audio WITH own_media carries ONLY the identified
+            # buttons (playlist + lyrics, one row) — wrong-song lives
+            # ONLY under the video (final identify UI, 2026-11-09).
             h._VIDEO_IDENTIFY.clear()
             kb0 = h._video_identify_kb(572595158, "VID123", "file")
             token0 = kb0.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
@@ -402,16 +422,14 @@ async def main():
             _akw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
             _texts = _kb_texts(_akw.get("reply_markup"))
             _cbs = _kb_callbacks(_akw.get("reply_markup"))
-            check("W2a final audio carries «❌ آهنگ اشتباه»",
-                  _WRONG_FA in _texts,
+            check("W2a final audio has exactly [playlist, lyrics], one row",
+                  _texts == [_PL_FA, _LYRICS_FA]
+                  and len(_akw.get("reply_markup").inline_keyboard) == 1,
                   f"buttons={_texts}")
-            check("W2a button reuses the video's identify token",
-                  f"wrong:{token0}" in _cbs,
-                  f"callbacks={_cbs} token={token0}")
-            check("W2a button records the shown result on the entry",
-                  h._VIDEO_IDENTIFY.get(token0, {}).get("last_title") == _WRONG_TITLE
-                  and h._VIDEO_IDENTIFY.get(token0, {}).get("last_source") == "shazam+audd",
-                  f"entry={h._VIDEO_IDENTIFY.get(token0)}")
+            check("W2a final audio carries NO wrong-song button",
+                  "wrong:" not in "".join(_cbs)
+                  and _WRONG_FA not in _texts and _REPORT_FA not in _texts,
+                  f"callbacks={_cbs} buttons={_texts}")
             check("W2a NO card text is sent (one final audio only)",
                   spawned and msg.answers == [] and len(msg.audio_calls) == 1,
                   f"answers={msg.answers} audio={msg.audio_calls}")
@@ -482,14 +500,24 @@ async def main():
             check("W2c video tap answers the identify tap at once",
                   any("در حال شناسایی" in a[0] for a in cb.answered),
                   f"answered={cb.answered}")
-            check("W2c video message gains the wrong-song row, keeps identify",
-                  bool(msg.markup_edits)
-                  and _kb_callbacks(msg.markup_edits[-1]) == [f"vid:id:{token}",
-                                                             f"wrong:{token}"],
-                  f"edits={[_kb_callbacks(k) for k in msg.markup_edits]}")
+            check("W2c video keyboard is CLEARED first (no buttons during identification)",
+                  msg.markup_edits
+                  and _kb_texts(msg.markup_edits[0]) == [],
+                  f"edits={[_kb_texts(k) for k in msg.markup_edits]}")
+            _last = msg.markup_edits[-1]
+            check("W2c video message gains [Google, YouTube] + report row after the result",
+                  _kb_texts(_last) == [_GOOGLE_FA, _YT_FA, _REPORT_FA]
+                  and f"wrong:{token}" in _kb_callbacks(_last)
+                  and _kb_urls(_last)[0].startswith("https://www.google.com/search?q=")
+                  and _kb_urls(_last)[1].startswith("https://www.youtube.com/results?search_query="),
+                  f"edits={[_kb_texts(k) for k in msg.markup_edits]}")
+            check("W2c video keyboard records the shown result on the entry",
+                  h._VIDEO_IDENTIFY.get(token, {}).get("last_title") == _WRONG_TITLE
+                  and h._VIDEO_IDENTIFY.get(token, {}).get("last_source") == "shazam+audd",
+                  f"entry={h._VIDEO_IDENTIFY.get(token)}")
             _akw = msg.audio_kwargs[0] if msg.audio_kwargs else {}
-            check("W2c final audio for the same video carries the same wrong token",
-                  f"wrong:{token}" in _kb_callbacks(_akw.get("reply_markup")),
+            check("W2c final audio for the same video carries NO wrong-song button",
+                  f"wrong:{token}" not in _kb_callbacks(_akw.get("reply_markup")),
                   f"audio_callbacks={_kb_callbacks(_akw.get('reply_markup'))}")
             check("W2c temp status is deleted once the final audio is out",
                   msg.sent_messages and msg.sent_messages[0].deleted,
@@ -582,9 +610,16 @@ async def main():
                   and entry.get("attempts") == 1
                   and entry.get("wrong") == [(_WRONG_TITLE, _WRONG_ARTIST)],
                   f"entry={entry}")
-            check("W3a final audio carries the wrong-song button (same token)",
-                  f"wrong:{token}" in _kb_callbacks(_akw.get("reply_markup")),
+            check("W3a final audio carries NO wrong-song button (it lives under the video)",
+                  f"wrong:{token}" not in _kb_callbacks(_akw.get("reply_markup")),
                   f"callbacks={_kb_callbacks(_akw.get('reply_markup'))}")
+            _vkb = msg.markup_edits[-1] if msg.markup_edits else None
+            check("W3a video keyboard carries the report button (same token) + new-name search links",
+                  _vkb is not None
+                  and f"wrong:{token}" in _kb_callbacks(_vkb)
+                  and _REPORT_FA in _kb_texts(_vkb)
+                  and _NEW_TITLE.replace(" ", "+") in "".join(_kb_urls(_vkb)),
+                  f"video_kb_texts={_kb_texts(_vkb) if _vkb else None} urls={_kb_urls(_vkb) if _vkb else None}")
             rows = await _rows_with("different_confirmed")
             check("W3a Turso report row: wrong result + source + outcome",
                   any(r[2] == _WRONG_TITLE and r[3] == _WRONG_ARTIST
@@ -617,10 +652,16 @@ async def main():
         check("W3b no «شناسایی شد» card for a single-source name",
               not any("شناسایی شد" in a for a in msg.answers),
               f"answers={msg.answers}")
-        check("W3b maybe message keeps the wrong-song button",
+        check("W3b maybe message has the identified buttons, NO wrong-song",
               msg.sent_messages
-              and f"wrong:{token}" in _kb_callbacks(msg.sent_messages[0].edited_kb),
+              and _kb_texts(msg.sent_messages[0].edited_kb) == [_PL_FA, _LYRICS_FA]
+              and len(msg.sent_messages[0].edited_kb.inline_keyboard) == 1
+              and "wrong:" not in "".join(_kb_callbacks(msg.sent_messages[0].edited_kb)),
               f"callbacks={_kb_callbacks(msg.sent_messages[0].edited_kb) if msg.sent_messages else []}")
+        check("W3b video keyboard carries the report button (same token)",
+              msg.markup_edits
+              and f"wrong:{token}" in _kb_callbacks(msg.markup_edits[-1]),
+              f"edits={[_kb_callbacks(k) for k in msg.markup_edits]}")
         check("W3b entry now disputes the maybe name, attempts == 1",
               entry.get("last_title") == _NEW_TITLE
               and entry.get("attempts") == 1,

@@ -1701,6 +1701,11 @@ async def _extract_and_send_clip_audio(message, conn, data: bytes,
         mp3 = conv[0] if conv[0] else None
         if not mp3:
             return None
+        # §6 (2026-11-09): transcode_mp3 already probed the REAL duration
+        # of exactly these bytes — pass it through instead of discarding
+        # it, so the sent audio always carries a real duration even if
+        # the pipeline's re-probe ever fails (never 0:00 / "-:--").
+        _mp3_dur = conv[2] if len(conv) > 2 else None
         ulang = _user_lang(conn, getattr(getattr(message, "from_user", None), "id", None))
         # show_quality=False: the extracted-audio caption is the user's
         # exact text (byte-exact per the 2026-11-09 order) — the unified
@@ -1708,6 +1713,7 @@ async def _extract_and_send_clip_audio(message, conn, data: bytes,
         sent = await send_music(message, mp3, t("m_extracted_audio_title", ulang),
                                 "Avano", caption=caption,
                                 reply_markup=reply_markup,
+                                duration=_mp3_dur,
                                 show_quality=False)
         if sent is not None:
             _track(conn, message, sent)
@@ -1757,29 +1763,29 @@ def _extracted_audio_kb(title: str, artist: str, ulang,
                         file_id: str | None = None,
                         user_id: int | None = None,
                         kind: str = "file"):
-    """The two buttons under an extracted-audio message.
-
-    Google search for the best available name (the confirmed name, else
-    the single-source name; OMITTED when no name exists at all — a
-    query is never invented) + retry identification via the video's
-    EXISTING identify button (vid:id:<token>). Never used on an
-    identified/bank send."""
+    """The buttons under an extracted-audio message (final identify UI,
+    2026-11-09): ONE row — Google search for the best available name
+    (the confirmed name, else the single-source name; OMITTED when no
+    name exists at all — a query is never invented) + retry
+    identification via the video's EXISTING identify button
+    (vid:id:<token>). Never used on an identified/bank send; never
+    playlist/lyrics/wrong-song under an extracted file."""
     import urllib.parse as _up
-    rows = []
+    row = []
     name = f"{(title or '').strip()} {(artist or '').strip()}".strip()
     if name:
-        rows.append([InlineKeyboardButton(
+        row.append(InlineKeyboardButton(
             text=t("m_extracted_google_btn", ulang),
-            url="https://www.google.com/search?q=" + _up.quote_plus(name))])
+            url="https://www.google.com/search?q=" + _up.quote_plus(name)))
     cb = None
     if token:
         cb = f"vid:id:{token}"
     elif file_id and user_id:
         cb = _find_identify_callback(file_id, user_id, kind)
     if cb:
-        rows.append([InlineKeyboardButton(
-            text=t("m_extracted_retry_btn", ulang), callback_data=cb)])
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        row.append(InlineKeyboardButton(
+            text=t("m_extracted_retry_btn", ulang), callback_data=cb))
+    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
 
 
 async def _send_unconfirmed_audio(message, conn, data: bytes,
@@ -1880,35 +1886,35 @@ def _identified_no_full_caption(title: str, artist: str, ulang) -> str:
         title, artist)
 
 
+def _identified_audio_row(key: str, ulang) -> list:
+    """The ONE row under an identified full song (and under a case-(b)
+    clip audio): add-to-playlist + lyrics (& translation), side by
+    side. Callbacks/handlers unchanged (pro:pick: / ly:). No heart,
+    no wrong-song, no Google/YouTube/retry, no library/save button —
+    the wrong-song report lives ONLY under the video (final identify
+    UI, 2026-11-09)."""
+    return [InlineKeyboardButton(
+                text=t("m_id_pl_btn", ulang),
+                callback_data=f"pro:pick:{key}"),
+            InlineKeyboardButton(
+                text=t("m_id_lyrics_btn", ulang),
+                callback_data=f"ly:{key}")]
+
+
 def _identified_song_kb(message, conn, title: str, artist: str,
                         own_media, source: str, ulang):
-    """The identified-song keyboard (unify fix, 2026-11-09).
+    """The identified-song keyboard (final identify UI, 2026-11-09).
 
-    Lyrics + add-to-playlist, with «❌ آهنگ اشتباه» in place of the
-    heart: the favorites feature itself is untouched (its handler and
-    callbacks stay), only this keyboard drops the heart button. The
-    wrong-song button is wired only when the song came from a video /
-    file the user can dispute (own_media) — same token mechanism as
-    batch F. Returns (keyboard, result_key)."""
+    Exactly one row — add-to-playlist + lyrics (& translation) — under
+    the ONE final audio message. The favorites feature itself is
+    untouched (its handler and callbacks stay); only this keyboard
+    carries no heart button, and the wrong-song report is NOT here
+    anymore (it lives under the video message only). ``own_media`` is
+    kept on the stored result so the lyrics/playlist callbacks keep
+    working. Returns (keyboard, result_key)."""
     key = profeat.remember_result(title, artist, "", "", own_media=own_media)
-    is_fav = profeat.is_favorite(conn, message.from_user.id, title, artist)
-    rows = [list(r) for r in profeat.build_song_card_buttons(key, is_fav)]
-    rows = [r for r in rows if not any(
-        (getattr(b, "callback_data", "") or "").startswith("fav:toggle:")
-        for b in r)]
-    if own_media is not None:
-        try:
-            _wrong_cb = _wrong_song_button_data(
-                own_media[1], message.from_user.id,
-                "audio" if own_media[0] == "audio" else "file",
-                title, artist, source)
-        except Exception:
-            _wrong_cb = None
-        if _wrong_cb:
-            rows.insert(0, [InlineKeyboardButton(
-                text=t("m_wrong_song_btn", ulang),
-                callback_data=_wrong_cb)])
-    return InlineKeyboardMarkup(inline_keyboard=rows), key
+    return InlineKeyboardMarkup(
+        inline_keyboard=[_identified_audio_row(key, ulang)]), key
 
 
 def _final_audio_caption(title: str, artist: str, ulang,
@@ -2002,6 +2008,10 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         return
     _VIDEO_IDENTIFY_RUNNING.add(token)
     await callback.answer(t("m_identifying_video", ulang))
+    # FINAL IDENTIFY UI (2026-11-09): the tap clears the video's
+    # keyboard at once — no buttons show while the identification
+    # runs; the result keyboard is set once the result is known.
+    await _clear_video_kb(callback.message)
     # UNIFY FIX (2026-11-09): the temporary «در حال جستجوی موسیقی...»
     # status stays until the ONE final message is sent. The background
     # delivery deletes it (identified path); every other path deletes
@@ -2136,12 +2146,14 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 arm=("video_button", entry["file_id"], data or None,
                      audio_url or "", ""),
                 source=result.source, status_msg=status_msg)
-            # Batch F: the video message keeps its identify button and
-            # gains «❌ آهنگ اشتباه» next to it, so the user can dispute
-            # the shown name. The final audio message carries the same
-            # button (same token).
-            await _edit_video_wrong_song_row(callback.message, token, ulang,
-                                             add=True)
+            # FINAL IDENTIFY UI (2026-11-09): the video now carries
+            # the result keyboard — Google + YouTube row, report row
+            # below it. The final audio message carries only
+            # playlist + lyrics.
+            await _set_video_result_kb(
+                callback.message, result.title, result.artist, ulang,
+                entry["file_id"], callback.from_user.id,
+                entry.get("kind") or "file", result.source)
         elif result.status in ("unconfirmed", "not_found") \
                 or result.detail == "lookup_error":
             # NOT confirmed (single source, disagreement, no match, or
@@ -2152,6 +2164,13 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
             sent = await _send_unconfirmed_audio(
                 callback.message, conn, data, result.title, result.artist,
                 ulang, token=token)
+            # FINAL IDENTIFY UI (2026-11-09): a single-source name is
+            # still a name to review — the video gets the Google +
+            # YouTube + report rows; no name at all -> empty keyboard.
+            await _set_video_result_kb(
+                callback.message, result.title, result.artist, ulang,
+                entry["file_id"], callback.from_user.id,
+                entry.get("kind") or "file", result.source)
             if sent is None:
                 # Extraction impossible: the honest line (existing text).
                 _head = ("m_identify_error"
@@ -2211,7 +2230,7 @@ def _is_rejected(entry: dict, title: str, artist: str) -> bool:
 def _wrong_song_button_data(file_id: str, user_id: int, kind: str,
                             title: str, artist: str,
                             source: str = "") -> str | None:
-    """callback_data for the «❌ آهنگ اشتباه» button: "wrong:<token>"
+    """callback_data for the «⚠️ گزارش شناسایی اشتباه ⚠️» button: "wrong:<token>"
     for the video's EXISTING identify token (minted when none is
     registered, exactly like the retry button). Records the shown
     result on the registry entry so the handler knows the disputed
@@ -2235,29 +2254,72 @@ def _wrong_song_button_data(file_id: str, user_id: int, kind: str,
     return f"wrong:{token}"
 
 
-async def _edit_video_wrong_song_row(message, token: str, ulang: str,
-                                     add: bool) -> None:
-    """Best-effort: add (or remove) the «❌ آهنگ اشتباه» row under a
-    bot-sent video message, keeping the existing identify row. Never
-    raises; a failed edit leaves the markup as it was."""
-    try:
-        kb = getattr(message, "reply_markup", None)
-        rows = [list(r) for r in (getattr(kb, "inline_keyboard", None) or [])]
-        rows = [r for r in rows
-                if not any(getattr(b, "callback_data", "") == f"wrong:{token}"
-                           for b in r)]
-        if not rows:
-            # No keyboard survived (should not happen — the message
-            # always carries its identify button): rebuild both rows.
-            rows = [[InlineKeyboardButton(
-                text=t("m_identify_music_btn", ulang),
-                callback_data=f"vid:id:{token}")]]
-        if add:
+def _video_result_kb(title: str, artist: str, ulang: str,
+                     file_id: str | None, user_id: int | None,
+                     kind: str, source: str = "",
+                     include_report: bool = True) -> InlineKeyboardMarkup:
+    """The keyboard under a bot-sent video AFTER the result is known
+    (final identify UI, 2026-11-09). Row 1: Google + YouTube search
+    for the name, side by side. Row 2: the wrong-song report button,
+    full width (the EXISTING wrong:<token> handler + registry entry
+    from batch F — the report records the shown name/source on the
+    entry, same as before). Google/YouTube appear only when a name
+    exists (a query is never invented); the report button only when a
+    name was produced (confirmed or single-source). No name at all ->
+    an EMPTY keyboard (no buttons under the video)."""
+    import urllib.parse as _up
+    name = f"{(title or '').strip()} {(artist or '').strip()}".strip()
+    if not name:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+    q = _up.quote_plus(name)
+    rows = [[InlineKeyboardButton(
+                 text=t("m_video_google_btn", ulang),
+                 url="https://www.google.com/search?q=" + q),
+             InlineKeyboardButton(
+                 text=t("m_video_youtube_btn", ulang),
+                 url="https://www.youtube.com/results?search_query=" + q)]]
+    if include_report:
+        cb = None
+        if file_id and user_id:
+            try:
+                cb = _wrong_song_button_data(file_id, user_id, kind,
+                                             title, artist, source)
+            except Exception:
+                cb = None
+        if cb:
             rows.append([InlineKeyboardButton(
-                text=t("m_wrong_song_btn", ulang),
-                callback_data=f"wrong:{token}")])
+                text=t("m_video_wrong_btn", ulang), callback_data=cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _set_video_result_kb(message, title: str, artist: str,
+                               ulang: str, file_id: str | None,
+                               user_id: int | None, kind: str,
+                               source: str = "",
+                               include_report: bool = True) -> None:
+    """Best-effort: set a video message's keyboard to the post-result
+    layout (or empty when no name exists). Never raises; a failed edit
+    leaves the markup as it was. NOTE: a USER-sent video's markup
+    cannot be edited at all (Telegram only lets the bot edit its own
+    messages) — the file flow calls this best-effort and the edit
+    silently fails there; the video keyboard is real only for
+    bot-sent videos (link flow / video-button flow)."""
+    try:
         await message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            reply_markup=_video_result_kb(
+                title, artist, ulang, file_id, user_id, kind, source,
+                include_report=include_report))
+    except Exception:
+        pass
+
+
+async def _clear_video_kb(message) -> None:
+    """Best-effort: remove every button under a video message. The
+    identify tap clears the keyboard — nothing shows while the
+    identification runs (scenario 1). Never raises."""
+    try:
+        await message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     except Exception:
         pass
 
@@ -2319,7 +2381,8 @@ def _wrong_song_log_and_store(user_id: int, link: str,
 
 @router.callback_query(F.data.startswith("wrong:"))
 async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
-    """«❌ آهنگ اشتباه» under a sent video or a result card (batch F).
+    """«⚠️ گزارش شناسایی اشتباه ⚠️» under a sent video (final identify
+    UI, 2026-11-09 — the report button lives ONLY under the video).
 
     Re-identifies the CACHED audio of that video — the same bytes the
     original identification used (reel audio URL, else the Telegram
@@ -2358,8 +2421,13 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
     attempts = int(entry.get("attempts") or 0)
     if attempts >= _WRONG_SONG_MAX_ATTEMPTS:
         await callback.answer(t("m_wrong_song_limit", ulang), show_alert=True)
-        await _edit_video_wrong_song_row(callback.message, token, ulang,
-                                         add=False)
+        # FINAL IDENTIFY UI (2026-11-09): the report button goes away
+        # (attempts exhausted); Google + YouTube stay for the name.
+        await _set_video_result_kb(
+            callback.message, wrong_title, wrong_artist, ulang,
+            entry["file_id"], callback.from_user.id,
+            entry.get("kind") or "file", wrong_source,
+            include_report=False)
         _wrong_song_log_and_store(
             callback.from_user.id,
             entry.get("link") or entry.get("audio_url") or "",
@@ -2419,6 +2487,14 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
                 source=result.source, status_msg=status_msg)
             if not _spawned:
                 await _delete_card(status_msg)
+            # FINAL IDENTIFY UI (2026-11-09): the video keyboard
+            # follows the NEW name (its Google/YouTube links change
+            # with it); the final audio carries only playlist +
+            # lyrics.
+            await _set_video_result_kb(
+                callback.message, result.title, result.artist, ulang,
+                entry["file_id"], callback.from_user.id,
+                entry.get("kind") or "file", result.source)
         elif result.status == "unconfirmed" and result.title:
             # A DIFFERENT single-source name: a «شاید...» lead, never a
             # «شناسایی شد» card. Heart/lyrics/playlist stay available;
@@ -2431,18 +2507,16 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
             key = profeat.remember_result(
                 result.title, result.artist, "", "",
                 own_media=(_om_kind, entry["file_id"]))
-            is_fav = profeat.is_favorite(conn, callback.from_user.id,
-                                         result.title, result.artist)
+            # FINAL IDENTIFY UI (2026-11-09): the «شاید...» text keeps
+            # only the name's own buttons (playlist + lyrics, one
+            # row) — no heart, and the report button lives under the
+            # video only.
             kb = InlineKeyboardMarkup(
-                inline_keyboard=profeat.build_song_card_buttons(key, is_fav))
-            _wrong_cb = _wrong_song_button_data(
+                inline_keyboard=[_identified_audio_row(key, ulang)])
+            await _set_video_result_kb(
+                callback.message, result.title, result.artist, ulang,
                 entry["file_id"], callback.from_user.id,
-                entry.get("kind") or "file",
-                result.title, result.artist, result.source)
-            if _wrong_cb:
-                kb.inline_keyboard.append([InlineKeyboardButton(
-                    text=t("m_wrong_song_btn", ulang),
-                    callback_data=_wrong_cb)])
+                entry.get("kind") or "file", result.source)
             maybe_text = t("m_wrong_song_maybe", ulang).format(
                 title=result.title, artist=result.artist)
             if status_msg is not None:
@@ -3519,6 +3593,14 @@ async def _answer_link_identify_result(message, conn, config, outcome,
             status_msg=status_msg)
         if not _spawned:
             await _delete_card(status_msg)
+        # FINAL IDENTIFY UI (2026-11-09): the delivered video carries
+        # the result keyboard (Google + YouTube + report); the final
+        # audio carries only playlist + lyrics. Best-effort: a
+        # missing video message simply skips the edit.
+        if video_msg is not None and _own is not None:
+            await _set_video_result_kb(
+                video_msg, title, artist, ulang, _own[1],
+                message.from_user.id, "link")
     elif needs_file:
         _tok = await _arm_bank_sample(conn, config, "link", outcome.official_url,
                                       heard or None, media_hint, page_text)
@@ -3580,6 +3662,12 @@ async def _answer_link_identify_result(message, conn, config, outcome,
                          else "link_stage_not_found")
             await _answer(message, conn, t(_text_key, ulang),
                           reply_markup=_kb)
+        # FINAL IDENTIFY UI (2026-11-09): the video keyboard follows
+        # the name (or stays empty when nothing was produced).
+        if video_msg is not None:
+            await _set_video_result_kb(
+                video_msg, title, artist, ulang, _vid_fid,
+                message.from_user.id, "link")
         await _run_link_channel_stage(message, conn, config, page_text)
 
 
@@ -3893,8 +3981,9 @@ async def _send_professional_song_card(message, conn, title: str, artist: str, b
     once the file (or the clip-audio fallback) is ready. The
     temporary status message (sent by the entry point) stays until
     that final send deletes it. The keyboard is the identified-song
-    set (lyrics + playlist, wrong-song in place of the heart — the
-    favorites feature itself is untouched). Everything else runs in
+    set (playlist + lyrics, one row — the favorites feature itself is
+    untouched; the wrong-song report lives under the video only).
+    Everything else runs in
     the background after this call returns
     (_after_card_delivery): the sample arming, the exclusive-bank
     file (which IS the full version for a bank song), the catalog
@@ -4465,8 +4554,14 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                             message, file_id,
                             caption=t("m_identified_no_audio_resend", ulang))
                 elif kind == "voice":
-                    sent = await message.answer_voice(file_id, caption=cap,
-                                                      reply_markup=kb)
+                    # §6 (2026-11-09): a voice message re-sent as voice
+                    # renders as a small voice bubble, not an audio
+                    # card — the same file goes out as a proper AUDIO
+                    # message (title/performer, real stored duration),
+                    # exactly like the audio kind below.
+                    sent = await send_song_audio(
+                        message, file_id, title, artist, caption=cap,
+                        reply_markup=kb)
                 else:
                     sent = await send_song_audio(
                         message, file_id, title, artist, caption=cap,
@@ -5704,6 +5799,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
             media_kind=media_kind,
             file_id=media.file_id if media is not None else None,
             user_id=message.from_user.id)
+        # FINAL IDENTIFY UI (2026-11-09): best-effort video keyboard
+        # (a user-sent video's markup cannot be edited — the edit
+        # silently fails there; see _set_video_result_kb).
+        await _set_video_result_kb(
+            message, result.title, result.artist, ulang,
+            media.file_id if media is not None else None,
+            message.from_user.id, media_kind, result.source)
         if sent is None:
             # Extraction impossible: the honest line, with the same
             # Google/retry buttons (no bank button).
@@ -5739,6 +5841,10 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
                 file_id=media.file_id if media is not None else None,
                 user_id=message.from_user.id)
             if sent is not None:
+                await _set_video_result_kb(
+                    message, result.title, result.artist, ulang,
+                    media.file_id if media is not None else None,
+                    message.from_user.id, media_kind, result.source)
                 return
         # Distinct honest cause for video inputs (user order 2026-11-07):
         # the generic "audio_error" line must never hide the real cause.
@@ -5767,6 +5873,13 @@ async def media_handler(message: Message, conn: sqlite3.Connection, config: Conf
         source=result.source, status_msg=status_msg)
     if not _spawned:
         await _delete_card(status_msg)
+    # FINAL IDENTIFY UI (2026-11-09): best-effort video keyboard (a
+    # user-sent video's markup cannot be edited — the edit silently
+    # fails there; see _set_video_result_kb).
+    await _set_video_result_kb(
+        message, result.title, result.artist, ulang,
+        media.file_id if media is not None else None,
+        message.from_user.id, media_kind, result.source)
 
 
 
@@ -6130,11 +6243,12 @@ async def _download_full_bg(callback, conn, config, title, artist, result):
                 # card is deleted. (No button creates dl:full callbacks
                 # today, so this path is unreachable in production; the
                 # replacement is implemented for consistency.)
+                # FINAL IDENTIFY UI (2026-11-09): the full song carries
+                # exactly one row — playlist + lyrics. No heart, no
+                # wrong-song, no other buttons.
                 _key = callback.data[8:]
-                _is_fav = profeat.is_favorite(conn, callback.from_user.id,
-                                              title, artist)
                 _dl_kb = InlineKeyboardMarkup(inline_keyboard=
-                    profeat.build_song_card_buttons(_key, _is_fav))
+                    [_identified_audio_row(_key, ulang)])
                 sent = await callback.message.answer_audio(
                     BufferedInputFile(full["data"], filename=f"{title}.{full['ext']}"),
                     title=title, performer=artist,

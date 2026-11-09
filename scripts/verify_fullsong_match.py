@@ -172,11 +172,13 @@ def _full_dict(data, source, url=None, size=None, duration_sec=0.0):
 
 
 # The EXACT new extracted-audio caption from the user order
-# (2026-11-09 01:17), typed here independently of i18n.py so the test
-# proves byte equality. (The 00:12 corporate text is superseded.)
+# (2026-11-09 01:17, middle line removed by the 2026-11-09 14:54
+# final identify-UI order), typed here independently of i18n.py so
+# the test proves byte equality. (The 00:12 corporate text is
+# superseded.)
 _NEW_EXACT = ("🎵 نسخه رسمی این آهنگ در منابع موسیقی پیدا نشد؛ اما آوانو "
               "صدای آن را مستقیماً از همین کلیپ استخراج کرده تا چیزی از "
-              "دست ندهید. 💜\n\n🎧 صدای کلیپ، آماده شنیدن!\n\n"
+              "دست ندهید. 💜\n\n"
               "AVANO AI | همیشه یک راه برای شنیدن موسیقی هست!")
 
 

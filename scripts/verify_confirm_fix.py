@@ -78,7 +78,7 @@ _TITLE = "Test Song"
 _ARTIST = "Test Artist"
 _NEW_FA = vm._NEW_FA
 _GOOGLE_FA = "🌐 جستجوی این صدا در گوگل"
-_RETRY_FA = "🎧 تلاش مجدد برای شناسایی آهنگ"
+_RETRY_FA = "🔄 شناسایی مجدد"
 
 
 class _CardSent(vs._FakeSent):
@@ -332,8 +332,9 @@ async def main():
         check("C1g extracted audio carries the new caption",
               kw.get("caption", "") == _NEW_FA, f"caption={kw.get('caption')!r}")
         _texts = _kb_texts(kw.get("reply_markup"))
-        check("C1g extracted audio has BOTH new buttons",
-              _GOOGLE_FA in _texts and _RETRY_FA in _texts,
+        check("C1g extracted audio has BOTH new buttons, in ONE row",
+              _GOOGLE_FA in _texts and _RETRY_FA in _texts
+              and len(kw.get("reply_markup").inline_keyboard) == 1,
               f"buttons={_texts}")
         check("C1g retry button reuses the video's existing token",
               f"vid:id:{token}" in _kb_callbacks(kw.get("reply_markup")),
@@ -393,9 +394,11 @@ async def main():
               _TITLE in cap and _ARTIST in cap and "شناسایی شد" in cap
               and "0:05" in cap, f"caption={cap!r}")
         _btns = _kb_texts(msg.audio_kwargs[0].get("reply_markup")) if msg.audio_kwargs else []
-        check("C2 final audio has the identified buttons (lyrics/playlist, no heart)",
-              "📝 متن آهنگ" in _btns and "🎶 افزودن به پلی‌لیست" in _btns
-              and not any("❤️" in b for b in _btns),
+        check("C2 final audio has exactly the 2 identified buttons (playlist/lyrics), one row, no heart, no wrong-song",
+              _btns == ["🎵 افزودن به پلی‌لیست", "📝 متن آهنگ و ترجمه"]
+              and len(msg.audio_kwargs[0].get("reply_markup").inline_keyboard) == 1
+              and not any("❤️" in b for b in _btns)
+              and "wrong:" not in "".join(_kb_callbacks(msg.audio_kwargs[0].get("reply_markup"))),
               f"buttons={_btns}")
         check("C2 final audio has NEITHER new button",
               msg.audio_kwargs
