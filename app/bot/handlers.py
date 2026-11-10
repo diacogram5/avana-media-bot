@@ -2442,9 +2442,10 @@ async def _set_video_result_kb_if_video(message, title: str, artist: str,
 # not-found after ZERO work (fix round 2 early return). The user
 # orders real work first: re-identify the extracted clip from
 # DIFFERENT audio windows, so Stage 0 cannot return the stored
-# result for the original bytes. One attempt per tap, ~30 s budget.
-_Q4_SLICE_TIMEOUT_SEC = 15.0
-_Q4_TOTAL_BUDGET_SEC = 30.0
+# result for the original bytes. One attempt per tap, ~40 s budget
+# (fix round 4: was ~30 s).
+_Q4_SLICE_TIMEOUT_SEC = 20.0
+_Q4_TOTAL_BUDGET_SEC = 40.0
 _Q4_CLIP_MAX_BYTES = 10 * 1024 * 1024
 
 
@@ -2549,13 +2550,20 @@ async def _supplementary_identify(callback, entry, hit, config, conn,
     10 s window. Different slices => different content hashes, so
     Stage 0 cannot return the stored result for the original bytes;
     cache_url_key is never passed for the same reason. One attempt
-    per tap, ~30 s total budget, 15 s per slice; never spawns or
-    awaits the bg job. Returns the first CONFIRMED result, else the
-    best (unconfirmed / not_found / error) result seen, else None
-    when no clip bytes could be loaded. Never raises.
+    per tap, ~40 s total budget, 20 s per slice; never spawns or
+    awaits the bg job. The slices are identified with the Q4 fast
+    path (q4_fast=True: single Shazam window, Shazam-first with
+    AudD only on a Shazam candidate, slice WAV reused). Returns the
+    first CONFIRMED result, else the best (unconfirmed / not_found /
+    error) result seen, else None when no clip bytes could be loaded.
+    Never raises.
     """
     _rid = req_id or _timing.new_req_id()
     _t0 = _time.perf_counter()
+    # Fix round 4: the deadline starts at function entry, so the
+    # clip load + decode count toward the budget (they used to run
+    # before the deadline was set).
+    _deadline = _time.monotonic() + _Q4_TOTAL_BUDGET_SEC
     try:
         data = await _supplementary_clip_bytes(callback, hit)
     except Exception:
@@ -2598,7 +2606,6 @@ async def _supplementary_identify(callback, entry, hit, config, conn,
     if not _slices:
         return AudioIdResult(status="error", detail="slice_failed")
     _best = None
-    _deadline = _time.monotonic() + _Q4_TOTAL_BUDGET_SEC
     _seen_hashes = set()
     for _name, _sl in _slices:
         _h = _hashlib.sha256(_sl).hexdigest()
@@ -2609,11 +2616,18 @@ async def _supplementary_identify(callback, entry, hit, config, conn,
         if _remaining <= 0:
             break
         _t_sl = _time.perf_counter()
+        # Fix round 4: the slice WAV is already decoded — pass it
+        # through (q4_fast) instead of re-transcoding — and hand
+        # _identify_audio a one-element stage tracker so a timeout
+        # logs the stage in flight, not just a bare abandon.
+        _stage_in_flight = [""]
         try:
             _res = await asyncio.wait_for(
                 _identify_audio(_sl, "clip.wav", config, conn,
                                 req_id=_rid, t_req=t_req,
-                                exclude=entry.get("wrong") or None),
+                                exclude=entry.get("wrong") or None,
+                                q4_fast=True, predecoded_wav=_sl,
+                                stage_tracker=_stage_in_flight),
                 timeout=min(_Q4_SLICE_TIMEOUT_SEC, _remaining))
         except asyncio.TimeoutError:
             _res = AudioIdResult(status="error", detail="slice_timeout")
@@ -2625,6 +2639,8 @@ async def _supplementary_identify(callback, entry, hit, config, conn,
                               slice=_name, status=_res.status,
                               title=_res.title or "",
                               artist=_res.artist or "",
+                              detail=_res.detail or "",
+                              stage_in_flight=_stage_in_flight[0] or "",
                               ms=int((_time.perf_counter() - _t_sl) * 1000))
         except Exception:
             pass
@@ -2739,6 +2755,83 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 if _hit is not None:
                     _identify_result_put(_cache_key, _hit)
         _failed_fid = ""
+        # FIX ROUND 4 — Q4 hoisted (2026-11-11): the round-3 block
+        # below used to run ONLY on an audio-message retry tap, so a
+        # video-message tap on the same unconfirmed clip re-sent the
+        # clip, and a tap that awaited the bg job never got a Q4
+        # attempt at all. _run_q4_once runs the supplementary
+        # identify ONCE per tap on any unconfirmed/not_found clip
+        # hit, from any of the three call sites (A: audio retry,
+        # B: cache-hit send, C: after the bg wait). It never sends
+        # audio and never touches the video keyboard; the confirm
+        # path (rebuild the 1b entry, forget the smart negative) is
+        # exactly the round-3 code.
+        _q4_ran = False
+
+        async def _run_q4_once(hit):
+            """Run Q4 once per tap on `hit`. Returns (confirmed,
+            updated hit): (True, new entry) when a slice CONFIRMS
+            the song, else (False, None). A non-identified result
+            only logs (the caller answers honestly). Guard-refused
+            hits — and no-bytes attempts, where _supplementary_
+            identify returns None without attempting anything —
+            return without setting _q4_ran, so the caller falls
+            through to its normal send. Never raises."""
+            nonlocal _q4_ran
+            if _q4_ran:
+                return False, None
+            if hit is None:
+                return False, None
+            if (hit.get("kind") or "clip") != "clip":
+                return False, None
+            if hit.get("status") == "identified":
+                return False, None
+            if _is_rejected(entry, hit.get("title", ""),
+                            hit.get("artist", "")):
+                return False, None
+            _q4 = await _supplementary_identify(
+                callback, entry, hit, config, conn,
+                req_id=_req_id, t_req=_t_req)
+            if _q4 is not None:
+                # A verdict (identified / unconfirmed / not_found /
+                # error) means Q4 really attempted identification.
+                # None means no clip bytes could be loaded at all —
+                # Q4 never ran, so _q4_ran stays False and the
+                # caller falls through to its normal send instead
+                # of answering not-found for a clip it could send.
+                _q4_ran = True
+            if (_q4 is not None and _q4.status == "identified"
+                    and (_q4.title or "").strip()
+                    and not _is_rejected(entry, _q4.title, _q4.artist)):
+                _upd = _identify_result_entry(
+                    "identified", _q4.title, _q4.artist,
+                    source=_q4.source or "shazam+audd", kind="clip",
+                    file_id=hit.get("file_id") or "",
+                    disk_path=hit.get("disk_path") or "",
+                    duration_sec=hit.get("duration_sec") or 0,
+                    resolve_ms=hit.get("resolve_ms") or 0)
+                _identify_result_store(_cache_key, _upd, req_id=_req_id)
+                # A stale smart negative for this song must not block
+                # the fresh confirmed search below.
+                try:
+                    from ..search.smart_fullsong import (
+                        forget_negative as _forget_neg)
+                    _forget_neg(_q4.artist, _q4.title)
+                except Exception:
+                    pass
+                return True, _upd
+            if _q4 is not None:
+                # Still not confirmed: the per-slice lines above plus
+                # the detail here carry the cause (fix round 4: the
+                # old comment claimed the per-slice lines carried
+                # it, but they dropped _res.detail until this round).
+                _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                                  "supplementary_identify", _t_req,
+                                  status=_q4.status,
+                                  title=_q4.title or "",
+                                  artist=_q4.artist or "",
+                                  detail=_q4.detail or "")
+            return False, None
         # FIX ROUND 3 — Q4 supplementary identify (2026-11-10, user
         # order 09:55): a retry tap on a NON-ELIGIBLE clip hit must
         # do REAL work before any not-found — the fix-round-2 early
@@ -2751,6 +2844,8 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
         # identified, clip file kept) and the smart branch below
         # runs on the updated hit; otherwise the cause is logged
         # and the early return below shows the honest not-found.
+        # FIX ROUND 4: this block is now _run_q4_once above, with
+        # two more call sites (cache-hit send, after the bg wait).
         if (callback.message is not None
                 and getattr(callback.message, "audio", None) is not None
                 and _hit is not None
@@ -2758,37 +2853,13 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 and not _smart_search_eligible(callback, entry, _hit)
                 and not _is_rejected(entry, _hit.get("title", ""),
                                      _hit.get("artist", ""))):
-            _q4 = await _supplementary_identify(
-                callback, entry, _hit, config, conn,
-                req_id=_req_id, t_req=_t_req)
-            if (_q4 is not None and _q4.status == "identified"
-                    and (_q4.title or "").strip()
-                    and not _is_rejected(entry, _q4.title, _q4.artist)):
-                _upd = _identify_result_entry(
-                    "identified", _q4.title, _q4.artist,
-                    source=_q4.source or "shazam+audd", kind="clip",
-                    file_id=_hit.get("file_id") or "",
-                    disk_path=_hit.get("disk_path") or "",
-                    duration_sec=_hit.get("duration_sec") or 0,
-                    resolve_ms=_hit.get("resolve_ms") or 0)
-                _identify_result_store(_cache_key, _upd, req_id=_req_id)
-                _hit = _upd
-                # A stale smart negative for this song must not block
-                # the fresh confirmed search below.
-                try:
-                    from ..search.smart_fullsong import (
-                        forget_negative as _forget_neg)
-                    _forget_neg(_q4.artist, _q4.title)
-                except Exception:
-                    pass
-            elif _q4 is not None:
-                # Still not confirmed: the per-slice lines above carry
-                # the cause; the early return below answers honestly.
-                _timing.log_stage(log, "identify_stage", _req_id, _t_req,
-                                  "supplementary_identify", _t_req,
-                                  status=_q4.status,
-                                  title=_q4.title or "",
-                                  artist=_q4.artist or "")
+            # Call site A (unchanged): the audio-message retry path.
+            # On CONFIRM the smart branch below runs on the updated
+            # hit; otherwise the cause is logged and the early
+            # return below answers honestly.
+            _q4_ok, _q4_upd = await _run_q4_once(_hit)
+            if _q4_ok and _q4_upd is not None:
+                _hit = _q4_upd
         # SMART SEARCH (2026-11-09, free-only): the retry button under
         # an extracted audio message, with a cached clip result and a
         # known title, runs the smart full-version search INSTEAD of
@@ -2892,6 +2963,61 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 # stored_resolve_ms on the total line below.
                 _search_file_ms = 0
                 _stored_resolve_ms = int(_hit.get("resolve_ms") or 0)
+                # FIX ROUND 4 — Q4 on a cache-hit VIDEO tap (call
+                # site B): site A above only recognises audio
+                # messages, so a video tap on the same unconfirmed
+                # clip fell through here and re-sent the clip audio
+                # that is already on screen. A file_id hit means
+                # the clip IS already on screen (the first send
+                # stores the file_id; a staged disk file is sent
+                # only when never sent yet), so run Q4 first. On
+                # CONFIRM _hit is updated and the send below
+                # handles it (now identified); on failure answer
+                # the honest not-found text, reusing the
+                # fix-round-2 early-return body, instead of
+                # re-sending the clip. The `audio is not None`
+                # conjunct is dropped FOR THIS CALL SITE ONLY: an
+                # audio tap can never reach here with a Q4-able hit
+                # (site A + the early return catch it first).
+                if ((_hit.get("kind") or "clip") == "clip"
+                        and (_hit.get("status") or "") != "identified"
+                        and not _q4_ran
+                        and (_hit.get("file_id") or "")):
+                    _q4_ok, _q4_upd = await _run_q4_once(_hit)
+                    if _q4_ok and _q4_upd is not None:
+                        _hit = _q4_upd
+                        result = AudioIdResult(
+                            status="identified",
+                            title=_hit.get("title", ""),
+                            artist=_hit.get("artist", ""),
+                            confirmed=True,
+                            source=_hit.get("source") or "cache")
+                    elif _q4_ran:
+                        result = AudioIdResult(
+                            status=_hit.get("status") or "not_found",
+                            title=_hit.get("title", ""),
+                            artist=_hit.get("artist", ""),
+                            confirmed=False,
+                            source=_hit.get("source") or "cache")
+                        try:
+                            await callback.message.answer(
+                                t("m_identify_head_notfound", ulang))
+                        except Exception:
+                            pass
+                        try:
+                            _kb = _extracted_audio_kb(
+                                result.title, result.artist, ulang,
+                                token=token)
+                            if _kb is not None:
+                                await callback.message.edit_reply_markup(
+                                    reply_markup=_kb)
+                        except Exception:
+                            pass
+                        _timing.log_stage(log, "identify_stage", _req_id,
+                                          _t_req, "result_send", _t_req,
+                                          status=result.status)
+                        _log_identify_timing()
+                        return
                 _t_send = _time.perf_counter()
                 sent = await _send_identify_cache_hit(
                     callback.message, conn, _hit, token, entry, ulang,
@@ -3027,6 +3153,85 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 # file_id the caches re-served): no third attempt —
                 # the honest message below is the answer.
                 result = None
+        # FIX ROUND 4 — Q4 after the bg wait (call site C): a tap
+        # that awaited the bg job to an unconfirmed/not_found clip
+        # never got a Q4 attempt — at tap time there was no entry
+        # to run it on. Run it once here on the freshest entry
+        # (_bg_entry preferred; its staged disk_path). On CONFIRM
+        # route to the smart search if eligible, else the cache-hit
+        # send; on failure fall through to the BG FAILURE message
+        # below unchanged. (This is NOT the during-wait handoff —
+        # that stays stage 3: the tap holds no clip bytes mid-wait.)
+        if not _q4_ran:
+            _known_q4 = _bg_entry if _bg_entry is not None else _hit
+            if (_known_q4 is not None
+                    and (_known_q4.get("kind") or "clip") == "clip"
+                    and (_known_q4.get("status") or "") != "identified"
+                    and not _is_rejected(entry, _known_q4.get("title", ""),
+                                         _known_q4.get("artist", ""))):
+                _q4_ok, _q4_upd = await _run_q4_once(_known_q4)
+                if _q4_ok and _q4_upd is not None:
+                    _hit = _q4_upd
+                    _bg_entry = _q4_upd
+                    if _smart_search_eligible(callback, entry, _hit) \
+                            and not _is_rejected(
+                                entry, _hit.get("title", ""),
+                                _hit.get("artist", "")):
+                        try:
+                            if status_msg is not None:
+                                await status_msg.edit_text(
+                                    t("m_smart_searching", ulang))
+                        except Exception:
+                            try:
+                                await _delete_card(status_msg)
+                                status_msg = await callback.message.answer(
+                                    t("m_smart_searching", ulang))
+                            except Exception:
+                                pass
+                        _t_smart = _time.perf_counter()
+                        _smart_status = await _run_smart_search_tap(
+                            callback, conn, entry, _hit, _cache_key, token,
+                            ulang, req_id=_req_id)
+                        if _smart_status:
+                            result = AudioIdResult(
+                                status=_smart_status,
+                                title=_hit.get("title", ""),
+                                artist=_hit.get("artist", ""),
+                                confirmed=_hit.get("status") == "identified",
+                                source=_hit.get("source") or "smart")
+                        _send_ms = int((_time.perf_counter() - _t_smart) * 1000)
+                        _log_identify_timing()
+                        _timing.log_stage(log, "identify_stage", _req_id,
+                                          _t_req, "result_send", _t_req,
+                                          status="smart_search")
+                        return
+                    result = AudioIdResult(
+                        status=_hit.get("status") or "identified",
+                        title=_hit.get("title", ""),
+                        artist=_hit.get("artist", ""),
+                        confirmed=_hit.get("status") == "identified",
+                        source=_hit.get("source") or "cache")
+                    _search_file_ms = int(_hit.get("resolve_ms") or 0)
+                    _t_send = _time.perf_counter()
+                    sent = await _send_identify_cache_hit(
+                        callback.message, conn, _hit, token, entry, ulang,
+                        _cache_key, req_id=_req_id)
+                    _send_ms = int((_time.perf_counter() - _t_send) * 1000)
+                    if sent is not None:
+                        await _set_video_result_kb_if_video(
+                            callback.message, result.title, result.artist,
+                            ulang, entry["file_id"], callback.from_user.id,
+                            entry.get("kind") or "file", result.source)
+                        _timing.log_stage(log, "identify_stage", _req_id,
+                                          _t_req, "name_sent", _t_req,
+                                          cache_hit=False, via="shortcode",
+                                          kind=_hit.get("kind") or "clip")
+                        _log_identify_timing()
+                        _timing.log_stage(log, "identify_stage", _req_id,
+                                          _t_req, "result_send", _t_req,
+                                          status=result.status)
+                        return
+                    result = None
         # BG FAILURE (or no job could be spawned): the honest message
         # (existing text) — never a fresh download+identify. A known
         # name still reaches the user on the video keyboard (Google +
@@ -3497,7 +3702,10 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                         conn=None, cache_url_key: str | None = None,
                         req_id: str | None = None, t_req=None,
                         exclude: list | None = None,
-                        skip_bank: bool = False) -> AudioIdResult:
+                        skip_bank: bool = False,
+                        q4_fast: bool = False,
+                        predecoded_wav: bytes | None = None,
+                        stage_tracker: list | None = None) -> AudioIdResult:
     """Shazam and AudD run IN PARALLEL; a name counts as identified
     only when TWO sources agree (confirm fix 2026-11-09).
 
@@ -3513,6 +3721,17 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     result came from it, so the re-check consults only Shazam/AudD/
     ACRCloud. With both unset the behavior is byte-identical to
     before (all existing paths call without them).
+
+    ``q4_fast`` (fix round 4, ONLY from _supplementary_identify):
+    the input is already one decoded WAV slice, so Stage 1 reuses
+    ``predecoded_wav`` instead of re-transcoding, only ONE Shazam
+    window runs (the slice itself), and AudD runs only when Shazam
+    identified a candidate — the two-source gate needs Shazam
+    identified anyway, so AudD alone can never confirm here. The
+    exclusive bank and Stage 0 behave exactly as in the normal
+    path, and the confirmation gate is unchanged. ``stage_tracker``
+    is an optional one-element list the caller reads when a slice
+    times out, so the abandon reason names the stage in flight.
 
     Pipeline stages (each logged with timing; errors carry their stage):
       0. identify cache — sha256 of the input bytes is looked up first;
@@ -3555,6 +3774,18 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         req_id = _timing.new_req_id()
     if t_req is None:
         t_req = _time.perf_counter()
+    # Fix round 4: current-stage tracker for Q4 timeout diagnosis.
+    # _supplementary_identify passes a one-element list and reads it
+    # when a slice times out, so the log names the stage in flight
+    # ("validate" / "exclusive_bank" / "shazam_window:1" / "audd" /
+    # "acrcloud"). Any other caller gets a private throwaway list.
+    # CancelledError is never swallowed below: it inherits
+    # BaseException (3.8+), so the `except Exception` blocks in
+    # _run_shazam_windows / _run_audd cannot catch it.
+    if isinstance(stage_tracker, list) and stage_tracker:
+        _stage_in_flight = stage_tracker
+    else:
+        _stage_in_flight = [""]
 
     def _st(stage, t_stage, **extra):
         _timing.log_stage(log, "identify_stage", req_id, t_req, stage,
@@ -3634,18 +3865,28 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
 
     # Stage 1: validation gate (keeps the signable WAV for the lookup).
     t0 = _time.perf_counter()
-    try:
-        # Sync ffmpeg transcode + pure-Python WAV analysis run in the
-        # default executor so identification never blocks the event
-        # loop (same pattern as the fpcalc call below).
-        import functools as _functools
-        analysis, wav = await asyncio.get_running_loop().run_in_executor(
-            None, _functools.partial(analyze_audio_with_wav, data,
-                                     req_id=req_id))
-    except Exception as exc:
-        _st("validate", t_req, ok=False,
-            reason=f"analyze_crashed:{type(exc).__name__}")
-        return AudioIdResult(status="error", detail="undecodable")
+    _stage_in_flight[0] = "validate"
+    if q4_fast and predecoded_wav is not None:
+        # Fix round 4 (Q4 fast path): the slice WAV was already
+        # decoded by _supplementary_identify — reuse it instead of
+        # re-transcoding the same bytes a second time. The analysis
+        # is recomputed from the WAV (pure Python, no ffmpeg).
+        from ..services.shazam_id import _analyze_wav as _q4_analyze_wav
+        analysis = _q4_analyze_wav(predecoded_wav)
+        wav = predecoded_wav
+    else:
+        try:
+            # Sync ffmpeg transcode + pure-Python WAV analysis run in the
+            # default executor so identification never blocks the event
+            # loop (same pattern as the fpcalc call below).
+            import functools as _functools
+            analysis, wav = await asyncio.get_running_loop().run_in_executor(
+                None, _functools.partial(analyze_audio_with_wav, data,
+                                         req_id=req_id))
+        except Exception as exc:
+            _st("validate", t_req, ok=False,
+                reason=f"analyze_crashed:{type(exc).__name__}")
+            return AudioIdResult(status="error", detail="undecodable")
     _st("validate", t0, wav_reused=wav is not None, **analysis)
     if not analysis.get("ok"):
         reason = analysis.get("reason", "undecodable")
@@ -3713,6 +3954,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # it to the exclusive file via _exclusive_song_for. Any bank error
     # fails OPEN: the Shazam -> AudD -> ACRCloud chain runs untouched.
     # `bank_only` (cached not_found) skips that chain after the bank check.
+    _stage_in_flight[0] = "exclusive_bank"
     if skip_bank:
         # Wrong-song re-check: the bank IS the disputed source, so the
         # re-check consults only the unused sources (Shazam/AudD/
@@ -3792,7 +4034,11 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # transcode of the same bytes. Windows are PCM time-slices because
     # slicing raw container bytes breaks the container.
     windows: list = [(data, wav)]
-    if wav is not None and len(data) > 200_000:
+    if q4_fast:
+        # Fix round 4 (Q4 fast path): the slice IS already one
+        # window — the 1/3 and 2/3 re-slices are skipped.
+        pass
+    elif wav is not None and len(data) > 200_000:
         for frac in (1 / 3, 2 / 3):
             sl = wav_time_slice(wav, frac, 1.0)
             if sl is not None:
@@ -3823,6 +4069,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     async def _run_shazam_windows():
         _shazam = None
         for i, (probe, prepared) in enumerate(windows):
+            _stage_in_flight[0] = f"shazam_window:{i + 1}"
             t0 = _time.perf_counter()
             try:
                 candidate = await identify_bytes_shazam(probe,
@@ -3851,6 +4098,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     async def _run_audd():
         if not config.audd_token:
             return None
+        _stage_in_flight[0] = "audd"
         t0 = _time.perf_counter()
         try:
             audd = await identify_bytes(data, filename, config.audd_token)
@@ -3871,7 +4119,19 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
             return None
 
     _t_shazam = _time.perf_counter()
-    shazam, audd = await asyncio.gather(_run_shazam_windows(), _run_audd())
+    if q4_fast:
+        # Fix round 4 (Q4 fast path): Shazam FIRST; AudD runs only
+        # when Shazam identified a candidate — the two-source gate
+        # needs Shazam identified anyway, so AudD alone can never
+        # confirm here. This drops the gather-waits-for-slower
+        # penalty and the AudD upload on the common not-found path.
+        # The gate below is unchanged.
+        shazam = await _run_shazam_windows()
+        audd = None
+        if shazam is not None and shazam.status == "identified":
+            audd = await _run_audd()
+    else:
+        shazam, audd = await asyncio.gather(_run_shazam_windows(), _run_audd())
     _st("api_shazam", _t_shazam,
         status=shazam.status if shazam is not None else "none",
         windows=len(windows))
@@ -3886,6 +4146,7 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
             and (audd is None or audd.status != "identified") \
             and config.acrcloud_host and config.acrcloud_key \
             and config.acrcloud_secret:
+        _stage_in_flight[0] = "acrcloud"
         t0 = _time.perf_counter()
         try:
             acr = await identify_acrcloud(

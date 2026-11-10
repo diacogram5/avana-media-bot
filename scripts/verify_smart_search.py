@@ -120,6 +120,14 @@ Cases:
       timeout (tap finishes fast); (e) _loudest_wav_window picks
       the loudest 10 s span; (f) Q-C: _identify_audio logs each
       provider's title/artist on lookup_response lines.
+  T32 (fix round 4 — Q4 hoisted + cheapened, live cb7df25a):
+      (a) Q4 runs on a cache-hit VIDEO tap (unconfirmed clip with
+      file_id) instead of re-sending the clip audio; (b) Q4 runs
+      after a bg-wait completes with an unconfirmed clip, before
+      the honest message; (c) a slice exceeding its budget logs
+      detail=slice_timeout + stage_in_flight and the retry still
+      shows the honest status; (d) Q4 confirming after a bg wait
+      triggers the smart search (both v1 sources queried).
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -1332,10 +1340,12 @@ async def main() -> int:
 
     async def _fake_q4_identify(data, filename, config, conn=None,
                                 cache_url_key=None, req_id=None, t_req=None,
-                                exclude=None, skip_bank=False):
+                                exclude=None, skip_bank=False, **kw):
         _q4_calls.append({"data": bytes(data), "filename": filename,
                           "cache_url_key": cache_url_key,
-                          "exclude": exclude})
+                          "exclude": exclude,
+                          "q4_fast": kw.get("q4_fast"),
+                          "predecoded_wav": kw.get("predecoded_wav")})
         return AudioIdResult(status="identified", title=TITLE, artist=ARTIST,
                              confirmed=True, source="shazam+audd")
 
@@ -1370,6 +1380,10 @@ async def main() -> int:
           and _upd31a.get("file_id") == "CLIP_FILE_ID"
           and _upd31a.get("title") == TITLE,
           f"entry={_upd31a}")
+    check("T31a Q4 confirms: fast path used (q4_fast=True, slice WAV reused)",
+          len(_q4_calls) == 1 and _q4_calls[0].get("q4_fast") is True
+          and _q4_calls[0].get("predecoded_wav") == _q4_calls[0]["data"],
+          f"calls={_q4_calls}")
 
     # T31b: Q4 finds nothing on either slice -> honest head-not-found,
     # zero audio, smart search NEVER runs, per-slice lines logged.
@@ -1377,7 +1391,7 @@ async def main() -> int:
 
     async def _fake_q4_unconfirmed(data, filename, config, conn=None,
                                    cache_url_key=None, req_id=None, t_req=None,
-                                   exclude=None, skip_bank=False):
+                                   exclude=None, skip_bank=False, **kw):
         _q4_calls_b.append({"data": bytes(data)})
         return AudioIdResult(status="unconfirmed", title="Pistol",
                              artist="Tiem & Salii", confirmed=False,
@@ -1450,7 +1464,7 @@ async def main() -> int:
     async def _fake_q4_hang_then_answer(data, filename, config, conn=None,
                                         cache_url_key=None, req_id=None,
                                         t_req=None, exclude=None,
-                                        skip_bank=False):
+                                        skip_bank=False, **kw):
         _q4_calls_d.append({"data": bytes(data)})
         if len(_q4_calls_d) == 1:
             await asyncio.sleep(30)
@@ -1556,6 +1570,287 @@ async def main() -> int:
           any('"window": "audd"' in ln and '"title": "Other Song"' in ln
               and '"artist": "Someone Else"' in ln for ln in _lookups),
           f"lookups={_lookups}")
+
+    # --- FIX ROUND 4 (2026-11-11): Q4 hoisted + cheapened -----------
+    # (a) video tap on a cache-hit unconfirmed clip runs Q4 instead
+    # of re-sending the clip audio that is already on screen.
+    _q4_calls_32a: list[dict] = []
+
+    async def _fake_q4_32a(data, filename, config, conn=None,
+                           cache_url_key=None, req_id=None, t_req=None,
+                           exclude=None, skip_bank=False, **kw):
+        _q4_calls_32a.append({"data": bytes(data)})
+        return AudioIdResult(status="unconfirmed", title="Pistol",
+                             artist="Tiem & Salii", confirmed=False,
+                             source="shazam")
+
+    _seed_q4_clip("tok-fix4-t32a")
+    h._identify_audio = _fake_q4_32a
+    vs.LOG_LINES.clear()
+    try:
+        msg = _Msg(with_audio=False)
+        msg.video = SimpleNamespace(file_id="VID_FILE_ID")
+        cb = _Cb(msg, data="vid:id:tok-fix4-t32a")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._identify_audio = orig_identify
+        _drop_q4_token("tok-fix4-t32a")
+    check("T32a video cache-hit: Q4 ran (BOTH slices tried)",
+          len(_q4_calls_32a) == 2
+          and _q4_calls_32a[0]["data"] != _q4_calls_32a[1]["data"],
+          f"calls={len(_q4_calls_32a)}")
+    check("T32a video cache-hit: NO second audio sent",
+          msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+    check("T32a video cache-hit: honest head-not-found text sent",
+          msg.answers == [t("m_identify_searching", "fa"),
+                          t("m_identify_head_notfound", "fa")],
+          f"answers={msg.answers}")
+    retry_btns_32a = _kb_buttons(
+        msg.edits_markup[-1] if msg.edits_markup else None)
+    check("T32a video cache-hit: retry button restored on the video",
+          len(msg.edits_markup) == 2 and len(retry_btns_32a) == 1
+          and retry_btns_32a[0].callback_data == "vid:id:tok-fix4-t32a"
+          and retry_btns_32a[0].text == t("m_extracted_retry_btn", "fa"),
+          f"edits={len(msg.edits_markup)} "
+          f"btns={[(b.text, b.callback_data) for b in retry_btns_32a]}")
+
+    # --- T32b/d helper: drive a tap whose BG phase awaits a fake bg
+    # job. The job stores `bg_entry` (or nothing) only once the tap
+    # is actually inside _await_identify_bg, so the tap can never
+    # race ahead and spawn a real bg job.
+    orig_await_bg = h._await_identify_bg
+    orig_send_hit = h._send_identify_cache_hit
+
+    async def _drive_bg_tap(token, with_audio, bg_entry):
+        entry = _link_entry()
+        entry["user_id"] = 572595158
+        h._VIDEO_IDENTIFY[token] = entry
+        key = h._identify_result_key(link=entry["link"])
+        # No cache hit at tap time (the evening bg-wait case): drop
+        # any entry an earlier test left under this shortcode, or
+        # the tap would answer from the cache and never reach the
+        # BG phase.
+        h._IDENTIFY_RESULT_CACHE.pop(key, None)
+        _release = asyncio.Event()
+        _entered = asyncio.Event()
+        _drive_error = ""
+
+        async def _fake_bg_job():
+            await _release.wait()
+            if bg_entry is not None:
+                h._identify_result_put(key, {**bg_entry,
+                                             "created_at": time.time(),
+                                             "ttl": 600})
+
+        async def _await_bg_tracked(k, timeout=120.0):
+            _entered.set()
+            return await orig_await_bg(k, timeout=timeout)
+
+        _bg_task = asyncio.create_task(_fake_bg_job())
+        h._IDENTIFY_BG_TASKS[key] = _bg_task
+        h._await_identify_bg = _await_bg_tracked
+        msg = _Msg(with_audio=with_audio)
+        if not with_audio:
+            msg.video = SimpleNamespace(file_id="VID_FILE_ID")
+        cb = _Cb(msg, data=f"vid:id:{token}")
+        _vtask = None
+        try:
+            _vtask = asyncio.create_task(
+                h.video_identify(cb, conn, SimpleNamespace()))
+            await asyncio.wait_for(_entered.wait(), timeout=10)
+            _release.set()
+            await _vtask
+        except Exception as exc:
+            _drive_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            _release.set()
+            if _vtask is not None and not _vtask.done():
+                _vtask.cancel()
+            h._await_identify_bg = orig_await_bg
+            h._IDENTIFY_BG_TASKS.pop(key, None)
+            _drop_q4_token(token)
+        return msg, key, _drive_error
+
+    # T32b: Q4 runs after a bg-wait completes with an unconfirmed
+    # clip (the evening 10.6/38.5/85.9 s waits never got a Q4
+    # attempt). The bg send is mocked to fail so the tap reaches
+    # call site C; the smart search must not run on an unconfirmed
+    # name.
+    _q4_calls_32b: list[dict] = []
+    _search_calls_32b: list = []
+
+    async def _fake_q4_32b(data, filename, config, conn=None,
+                           cache_url_key=None, req_id=None, t_req=None,
+                           exclude=None, skip_bank=False, **kw):
+        _q4_calls_32b.append({"data": bytes(data)})
+        return AudioIdResult(status="unconfirmed", title="Pistol",
+                             artist="Tiem & Salii", confirmed=False,
+                             source="shazam")
+
+    async def _fake_send_hit_32b(*a, **k):
+        return None
+
+    async def _rec_search_32b(artist, title, clip_fingerprint=None):
+        _search_calls_32b.append((artist, title))
+        return await _fake_not_found(artist, title, clip_fingerprint)
+
+    _bg_entry_32b = {**_clip_hit(status="unconfirmed", file_id="",
+                                 disk_path=_clip_path)}
+    h._identify_audio = _fake_q4_32b
+    h._send_identify_cache_hit = _fake_send_hit_32b
+    sf.search_smart_full_version = _rec_search_32b
+    vs.LOG_LINES.clear()
+    try:
+        msg32b, _key32b, _err32b = await _drive_bg_tap(
+            "tok-fix4-t32b", False, _bg_entry_32b)
+    finally:
+        h._identify_audio = orig_identify
+        h._send_identify_cache_hit = orig_send_hit
+        sf.search_smart_full_version = orig_search
+    check("T32b bg-wait: tap completed without hanging",
+          _err32b == "" and msg32b is not None, _err32b)
+    if msg32b is not None:
+        check("T32b bg-wait: Q4 ran on the bg entry (BOTH slices)",
+              len(_q4_calls_32b) == 2
+              and _q4_calls_32b[0]["data"] != _q4_calls_32b[1]["data"],
+              f"calls={len(_q4_calls_32b)}")
+        check("T32b bg-wait: smart search never ran (unconfirmed)",
+              _search_calls_32b == [], f"calls={_search_calls_32b}")
+        check("T32b bg-wait: NO audio sent",
+              msg32b.audio_calls == [], f"audio_calls={msg32b.audio_calls}")
+        _bg_fail = t("h_clip_audio_failed", "fa").format(
+            head=t("m_identify_error", "fa"))
+        check("T32b bg-wait: honest BG FAILURE text sent",
+              _bg_fail in msg32b.answers, f"answers={msg32b.answers}")
+        _supp32b = [i for i, ln in enumerate(vs.LOG_LINES)
+                    if '"stage": "supplementary_identify"' in ln]
+        _send32b = [i for i, ln in enumerate(vs.LOG_LINES)
+                    if '"stage": "result_send"' in ln]
+        check("T32b bg-wait: supplementary slices logged BEFORE the honest message",
+              bool(_supp32b) and bool(_send32b)
+              and min(_supp32b) < min(_send32b),
+              f"supp={_supp32b} send={_send32b}")
+
+    # T32c: a slice exceeding its budget logs the abandon reason
+    # (detail=slice_timeout + stage_in_flight) with the REAL
+    # _identify_audio and a hanging Shazam — the evening slices
+    # died at exactly 15,001 ms with NO reason in the logs.
+    orig_shazam = h.identify_bytes_shazam
+    orig_audd = h.identify_bytes
+
+    async def _fake_shazam_hang(probe, prepared_wav=None, req_id=None):
+        await asyncio.sleep(30)
+        return AudioIdResult(status="identified", title="Pistol",
+                             artist="Tiem & Salii", confirmed=True,
+                             source="shazam")
+
+    async def _fake_audd_nf(data, filename, token):
+        return AudioIdResult(status="not_found")
+
+    h.identify_bytes_shazam = _fake_shazam_hang
+    h.identify_bytes = _fake_audd_nf
+    _old_slice_to = h._Q4_SLICE_TIMEOUT_SEC
+    _old_budget = h._Q4_TOTAL_BUDGET_SEC
+    h._Q4_SLICE_TIMEOUT_SEC = 3.0
+    h._Q4_TOTAL_BUDGET_SEC = 12.0
+    _seed_q4_clip("tok-fix4-t32c")
+    vs.LOG_LINES.clear()
+    _t32c = time.perf_counter()
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data="vid:id:tok-fix4-t32c")
+        await h.video_identify(
+            cb, conn,
+            SimpleNamespace(audd_token="fake", acrcloud_host="",
+                            acrcloud_key="", acrcloud_secret=""))
+    finally:
+        h.identify_bytes_shazam = orig_shazam
+        h.identify_bytes = orig_audd
+        h._Q4_SLICE_TIMEOUT_SEC = _old_slice_to
+        h._Q4_TOTAL_BUDGET_SEC = _old_budget
+        _drop_q4_token("tok-fix4-t32c")
+    _dt32c = time.perf_counter() - _t32c
+    _supp32c = [ln for ln in vs.LOG_LINES
+                if '"stage": "supplementary_identify"' in ln]
+    check("T32c slice timeout: tap finished fast, no hang/crash",
+          _dt32c < 20.0, f"elapsed={_dt32c:.2f}s")
+    check("T32c slice timeout: honest head-not-found text sent",
+          t("m_identify_head_notfound", "fa") in msg.answers,
+          f"answers={msg.answers}")
+    check("T32c slice timeout: slice logged detail=slice_timeout",
+          any('"detail": "slice_timeout"' in ln for ln in _supp32c),
+          f"lines={_supp32c}")
+    check("T32c slice timeout: slice logged stage_in_flight=shazam_window:1",
+          any('"stage_in_flight": "shazam_window:1"' in ln
+              for ln in _supp32c),
+          f"lines={_supp32c}")
+
+    # T32d: Q4 confirming AFTER a bg wait triggers the smart search
+    # (call site C routing): audio tap, no cache hit at tap time,
+    # bg completes with an unconfirmed clip, Q4 confirms on the
+    # first slice, and the smart search queries BOTH v1 sources.
+    _q4_calls_32d: list[dict] = []
+    _search_clients_32d: list = []
+
+    async def _fake_q4_32d(data, filename, config, conn=None,
+                           cache_url_key=None, req_id=None, t_req=None,
+                           exclude=None, skip_bank=False, **kw):
+        _q4_calls_32d.append({"data": bytes(data)})
+        return AudioIdResult(status="identified", title=TITLE, artist=ARTIST,
+                             confirmed=True, source="shazam+audd")
+
+    async def _fake_send_hit_32d(*a, **k):
+        return None
+
+    async def _real_search_32d(artist, title, clip_fingerprint=None):
+        _client = _FakeClient(
+            searches={"javanmelody.ir": _javan_hits(),
+                      "melonmusic.ir": _melon_hits()},
+            pages={"javanmelody.ir/10959": _javan_page(),
+                   "melonmusic.ir/1908": _melon_page()},
+            mp3s={"dl.javanmelody.ir": javan_bytes,
+                  "dl.melonmusic.ir": melon_bytes})
+        _search_clients_32d.append(_client)
+        return await orig_search(
+            artist, title, clip_fingerprint=clip_fingerprint,
+            client=_client, expected_duration_sec=EXPECTED,
+            workdir=tempfile.mkdtemp(prefix="smartsearch_"))
+
+    _bg_entry_32d = {**_clip_hit(status="unconfirmed", file_id="",
+                                 disk_path=_clip_path)}
+    sf._NEGATIVE.clear()
+    h._identify_audio = _fake_q4_32d
+    h._send_identify_cache_hit = _fake_send_hit_32d
+    sf.search_smart_full_version = _real_search_32d
+    vs.LOG_LINES.clear()
+    try:
+        msg32d, _key32d, _err32d = await _drive_bg_tap(
+            "tok-fix4-t32d", True, _bg_entry_32d)
+    finally:
+        h._identify_audio = orig_identify
+        h._send_identify_cache_hit = orig_send_hit
+        sf.search_smart_full_version = orig_search
+    check("T32d bg-wait confirm: tap completed without hanging",
+          _err32d == "" and msg32d is not None, _err32d)
+    if msg32d is not None:
+        check("T32d bg-wait confirm: Q4 confirmed on the FIRST slice",
+              len(_q4_calls_32d) == 1, f"calls={len(_q4_calls_32d)}")
+        _calls32d = (_search_clients_32d[0].calls
+                     if _search_clients_32d else [])
+        check("T32d bg-wait confirm: smart search queried BOTH v1 sources",
+              len(_search_clients_32d) == 1
+              and any("javanmelody.ir" in u for _, u in _calls32d)
+              and any("melonmusic.ir" in u for _, u in _calls32d),
+              f"calls={_calls32d}")
+        check("T32d bg-wait confirm: full file sent exactly once",
+              len(msg32d.audio_calls) == 1,
+              f"audio_calls={msg32d.audio_calls}")
+        _total32d = [ln for ln in vs.LOG_LINES
+                     if '"stage": "total"' in ln
+                     and '"event": "identify_stage"' in ln]
+        check("T32d bg-wait confirm: total status is 'found'",
+              any('"status": "found"' in ln for ln in _total32d),
+              f"total={_total32d}")
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")
