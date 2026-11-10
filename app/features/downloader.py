@@ -211,23 +211,23 @@ def validation_line(reason: str, lang: str = "fa") -> str:
 
 
 def normalize_url(url: str) -> str:
-    """Canonical form used for cache lookups: lowercase host, no junk."""
-    url = (url or "").strip()
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return url
-    host = (parts.hostname or "").lower()
-    if not host:
-        return url
-    netloc = host if not parts.port else f"{host}:{parts.port}"
-    path = parts.path or ""
-    if len(path) > 1 and path.endswith("/"):
-        path = path[:-1]
-    out = f"{parts.scheme.lower()}://{netloc}{path}"
-    if parts.query:
-        out += "?" + parts.query
-    return out
+    """Canonical form used for cache lookups: lowercase host, no junk.
+
+    Fix round 5 (F-12): delegates to the single fix-3 normalizer in
+    app.bot.file_cache, so the same reel pasted with different
+    tracking params (?igshid=…, ?utm_source=…) or as /p/ vs /reel/
+    shares one download_jobs key with the main link flow. Query
+    string and fragment are dropped, "www." is stripped, and
+    instagram /reel|p|tv|reels/ paths collapse to /reel/<code>.
+    NOTE: rows stored under the old (query-keeping) keys keep those
+    keys and simply miss once — no migration, the next download
+    re-stores under the canonical key.
+    The import is lazy: file_cache is stdlib-only, but the lazy
+    import keeps this feature module free of any bot-package
+    import-time coupling.
+    """
+    from ..bot.file_cache import _normalize_url as _canonical_url
+    return _canonical_url(url)
 
 
 def detect_source(url: str, validation=None) -> str:

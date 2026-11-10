@@ -19,6 +19,7 @@ that case identification via this path returns "error" instead of a match.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import struct
 from dataclasses import dataclass
@@ -27,6 +28,11 @@ from .. import timing as _timing
 from ..logging_config import get_logger, log_event
 
 log = get_logger(__name__)
+
+# Fix round 5 (F-01): Shazam's recognize() has no network timeout of its
+# own — a hung lookup used to wedge the bg identify task until restart.
+# Every caller inherits this bound via _recognize_bytes.
+_RECOGNIZE_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -69,7 +75,15 @@ async def _recognize_bytes(data: bytes) -> tuple[dict | None, bool]:
     shazam = Shazam()
     try:
         try:
-            payload = await shazam.recognize(data)
+            payload = await asyncio.wait_for(
+                shazam.recognize(data), timeout=_RECOGNIZE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # Fix round 5 (F-01): a hung Shazam lookup is a normal
+            # lookup failure, never a wedge. identify_bytes_shazam
+            # converts the raised TimeoutError to status "error".
+            log_event(log, "shazam_timeout",
+                      timeout_s=_RECOGNIZE_TIMEOUT_S)
+            raise
         except Exception as exc:
             if "unsupported feature" in str(exc):
                 return None, True

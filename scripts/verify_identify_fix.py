@@ -424,6 +424,63 @@ async def main():
               f"{type(exc).__name__}: {exc}")
 
 
+    # ---- I6: fix round 5 (F-01) a hung Shazam lookup is bounded ---------
+    try:
+        import logging as _logging
+        import types as _types
+        import app.services.shazam_id as shazam_mod
+        check("I6a Shazam recognize bound defaults to 30 s",
+              shazam_mod._RECOGNIZE_TIMEOUT_S == 30.0,
+              f"timeout={shazam_mod._RECOGNIZE_TIMEOUT_S!r}")
+
+        class _HungShazam:
+            async def recognize(self, data):
+                await asyncio.sleep(3600)
+
+            async def close(self):
+                return None
+
+        # Capture the shazam logger directly: the shared harness only
+        # records the handlers/Turso loggers, and log_event emits an
+        # "event" field (not "stage"), so vs._log_has cannot see it.
+        _shazam_lines: list = []
+
+        class _CapShazam(_logging.Handler):
+            def emit(self, record):
+                _shazam_lines.append(record.getMessage())
+
+        _cap = _CapShazam()
+        shazam_mod.log.addHandler(_cap)
+        _fake_shazamio = _types.ModuleType("shazamio")
+        _fake_shazamio.Shazam = _HungShazam
+        _prev_shazamio = sys.modules.get("shazamio")
+        sys.modules["shazamio"] = _fake_shazamio
+        _prev_timeout = shazam_mod._RECOGNIZE_TIMEOUT_S
+        # Fast test: shrink the bound to 1 s (the mechanism is the
+        # same; I6a pins the production default at 30 s).
+        shazam_mod._RECOGNIZE_TIMEOUT_S = 1.0
+        try:
+            _t0 = time.perf_counter()
+            _res = await shazam_mod.identify_bytes_shazam(b"fake-audio-bytes")
+            _dt = time.perf_counter() - _t0
+        finally:
+            shazam_mod._RECOGNIZE_TIMEOUT_S = _prev_timeout
+            shazam_mod.log.removeHandler(_cap)
+            if _prev_shazamio is None:
+                sys.modules.pop("shazamio", None)
+            else:
+                sys.modules["shazamio"] = _prev_shazamio
+        check("I6b hung Shazam resolves as a lookup failure, never a hang",
+              _res.status == "error", f"status={_res.status} dt={_dt:.2f}s")
+        check("I6c hung Shazam resolves within the bound",
+              _dt < 10.0, f"dt={_dt:.2f}s")
+        check("I6d the timeout is logged, not silent",
+              any("shazam_timeout" in m for m in _shazam_lines),
+              f"lines={_shazam_lines}")
+    except Exception as exc:
+        check("I6 hung Shazam is bounded", False, f"{type(exc).__name__}: {exc}")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
     failed = [r for r in RESULTS if not r[1]]

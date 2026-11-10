@@ -2168,7 +2168,10 @@ async def _smart_clip_fingerprint(callback, entry, hit):
         try:
             import os as _os
             if _os.path.isfile(disk):
-                items = fingerprint_file_items(disk)
+                # Fix round 5 (F-18): fpcalc is a synchronous subprocess
+                # — run it off the event loop, as the neighbouring
+                # identify code already does.
+                items = await asyncio.to_thread(fingerprint_file_items, disk)
                 if items:
                     return items
         except Exception:
@@ -2195,7 +2198,8 @@ async def _smart_clip_fingerprint(callback, entry, hit):
             fd = None
         except Exception:
             pass
-        return fingerprint_file_items(tmp)
+        # Fix round 5 (F-18): same off-loop hop as the disk branch above.
+        return await asyncio.to_thread(fingerprint_file_items, tmp)
     except Exception:
         return None
     finally:
@@ -3698,6 +3702,82 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
             pass
 
 
+# --- Near-match confirmation (fix round 5, 2026-11-11) -------------------
+# The two-source gate in _identify_audio required Shazam and AudD to
+# agree EXACTLY (file_identity_matches). Live case 0abeac0d stayed
+# unconfirmed: Shazam "Hanoo Be Yadetam" / "Hichkas" vs AudD
+# "Be Yadetam" / "UserMix" — the same song, one title a word-subset
+# of the other, and "UserMix" is AudD's placeholder, not an artist.
+# _titles_agree_near is an ADDITIONAL acceptance, never a replacement:
+# the exact-match path runs first and is untouched. Both sources must
+# still return a result; a single source can never confirm.
+
+# Bare version words (same family as _VERSION_WORDS in
+# app/search/youtube_full.py, plus the skeleton form "rimiks" for
+# Persian "ریمیکس" and the generic markers "version"/"extended"/
+# "unplugged"/"demo"/"original"). Compared on skeleton tokens, so
+# these match the existing comparison's normalization.
+_NEAR_MATCH_VERSION_WORDS = frozenset({
+    "remix", "rimiks", "cover", "live", "acoustic", "instrumental",
+    "sped", "slowed", "edit", "flip", "bootleg", "mashup", "rework",
+    "karaoke", "8d", "version", "extended", "unplugged", "demo",
+    "original",
+})
+
+
+def _audd_artist_for_agreement(artist: str) -> str:
+    """AudD's literal artist "UserMix" (exact, case-insensitive) is a
+    placeholder, not a real artist: treat it as artist-absent (empty)
+    for the agreement check. Only AudD's "UserMix" — no other string
+    is generalized."""
+    return "" if (artist or "").strip().lower() == "usermix" else (artist or "")
+
+
+def _near_match_version_tokens(title: str) -> set[str]:
+    """Version markers of a title, the same way the existing code
+    extracts them: bracketed tags via identified_version_tokens
+    ("(Remix)" -> remix) plus bare version words in the distinctive
+    tokens ("Taziyane Remix" -> remix)."""
+    from .logic import _distinctive_tokens, identified_version_tokens
+    toks = set(_distinctive_tokens(title))
+    return set(identified_version_tokens(title)) | {
+        t for t in toks if t in _NEAR_MATCH_VERSION_WORDS}
+
+
+def _titles_agree_near(shazam_title: str, shazam_artist: str,
+                       audd_title: str, audd_artist: str) -> bool:
+    """Conservative near-match: True only when ALL hold:
+    (a) one title's distinctive tokens are a subset of the other's
+        with <=2 extra tokens in the longer title; (b) the shorter
+        title has >=2 tokens; (c) the version-token sets are
+        identical (a "(Remix)" on one side only rejects); (d) the
+        artists agree after normalization, or either side is empty.
+    Both titles must be non-empty; an empty title never agrees.
+    The caller passes the AudD artist already through
+    _audd_artist_for_agreement, so "UserMix" arrives as "" here."""
+    from .logic import _distinctive_tokens
+    toks_s = set(_distinctive_tokens(shazam_title))
+    toks_a = set(_distinctive_tokens(audd_title))
+    if not toks_s or not toks_a:
+        return False
+    shorter, longer = (toks_s, toks_a) if len(toks_s) <= len(toks_a) \
+        else (toks_a, toks_s)
+    if len(shorter) < 2:
+        return False
+    if not shorter <= longer:
+        return False
+    if len(longer - shorter) > 2:
+        return False
+    if _near_match_version_tokens(shazam_title) != \
+            _near_match_version_tokens(audd_title):
+        return False
+    art_s = set(_distinctive_tokens(shazam_artist))
+    art_a = set(_distinctive_tokens(audd_artist))
+    if art_s and art_a and art_s != art_a:
+        return False
+    return True
+
+
 async def _identify_audio(data: bytes, filename: str, config: Config,
                         conn=None, cache_url_key: str | None = None,
                         req_id: str | None = None, t_req=None,
@@ -4172,14 +4252,29 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # still agree on it — the fall-through below lets a DIFFERENT
     # single-source name surface instead.
     from ..search.fullsong_verify import file_identity_matches as _fim
-    if (shazam is not None and shazam.status == "identified"
-            and audd is not None and audd.status == "identified"
-            and _fim(shazam.title, shazam.artist, audd.title, audd.artist)
-            and not _is_excluded(shazam.title, shazam.artist)):
+    # Fix round 5: AudD's placeholder artist "UserMix" counts as
+    # artist-absent for the agreement check; every other artist is
+    # used verbatim. The gate still needs BOTH sources identified —
+    # the near-match below is an additional acceptance, never a
+    # replacement for the exact match and never single-source.
+    _audd_artist = _audd_artist_for_agreement(
+        audd.artist if audd is not None else "")
+    _both_identified = (shazam is not None
+                        and shazam.status == "identified"
+                        and audd is not None
+                        and audd.status == "identified")
+    _exact_agree = (_both_identified
+                    and _fim(shazam.title, shazam.artist,
+                             audd.title, _audd_artist))
+    _near_agree = (_both_identified and not _exact_agree
+                   and _titles_agree_near(shazam.title, shazam.artist,
+                                          audd.title, _audd_artist))
+    if (_exact_agree or _near_agree) \
+            and not _is_excluded(shazam.title, shazam.artist):
         _cache_store("identified", shazam.title, shazam.artist)
         _st("result_sent", t0, status="identified",
             title=shazam.title, artist=shazam.artist,
-            confirmed=True, via="shazam+audd")
+            confirmed=True, via="shazam+audd", near_match=_near_agree)
         return AudioIdResult(status="identified", title=shazam.title,
                              artist=shazam.artist, confirmed=True,
                              source="shazam+audd")

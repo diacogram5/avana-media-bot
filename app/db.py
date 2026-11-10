@@ -221,6 +221,20 @@ def _turso_conn():
         return None
 
 
+def _turso_invalidate() -> None:
+    """Drop a dead shared Turso connection so the next call reconnects.
+
+    Fix round 5 (F-08): the db.py mirror paths used to keep handing a
+    dead connection to every read/write and fail silently forever.
+    Lazy import, same pattern as _turso_conn; never raises.
+    """
+    try:
+        from .bot import turso_cache as _tc
+        _tc._turso_invalidate()
+    except Exception:
+        pass
+
+
 def _turso_read(sql: str, params=()):
     """Turso SELECT rows (tuples) or None when Turso is unavailable/failed."""
     tconn = _turso_conn()
@@ -229,6 +243,7 @@ def _turso_read(sql: str, params=()):
     try:
         return tconn.execute(sql, params).fetchall()
     except Exception:
+        _turso_invalidate()
         return None
 
 
@@ -242,6 +257,7 @@ def _turso_write(sql: str, params=()) -> bool:
         tconn.commit()
         return True
     except Exception:
+        _turso_invalidate()
         return False
 
 

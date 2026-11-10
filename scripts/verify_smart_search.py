@@ -128,6 +128,17 @@ Cases:
       detail=slice_timeout + stage_in_flight and the retry still
       shows the honest status; (d) Q4 confirming after a bg wait
       triggers the smart search (both v1 sources queried).
+  T33 (fix round 5 — near-match confirmation): the REAL
+      _identify_audio with fake Shazam/AudD. (a) the live 0abeac0d
+      pair confirms ("Hanoo Be Yadetam"/Hichkas vs "Be Yadetam"/
+      "UserMix"); (b) clearly-different titles/artists still
+      reject; (c) single-source (Shazam-only or AudD-only) never
+      confirms; (d) "UserMix"-as-absent only counts when the other
+      artist matches or is empty — with different titles it still
+      rejects; (e) version-token mismatch still rejects ("(Remix)"
+      vs plain, bare "Remix" vs plain); (f) >2 extra tokens still
+      rejects, exactly 2 confirms; (g) a shorter title with <2
+      tokens still rejects. The exact-match path still confirms.
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -157,6 +168,7 @@ os.environ.pop("TURSO_DATABASE_URL", None)
 import verify_speedfix as vs  # noqa: E402  (fake aiogram + handlers)
 import app.bot.handlers as h  # noqa: E402
 import app.search.smart_fullsong as sf  # noqa: E402
+import app.search.smart_validate as sv  # noqa: E402
 from app.i18n import t  # noqa: E402
 
 check = vs.check
@@ -1074,7 +1086,9 @@ async def main() -> int:
           f"status={out.status} detail={out.detail} checked={out.checked}")
     sf._NEGATIVE.clear()
 
-    # T29d: Joft 6 AS CATALOG (Amir Tataloo) — still NOT FOUND: "Joft shish".
+    # T29d: Joft 6 AS CATALOG (Amir Tataloo) — now FOUND after the Joft 6
+    # number-word fix: smart_tokens("Joft 6") == smart_tokens("Joft shish"),
+    # so the correct 225.4 s MelonMusic file passes title + duration gates.
     sf._NEGATIVE.clear()
     client = _FakeClient(
         searches={"javanmelody.ir": _joft_javan_hits(),
@@ -1084,14 +1098,22 @@ async def main() -> int:
     out = await sf.search_smart_full_version(
         "Amir Tataloo", "Joft 6", client=client,
         workdir=tempfile.mkdtemp(prefix="smartsearch_"))
-    check("T29d Joft 6 as catalog (Amir Tataloo) is NOT FOUND — 'Joft shish' title_mismatch",
-          out.status == "not_found" and out.checked >= 2,
-          f"status={out.status} detail={out.detail} checked={out.checked}")
-    check("T29d the rejection reason is title_mismatch (digit 6 vs word shish)",
+    check("T29d Joft 6 as catalog (Amir Tataloo) is FOUND — 'Joft shish' now matches 'Joft 6'",
+          out.status == "found" and out.file is not None
+          and out.file.validation.get("status") == "match",
+          f"status={out.status} detail={out.detail} "
+          f"file={out.file.source if out.file else None} "
+          f"validation={out.file.validation if out.file else None}")
+    if out.file is not None:
+        check("T29d found file is the original (225.4 s, not the 230.1 s remix)",
+              abs(out.file.duration_sec - 225.4) < 1.0,
+              f"duration={out.file.duration_sec}")
+        sf._unlink_quietly(out.file.disk_path)
+    check("T29d validate_smart_file now matches 'Joft shish' tags against 'Joft 6'",
           sf.validate_smart_file(
               "Joft 6", "Amir Tataloo",
               "Joft shish [Amir Tataloo] From abanmusics.com",
-              "Amir Tataloo", 225.4, 225.5).get("detail") == "title_mismatch")
+              "Amir Tataloo", 225.4, 225.5).get("detail") == "match")
     sf._NEGATIVE.clear()
 
     # T29e: En Güzel Tesadüfüm (Tefo & SEKO, reel Dd1niVHN07n) — NOT FOUND,
@@ -1851,6 +1873,193 @@ async def main() -> int:
         check("T32d bg-wait confirm: total status is 'found'",
               any('"status": "found"' in ln for ln in _total32d),
               f"total={_total32d}")
+
+    # --- FIX ROUND 5 (2026-11-11): near-match confirmation -----------
+    # Live 0abeac0d: Shazam "Hanoo Be Yadetam" / "Hichkas" vs AudD
+    # "Be Yadetam" / "UserMix" stayed unconfirmed. The conservative
+    # near-match rule confirms it; everything else below must still
+    # reject. The REAL _identify_audio runs with fake Shazam/AudD
+    # (same pattern as T31f); conn=None disables the Stage-0 cache
+    # so cases sharing one mp3 cannot pollute each other.
+    _clip6 = vm._make_mp3("Hanoo Be Yadetam", "Hichkas", seconds=6)
+    _cfg33 = SimpleNamespace(audd_token="fake", acrcloud_host="",
+                             acrcloud_key="", acrcloud_secret="")
+    orig_shazam33 = h.identify_bytes_shazam
+    orig_audd33 = h.identify_bytes
+
+    async def _identify33(sh_title, sh_artist, au_title, au_artist):
+        """Run _identify_audio with the given fake provider answers;
+        a None title means that provider answers not_found."""
+        async def _fake_shazam(probe, prepared_wav=None, req_id=None):
+            if sh_title is None:
+                return AudioIdResult(status="not_found")
+            return AudioIdResult(status="identified", title=sh_title,
+                                 artist=sh_artist, confirmed=True,
+                                 source="shazam")
+
+        async def _fake_audd(data, filename, token):
+            if au_title is None:
+                return AudioIdResult(status="not_found")
+            return AudioIdResult(status="identified", title=au_title,
+                                 artist=au_artist, confirmed=True,
+                                 source="audd")
+
+        h.identify_bytes_shazam = _fake_shazam
+        h.identify_bytes = _fake_audd
+        try:
+            return await h._identify_audio(_clip6, "clip.mp3", _cfg33,
+                                           None, req_id="near-test")
+        finally:
+            h.identify_bytes_shazam = orig_shazam33
+            h.identify_bytes = orig_audd33
+
+    # (a) the live 0abeac0d pair CONFIRMS.
+    _res33a = await _identify33("Hanoo Be Yadetam", "Hichkas",
+                                "Be Yadetam", "UserMix")
+    check("T33a 0abeac0d pair confirms (near-match + UserMix-as-absent)",
+          _res33a.status == "identified" and _res33a.confirmed
+          and _res33a.title == "Hanoo Be Yadetam"
+          and _res33a.artist == "Hichkas"
+          and _res33a.source == "shazam+audd",
+          f"res={_res33a}")
+    check("T33a helper: _titles_agree_near accepts the 0abeac0d pair",
+          h._titles_agree_near("Hanoo Be Yadetam", "Hichkas",
+                               "Be Yadetam", ""))
+    check("T33a helper: _audd_artist_for_agreement maps UserMix to empty",
+          h._audd_artist_for_agreement("UserMix") == ""
+          and h._audd_artist_for_agreement("usermix") == ""
+          and h._audd_artist_for_agreement("Usermix") == ""
+          and h._audd_artist_for_agreement("Hichkas") == "Hichkas"
+          and h._audd_artist_for_agreement("") == "")
+
+    # (a2) same near-match with a real matching artist on both sides.
+    _res33a2 = await _identify33("Hanoo Be Yadetam", "Hichkas",
+                                 "Be Yadetam", "Hichkas")
+    check("T33a2 near-match confirms with matching real artists",
+          _res33a2.status == "identified" and _res33a2.confirmed,
+          f"res={_res33a2}")
+
+    # (b) clearly-different titles / artists still reject.
+    _res33b = await _identify33("Pistol", "Tiem & Salii",
+                                "Other Song", "Someone Else")
+    check("T33b clearly-different titles stay unconfirmed (Shazam name shown)",
+          _res33b.status == "unconfirmed" and not _res33b.confirmed
+          and _res33b.title == "Pistol",
+          f"res={_res33b}")
+    _res33b2 = await _identify33("Be Yadetam", "Hichkas",
+                                 "Be Yadetam", "Someone Else")
+    check("T33b2 same title but different artist stays unconfirmed",
+          _res33b2.status == "unconfirmed" and not _res33b2.confirmed,
+          f"res={_res33b2}")
+
+    # (c) single-source never confirms.
+    _res33c1 = await _identify33("Hanoo Be Yadetam", "Hichkas", None, None)
+    check("T33c1 Shazam-only stays unconfirmed",
+          _res33c1.status == "unconfirmed" and not _res33c1.confirmed
+          and _res33c1.title == "Hanoo Be Yadetam",
+          f"res={_res33c1}")
+    _res33c2 = await _identify33(None, None, "Be Yadetam", "UserMix")
+    check("T33c2 AudD-only stays unconfirmed",
+          _res33c2.status == "unconfirmed" and not _res33c2.confirmed
+          and _res33c2.title == "Be Yadetam",
+          f"res={_res33c2}")
+
+    # (d) "UserMix"-as-absent does not rescue different titles.
+    _res33d = await _identify33("Hanoo Be Yadetam", "Someone Else",
+                                "Totally Different Song", "UserMix")
+    check("T33d UserMix-as-absent + different titles still rejects",
+          _res33d.status == "unconfirmed" and not _res33d.confirmed,
+          f"res={_res33d}")
+    check("T33d helper: artist-empty passes only when titles agree",
+          h._titles_agree_near("Hanoo Be Yadetam", "Someone Else",
+                               "Be Yadetam", "")
+          and not h._titles_agree_near(
+              "Hanoo Be Yadetam", "Someone Else",
+              "Totally Different Song", ""))
+
+    # (e) version-token mismatch still rejects. NOTE the layering:
+    # the pre-existing exact path strips "(Remix)" before comparing
+    # (file_identity_matches), so "Taziyane (Remix)" vs plain
+    # "Taziyane" still confirms exactly as before — that path is
+    # untouched. The version guard is proven on NEAR-match-shaped
+    # pairs, where the exact path does NOT confirm and only the
+    # near-match could: a subset title carrying "(Remix)" (or a
+    # bare "Remix") against the plain subset title must reject.
+    check("T33e helper: version mismatch rejects in _titles_agree_near",
+          not h._titles_agree_near("Taziyane (Remix)", "Amir Tataloo",
+                                   "Taziyane", "Amir Tataloo")
+          and not h._titles_agree_near("Taziyane Remix", "Amir Tataloo",
+                                       "Taziyane", "Amir Tataloo"))
+    _res33e = await _identify33("Hanoo Be Yadetam (Remix)", "Hichkas",
+                                "Be Yadetam", "Hichkas")
+    check("T33e near titles + '(Remix)' vs plain stays unconfirmed",
+          _res33e.status == "unconfirmed" and not _res33e.confirmed,
+          f"res={_res33e}")
+    _res33e2 = await _identify33("Hanoo Be Yadetam", "Hichkas",
+                                 "Be Yadetam (Remix)", "Hichkas")
+    check("T33e2 near titles + plain vs '(Remix)' stays unconfirmed",
+          _res33e2.status == "unconfirmed" and not _res33e2.confirmed,
+          f"res={_res33e2}")
+    _res33e3 = await _identify33("Hanoo Be Yadetam Remix", "Hichkas",
+                                 "Be Yadetam", "Hichkas")
+    check("T33e3 near titles + bare 'Remix' vs plain stays unconfirmed",
+          _res33e3.status == "unconfirmed" and not _res33e3.confirmed,
+          f"res={_res33e3}")
+    _res33e4 = await _identify33("Hanoo Be Yadetam (Remix)", "Hichkas",
+                                 "Be Yadetam (Remix)", "Hichkas")
+    check("T33e4 near titles + matching '(Remix)' on both sides confirms",
+          _res33e4.status == "identified" and _res33e4.confirmed,
+          f"res={_res33e4}")
+
+    # (f) extra tokens: >2 rejects, exactly 2 confirms.
+    _res33f = await _identify33("Yek Do Se Chahar Panj", "Singer",
+                                "Yek Do", "Singer")
+    check("T33f 3 extra tokens stays unconfirmed",
+          _res33f.status == "unconfirmed" and not _res33f.confirmed,
+          f"res={_res33f}")
+    _res33f2 = await _identify33("Yek Do Se Chahar", "Singer",
+                                 "Yek Do", "Singer")
+    check("T33f2 exactly 2 extra tokens confirms",
+          _res33f2.status == "identified" and _res33f2.confirmed,
+          f"res={_res33f2}")
+
+    # (g) shorter title with <2 tokens still rejects.
+    _res33g = await _identify33("Yadetam", "Hichkas",
+                                "Hanoo Be Yadetam", "Hichkas")
+    check("T33g 1-token shorter title stays unconfirmed",
+          _res33g.status == "unconfirmed" and not _res33g.confirmed,
+          f"res={_res33g}")
+
+    # Exact-match path still works exactly as before.
+    _res33x = await _identify33("Pistol", "Tiem & Salii",
+                                "Pistol", "Tiem & Salii")
+    check("T33x exact match still confirms",
+          _res33x.status == "identified" and _res33x.confirmed
+          and _res33x.title == "Pistol"
+          and _res33x.source == "shazam+audd",
+          f"res={_res33x}")
+
+    # T34 (fix round 5 — F-18): _smart_clip_fingerprint runs fpcalc
+    # off the event loop; the awaited result is identical to the
+    # direct synchronous call.
+    try:
+        _expected = sv.fingerprint_file_items(str(JAVAN))
+        _got = await h._smart_clip_fingerprint(
+            None, {}, {"disk_path": str(JAVAN)})
+        check("T34a fingerprint via the tap helper is identical to the direct call",
+              _got == _expected,
+              f"got={None if _got is None else len(_got)} "
+              f"expected={None if _expected is None else len(_expected)}")
+        check("T34b the fingerprint is real (vendored fpcalc produced items)",
+              _expected is not None and len(_expected) > 0,
+              f"expected={None if _expected is None else len(_expected)}")
+        _missing = await h._smart_clip_fingerprint(
+            None, {}, {"disk_path": "/nonexistent/nope.mp3"})
+        check("T34c a missing disk file still returns None (never raises)",
+              _missing is None)
+    except Exception as exc:
+        check("T34 _smart_clip_fingerprint off-loop", False,
+              f"{type(exc).__name__}: {exc}")
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")

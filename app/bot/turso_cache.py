@@ -11,13 +11,13 @@ Env vars (set on Render):
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import time
 
 from .. import timing as _timing
+from ..logging_config import get_logger
 
-_log = logging.getLogger("avana.turso_cache")
+_log = get_logger(__name__)
 
 _turso_conn = None
 _turso_ok = False

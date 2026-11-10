@@ -71,11 +71,57 @@ def _canon_token(tok: str) -> str:
     return t
 
 
+# Persian (Eastern Arabic) digits -> Latin digits.
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+
+# Number words -> the same n<N> token as the digit, so "Joft 6",
+# "Joft shish", "Joft six" and "Joft ۶" all tokenise identically.
+# English 1-12, Persian transliteration 1-10, Persian script 1-10.
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12,
+    "yek": 1, "do": 2, "se": 3, "chahar": 4, "char": 4, "panj": 5,
+    "shish": 6, "shesh": 6, "haft": 7, "hasht": 8, "noh": 9, "dah": 10,
+    "یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5, "شش": 6,
+    "هفت": 7, "هشت": 8, "نه": 9, "ده": 10,
+}
+_NUMBER_WORD_RE = re.compile(
+    r"\b(" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_numbers(text: str) -> str:
+    """Map digits and number words to n<N> tokens (Joft 6 fix, 2026-11-11).
+
+    ``_distinctive_tokens`` drops 1-char tokens, so a bare digit ("6")
+    vanished while the word ("shish") survived, and exact-set title
+    equality failed — the correct 196.8 s MelonMusic file for "Joft 6"
+    was rejected before duration/fingerprint ever ran. This
+    preprocessing runs BEFORE that step: Persian digits become Latin,
+    standalone digit runs become "n<digits>" ("6" -> "n6"), and number
+    words become the same "n<N>" token, so "Joft 6" == "Joft shish"
+    == "Joft six" == "Joft ۶". Smart path ONLY — app/bot/logic.py
+    is untouched, so the normal full-song path is unchanged.
+    """
+    text = (text or "").translate(_FA_DIGITS)
+    text = _NUMBER_WORD_RE.sub(
+        lambda m: f"n{_NUMBER_WORDS[m.group(1).lower()]}", text)
+    text = re.sub(r"\b(\d+)\b", r"n\1", text)
+    return text
+
+
 def smart_tokens(text: str) -> list[str]:
-    """Distinctive canon tokens of `text`, brand packaging removed."""
+    """Distinctive canon tokens of `text`, brand packaging removed.
+
+    Digits and number words are normalised to n<N> tokens first
+    (see _normalize_numbers), so a digit in the identify result and
+    the same number as a word in the file's tags still match.
+    """
     from ..bot.logic import _distinctive_tokens
     out = []
-    for tok in _distinctive_tokens(text or ""):
+    for tok in _distinctive_tokens(_normalize_numbers(text or "")):
         if tok in _BRAND_TOKENS:
             continue
         c = _canon_token(tok)

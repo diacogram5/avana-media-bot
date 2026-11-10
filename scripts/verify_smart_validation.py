@@ -36,6 +36,16 @@ Cases:
   V17 conditional_acceptable requires a passing duration: a
       conditional whose duration is 102 s off is NOT acceptable even
       with the version in the URL.
+  V18 Joft 6 number-word fix (2026-11-11, spec
+      joft6-number-fix-spec-2026-11-10.md): the 12 prototype cases —
+      Joft 6 vs shish/six/۶/shesh match; vs 7/5/no-number no match;
+      Taziyane and Sob Zohr Shab unchanged; Song 2 vs Song Two and
+      Song 10 vs Song Dah match; the documented miss (جفت ۶ vs Joft
+      shish, pre-existing skeleton gap jft vs joft) stays a
+      no-match and is OUT OF SCOPE. The spec lists 11 cases under
+      "11/12 pass"; the 12th passing case is Joft 6 vs Joft shesh,
+      the documented "shesh" alias for 6, which restores the count
+      (11 pass + 1 miss = 12).
 
 Run: python3 scripts/verify_smart_validation.py ; exit 0 = all PASS.
 """
@@ -257,6 +267,38 @@ def main() -> int:
            "version_in_source": True}
     check("V17 conditional with bad duration is NOT acceptable",
           sv.conditional_acceptable(v17, MELON_URL) is False)
+
+    # V18: Joft 6 number-word fix — the 12 prototype cases.
+    # Token level: the digit and the word must collapse to one token.
+    check("V18 tokens: Joft 6 == Joft shish == ['joft', 'n6']",
+          sv.smart_tokens("Joft 6") == sv.smart_tokens("Joft shish")
+          == ["joft", "n6"],
+          f"{sv.smart_tokens('Joft 6')} {sv.smart_tokens('Joft shish')}")
+    check("V18 J1 Joft 6 vs Joft shish -> match",
+          sv.smart_title_matches("Joft 6", "Joft shish"))
+    check("V18 J2 Joft 6 vs Joft six -> match",
+          sv.smart_title_matches("Joft 6", "Joft six"))
+    check("V18 J3 Joft 6 vs Joft ۶ -> match",
+          sv.smart_title_matches("Joft 6", "Joft ۶"))
+    check("V18 J4 Joft 6 vs Joft 7 -> no match",
+          not sv.smart_title_matches("Joft 6", "Joft 7"))
+    check("V18 J5 Joft 6 vs Joft 5 -> no match",
+          not sv.smart_title_matches("Joft 6", "Joft 5"))
+    check("V18 J6 Joft 6 vs Joft (no number) -> no match",
+          not sv.smart_title_matches("Joft 6", "Joft"))
+    check("V18 J7 Taziyane (Remix) vs itself -> match",
+          sv.smart_title_matches("Taziyane (Remix)", "Taziyane (Remix)"))
+    check("V18 J8 Sob Zohr Shab vs itself -> match",
+          sv.smart_title_matches("Sob Zohr Shab", "Sob Zohr Shab"))
+    check("V18 J9 Song 2 vs Song Two -> match",
+          sv.smart_title_matches("Song 2", "Song Two"))
+    check("V18 J10 Song 10 vs Song Dah -> match",
+          sv.smart_title_matches("Song 10", "Song Dah"))
+    check("V18 J11 Joft 6 vs Joft shesh -> match",
+          sv.smart_title_matches("Joft 6", "Joft shesh"))
+    check("V18 J12 DOCUMENTED MISS (out of scope): جفت ۶ vs Joft "
+          "shish stays no match (skeleton jft vs joft)",
+          not sv.smart_title_matches("جفت ۶", "Joft shish"))
 
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

@@ -1346,6 +1346,79 @@ async def main():
     except Exception as exc:
         check("C25 URL normalization converges", False, f"{type(exc).__name__}: {exc}")
 
+    # ---- C26: fix round 5 (F-08) db.py Turso failure invalidates ---------
+    try:
+        _calls: list = []
+        _orig_invalidate = tc._turso_invalidate
+
+        def _rec_invalidate():
+            _calls.append(1)
+            return _orig_invalidate()
+
+        tc._turso_invalidate = _rec_invalidate
+        _orig_conn = dbmod._turso_conn
+
+        class _BoomConn:
+            def execute(self, *a, **k):
+                raise RuntimeError("dead connection")
+
+            def commit(self):
+                raise RuntimeError("dead connection")
+
+        dbmod._turso_conn = lambda: _BoomConn()
+        try:
+            _r = dbmod._turso_read("SELECT 1")
+            _w = dbmod._turso_write("INSERT INTO x VALUES (1)")
+        finally:
+            dbmod._turso_conn = _orig_conn
+            tc._turso_invalidate = _orig_invalidate
+        check("C26a a failing Turso read returns None (never raises)",
+              _r is None, f"read={_r!r}")
+        check("C26b a failing Turso write returns False (never raises)",
+              _w is False, f"write={_w!r}")
+        check("C26c a dead connection is invalidated on both paths "
+              "(next call reconnects)",
+              len(_calls) == 2, f"invalidate_calls={len(_calls)}")
+    except Exception as exc:
+        check("C26 db.py Turso failure invalidates", False,
+              f"{type(exc).__name__}: {exc}")
+
+    # ---- C27: fix round 5 (F-09) turso_cache uses the standard logger ---
+    try:
+        import logging as _logging
+        check("C27a turso_cache logger has a handler (INFO is not dropped)",
+              len(tc._log.handlers) >= 1,
+              f"handlers={tc._log.handlers}")
+        check("C27b turso_cache logger is INFO level and non-propagating",
+              tc._log.level == _logging.INFO and tc._log.propagate is False,
+              f"level={tc._log.level} propagate={tc._log.propagate}")
+        check("C27c the connected-OK message text is unchanged",
+              "turso_cache: connected OK" in (
+                  Path(__file__).resolve().parent.parent
+                  / "app" / "bot" / "turso_cache.py").read_text(
+                      encoding="utf-8"))
+        _records: list = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, record):
+                _records.append(record.getMessage())
+
+        _cap = _Cap()
+        tc._log.addHandler(_cap)
+        try:
+            vs._turso_on()
+            _conn = tc._get_conn()
+        finally:
+            tc._log.removeHandler(_cap)
+            vs._turso_off()
+        check("C27d a successful connect emits the connected-OK line",
+              _conn is not None
+              and any("turso_cache: connected OK" in m for m in _records),
+              f"conn={_conn is not None} records={_records}")
+    except Exception as exc:
+        check("C27 turso_cache standard logger", False,
+              f"{type(exc).__name__}: {exc}")
+
     print(f"\nidentify_cache: {len(RESULTS)} checks run")
 
 
