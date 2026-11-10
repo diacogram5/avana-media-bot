@@ -108,6 +108,18 @@ Cases:
       and the video keyboard lands on the VIDEO message; (d)
       video_identify never calls _set_video_result_kb with an
       audio message.
+  T31 (fix round 3 — Q4 supplementary identify, live 07e2f956):
+      a retry tap on a non-eligible clip hit answered the honest
+      not-found after ~565 ms with ZERO work (log req 82c83d0d).
+      (a) Q4 CONFIRMS on the middle slice -> the 1b entry becomes
+      identified (clip file kept) and the smart search runs;
+      (b) Q4 finds nothing on either slice -> honest head-not-found,
+      zero audio, smart search never runs, per-slice lines logged;
+      (c) no clip bytes anywhere -> honest text, _identify_audio
+      never called; (d) a hung slice is abandoned by the per-slice
+      timeout (tap finishes fast); (e) _loudest_wav_window picks
+      the loudest 10 s span; (f) Q-C: _identify_audio logs each
+      provider's title/artist on lookup_response lines.
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -1283,6 +1295,267 @@ async def main() -> int:
               f"kb_calls={kb_calls}")
     finally:
         h._set_video_result_kb = orig_set_kb
+
+    # --- FIX ROUND 3 (2026-11-10): Q4 supplementary identify ---------
+    # Live 07e2f956: a retry tap on a non-eligible clip hit answered
+    # m_identify_head_notfound after ~565 ms with ZERO work (fix
+    # round 2 early return; log req 82c83d0d). Q4 re-identifies the
+    # extracted clip from DIFFERENT windows (middle 25–75% + loudest
+    # 10 s) before any not-found, and proceeds to the smart search
+    # when a slice CONFIRMS the song.
+    import verify_fullsong_match as vm  # noqa: E402 (small mp3 fixture)
+    from app.services.audio_id import AudioIdResult  # noqa: E402
+
+    orig_identify = h._identify_audio
+    _clip_mp3 = vm._make_mp3(TITLE, ARTIST, seconds=12)
+    _clip_path = os.path.join(tempfile.mkdtemp(prefix="q4_clip_"), "clip.mp3")
+    with open(_clip_path, "wb") as _fh:
+        _fh.write(_clip_mp3)
+
+    def _seed_q4_clip(token, status="unconfirmed"):
+        entry = _link_entry()
+        entry["user_id"] = 572595158
+        h._VIDEO_IDENTIFY[token] = entry
+        key = h._identify_result_key(link=entry["link"])
+        h._identify_result_put(key, {**_clip_hit(
+            status=status, file_id="CLIP_FILE_ID", disk_path=_clip_path),
+            "created_at": time.time(), "ttl": 600})
+        return key
+
+    def _drop_q4_token(token):
+        h._VIDEO_IDENTIFY.pop(token, None)
+        h._VIDEO_IDENTIFY_RUNNING.discard(token)
+
+    # T31a: Q4 CONFIRMS on the middle slice -> the 1b entry becomes
+    # identified (clip file kept) and the smart search runs.
+    _q4_calls: list[dict] = []
+
+    async def _fake_q4_identify(data, filename, config, conn=None,
+                                cache_url_key=None, req_id=None, t_req=None,
+                                exclude=None, skip_bank=False):
+        _q4_calls.append({"data": bytes(data), "filename": filename,
+                          "cache_url_key": cache_url_key,
+                          "exclude": exclude})
+        return AudioIdResult(status="identified", title=TITLE, artist=ARTIST,
+                             confirmed=True, source="shazam+audd")
+
+    key31a = _seed_q4_clip("tok-fix3-t31a")
+    h._identify_audio = _fake_q4_identify
+    sf.search_smart_full_version = _fake_not_found
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data="vid:id:tok-fix3-t31a")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._identify_audio = orig_identify
+        sf.search_smart_full_version = orig_search
+        _drop_q4_token("tok-fix3-t31a")
+    check("T31a Q4 confirms: _identify_audio ran on a WAV slice (not the mp3 bytes)",
+          len(_q4_calls) == 1 and _q4_calls[0]["data"][:4] == b"RIFF"
+          and _q4_calls[0]["data"] != _clip_mp3,
+          f"calls={len(_q4_calls)}")
+    check("T31a Q4 confirms: cache_url_key never passed (Stage-0 bypass)",
+          all(c["cache_url_key"] is None for c in _q4_calls),
+          f"calls={_q4_calls}")
+    check("T31a Q4 confirms: smart search ran (not-found text, no head-not-found)",
+          t("m_smart_not_found", "fa") in msg.answers
+          and t("m_identify_head_notfound", "fa") not in msg.answers,
+          f"answers={msg.answers}")
+    check("T31a Q4 confirms: no audio re-sent",
+          msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+    _upd31a = h._identify_result_get(key31a)
+    check("T31a Q4 confirms: 1b entry is now identified, clip file kept",
+          _upd31a is not None and _upd31a.get("status") == "identified"
+          and _upd31a.get("kind") == "clip"
+          and _upd31a.get("file_id") == "CLIP_FILE_ID"
+          and _upd31a.get("title") == TITLE,
+          f"entry={_upd31a}")
+
+    # T31b: Q4 finds nothing on either slice -> honest head-not-found,
+    # zero audio, smart search NEVER runs, per-slice lines logged.
+    _q4_calls_b: list[dict] = []
+
+    async def _fake_q4_unconfirmed(data, filename, config, conn=None,
+                                   cache_url_key=None, req_id=None, t_req=None,
+                                   exclude=None, skip_bank=False):
+        _q4_calls_b.append({"data": bytes(data)})
+        return AudioIdResult(status="unconfirmed", title="Pistol",
+                             artist="Tiem & Salii", confirmed=False,
+                             source="shazam")
+
+    async def _recording_search_must_not_run(artist, title,
+                                             clip_fingerprint=None):
+        raise AssertionError(
+            "smart search must not run when Q4 does not confirm")
+
+    _seed_q4_clip("tok-fix3-t31b")
+    h._identify_audio = _fake_q4_unconfirmed
+    sf.search_smart_full_version = _recording_search_must_not_run
+    vs.LOG_LINES.clear()
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data="vid:id:tok-fix3-t31b")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._identify_audio = orig_identify
+        sf.search_smart_full_version = orig_search
+        _drop_q4_token("tok-fix3-t31b")
+    check("T31b Q4 unconfirmed: BOTH slices tried with different bytes",
+          len(_q4_calls_b) == 2
+          and _q4_calls_b[0]["data"] != _q4_calls_b[1]["data"],
+          f"calls={len(_q4_calls_b)}")
+    check("T31b Q4 unconfirmed: honest head-not-found, no smart text",
+          t("m_identify_head_notfound", "fa") in msg.answers
+          and t("m_smart_not_found", "fa") not in msg.answers,
+          f"answers={msg.answers}")
+    check("T31b Q4 unconfirmed: ZERO audio sends",
+          msg.audio_calls == [], f"audio_calls={msg.audio_calls}")
+    check("T31b Q4 unconfirmed: supplementary_identify logged per slice",
+          any('"stage": "supplementary_identify"' in ln
+              and '"slice": "middle"' in ln for ln in vs.LOG_LINES)
+          and any('"stage": "supplementary_identify"' in ln
+                  and '"slice": "loudest"' in ln for ln in vs.LOG_LINES),
+          f"lines={[ln for ln in vs.LOG_LINES if 'supplementary' in ln]}")
+
+    # T31c: no clip bytes anywhere (no disk file, no file_id) ->
+    # honest text, no crash, _identify_audio never called.
+    async def _fake_q4_must_not_run(data, *a, **k):
+        raise AssertionError(
+            "_identify_audio must not run without clip bytes")
+
+    token31c = "tok-fix3-t31c"
+    entry31c = _link_entry()
+    entry31c["user_id"] = 572595158
+    h._VIDEO_IDENTIFY[token31c] = entry31c
+    key31c = h._identify_result_key(link=entry31c["link"])
+    h._identify_result_put(key31c, {**_clip_hit(status="unconfirmed",
+                                                file_id="", disk_path=""),
+                                    "created_at": time.time(), "ttl": 600})
+    h._identify_audio = _fake_q4_must_not_run
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data=f"vid:id:{token31c}")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._identify_audio = orig_identify
+        _drop_q4_token(token31c)
+    check("T31c Q4 no bytes: honest head-not-found, ZERO audio",
+          t("m_identify_head_notfound", "fa") in msg.answers
+          and msg.audio_calls == [], f"answers={msg.answers}")
+
+    # T31d: a hung slice is abandoned by the per-slice timeout (the
+    # tap never hangs): slice 1 sleeps, slice 2 answers unconfirmed.
+    _q4_calls_d: list[dict] = []
+
+    async def _fake_q4_hang_then_answer(data, filename, config, conn=None,
+                                        cache_url_key=None, req_id=None,
+                                        t_req=None, exclude=None,
+                                        skip_bank=False):
+        _q4_calls_d.append({"data": bytes(data)})
+        if len(_q4_calls_d) == 1:
+            await asyncio.sleep(30)
+        return AudioIdResult(status="unconfirmed", title="Pistol",
+                             artist="Tiem & Salii", confirmed=False,
+                             source="shazam")
+
+    _old_slice_to = h._Q4_SLICE_TIMEOUT_SEC
+    _old_budget = h._Q4_TOTAL_BUDGET_SEC
+    h._Q4_SLICE_TIMEOUT_SEC = 0.2
+    h._Q4_TOTAL_BUDGET_SEC = 2.0
+    _seed_q4_clip("tok-fix3-t31d")
+    h._identify_audio = _fake_q4_hang_then_answer
+    sf.search_smart_full_version = _recording_search_must_not_run
+    _t31d = time.perf_counter()
+    try:
+        msg = _Msg(with_audio=True)
+        cb = _Cb(msg, data="vid:id:tok-fix3-t31d")
+        await h.video_identify(cb, conn, SimpleNamespace())
+    finally:
+        h._identify_audio = orig_identify
+        sf.search_smart_full_version = orig_search
+        h._Q4_SLICE_TIMEOUT_SEC = _old_slice_to
+        h._Q4_TOTAL_BUDGET_SEC = _old_budget
+        _drop_q4_token("tok-fix3-t31d")
+    _dt31d = time.perf_counter() - _t31d
+    check("T31d Q4 timeout: hung slice abandoned, tap finished fast",
+          _dt31d < 5.0, f"elapsed={_dt31d:.2f}s")
+    check("T31d Q4 timeout: both slices attempted, honest text sent",
+          len(_q4_calls_d) == 2
+          and t("m_identify_head_notfound", "fa") in msg.answers,
+          f"calls={len(_q4_calls_d)} answers={msg.answers}")
+
+    # T31e: _loudest_wav_window picks the loudest 10 s span.
+    import struct as _struct
+
+    def _make_wav(seconds=20, loud=(12, 14), amp=10000):
+        sr = 22050
+        n = seconds * sr
+        samples = [0] * n
+        for s in range(loud[0] * sr, loud[1] * sr):
+            samples[s] = amp
+        pcm = _struct.pack(f"<{n}h", *samples)
+        header = _struct.pack("<4sI4s4sIHHIIHH4sI",
+                              b"RIFF", 36 + len(pcm), b"WAVE", b"fmt ", 16,
+                              1, 1, sr, sr * 2, 2, 16, b"data", len(pcm))
+        return header + pcm
+
+    _wav20 = _make_wav(20, loud=(12, 14))
+    _loud_win = h._loudest_wav_window(_wav20, 10.0)
+    check("T31e loudest window: 10 s slice, not the whole clip",
+          _loud_win is not None and len(_loud_win) == 44 + 10 * 22050 * 2,
+          f"len={None if _loud_win is None else len(_loud_win)}")
+    _pcm = _loud_win[44:] if _loud_win is not None else b""
+    _maxamp = max((abs(_v) for _v in _struct.unpack(
+        f"<{len(_pcm) // 2}h", _pcm)), default=0) if _pcm else 0
+    check("T31e loudest window: slice covers the loud burst",
+          _maxamp == 10000, f"maxamp={_maxamp}")
+    _wav5 = _make_wav(5, loud=(1, 2))
+    check("T31e loudest window: short clip returns the whole WAV",
+          h._loudest_wav_window(_wav5, 10.0) == _wav5)
+    check("T31e loudest window: non-WAV returns None",
+          h._loudest_wav_window(b"not a wav", 10.0) is None)
+
+    # T31f (Q-C): _identify_audio logs each provider's title/artist
+    # on lookup_response lines (the disagreement cause was invisible).
+    # ACRCloud is not exercised: its env vars are unset by user order.
+    orig_shazam = h.identify_bytes_shazam
+    orig_audd = h.identify_bytes
+
+    async def _fake_shazam_qc(probe, prepared_wav=None, req_id=None):
+        return AudioIdResult(status="identified", title="Pistol",
+                             artist="Tiem & Salii", confirmed=True,
+                             source="shazam")
+
+    async def _fake_audd_qc(data, filename, token):
+        return AudioIdResult(status="identified", title="Other Song",
+                             artist="Someone Else", confirmed=True,
+                             source="audd")
+
+    h.identify_bytes_shazam = _fake_shazam_qc
+    h.identify_bytes = _fake_audd_qc
+    vs.LOG_LINES.clear()
+    try:
+        _res_qc = await h._identify_audio(
+            vm._make_mp3("Pistol", "Tiem & Salii", seconds=6), "clip.mp3",
+            SimpleNamespace(audd_token="fake", acrcloud_host="",
+                            acrcloud_key="", acrcloud_secret=""),
+            conn, req_id="qc-test")
+    finally:
+        h.identify_bytes_shazam = orig_shazam
+        h.identify_bytes = orig_audd
+    check("T31f Q-C: disagreement stays unconfirmed (Shazam name shown)",
+          _res_qc.status == "unconfirmed" and _res_qc.title == "Pistol",
+          f"res={_res_qc}")
+    _lookups = [ln for ln in vs.LOG_LINES
+                if '"stage": "lookup_response"' in ln]
+    check("T31f Q-C: Shazam lookup_response carries its title/artist",
+          any('"window": 0' in ln and '"title": "Pistol"' in ln
+              and '"artist": "Tiem & Salii"' in ln for ln in _lookups),
+          f"lookups={_lookups}")
+    check("T31f Q-C: AudD lookup_response carries its title/artist",
+          any('"window": "audd"' in ln and '"title": "Other Song"' in ln
+              and '"artist": "Someone Else"' in ln for ln in _lookups),
+          f"lookups={_lookups}")
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")

@@ -97,6 +97,7 @@ _SMART_MAX_CANDIDATES_PER_VARIANT = 4
 # threaded through search_smart_full_version (3 signature changes,
 # not a one-line fix) — deferred; the 10-minute window bounds it.
 _NEGATIVE_TTL_SEC = 600
+_NEGATIVE_MAX = 1000  # fix round 3: bound the dict (was unbounded)
 _NEGATIVE: dict[str, float] = {}
 
 # v1 SOURCES (user order 22:19): JavanMelody (primary) + MelonMusic
@@ -178,6 +179,18 @@ def negative_cached(artist: str, title: str) -> bool:
 def remember_negative(artist: str, title: str) -> None:
     try:
         _NEGATIVE[_negative_key(artist, title)] = time.time()
+        while len(_NEGATIVE) > _NEGATIVE_MAX:
+            _NEGATIVE.pop(next(iter(_NEGATIVE)))
+    except Exception:
+        pass
+
+
+def forget_negative(artist: str, title: str) -> None:
+    """Drop a stored negative (fix round 3): a retry that just
+    CONFIRMED the song with fresh evidence must not wait out the
+    10-minute not-found window before the smart search runs."""
+    try:
+        _NEGATIVE.pop(_negative_key(artist, title), None)
     except Exception:
         pass
 

@@ -1790,7 +1790,7 @@ def _extracted_audio_kb(title: str, artist: str, ulang,
     2026-11-09): EXACTLY ONE button — re-identify via the video's
     EXISTING identify button (vid:id:<token>). The Google button was
     removed from extracted audio by the user's order; the retry runs
-    the previously defined supplementary re-identification, unchanged.
+    the supplementary re-identification (fix round 3, Q4), unchanged.
     The single-button row renders full-width by Telegram's layout.
     Never used on an identified/bank send; never playlist/lyrics/
     wrong-song under an extracted file. Returns None when no retry
@@ -2092,6 +2092,23 @@ async def _send_identify_cache_hit(message, conn, hit: dict, token: str,
                     quality=hit.get("quality") or "",
                     extra=hit.get("extra") or "", req_id=req_id,
                     resolve_ms=hit.get("resolve_ms") or 0)
+                # Fix round 3: a staged FULL song sent from disk is a
+                # verified full version — mirror its file_id to Turso
+                # song_file_cache (name-based lookups) too, not just
+                # the shortcode entry above. Clips are never stored
+                # here (they are not full songs); the verified
+                # identity is the name the file was tag-checked
+                # against before staging.
+                if kind == "full":
+                    try:
+                        from .turso_cache import store_song_file_id as _turso_song_store
+                        _turso_song_store(artist, title, new_fid, "audio",
+                                          verified_title=title,
+                                          verified_artist=artist,
+                                          duration_sec=dur,
+                                          req_id=req_id)
+                    except Exception:
+                        pass
         except Exception:
             pass
         return sent
@@ -2279,6 +2296,18 @@ async def _run_smart_search_tap(callback, conn, entry, hit,
                                        verified_artist=f.artist)
                         except Exception:
                             pass
+                        # Fix round 3: mirror the found full version to
+                        # Turso song_file_cache too (name-based lookups),
+                        # not just the shortcode entry above.
+                        try:
+                            from .turso_cache import store_song_file_id as _turso_song_store
+                            _turso_song_store(artist, title, fid, "audio",
+                                              verified_title=f.title,
+                                              verified_artist=f.artist,
+                                              duration_sec=f.duration_sec,
+                                              req_id=req_id)
+                        except Exception:
+                            pass
             finally:
                 try:
                     _os.unlink(f.disk_path)
@@ -2408,6 +2437,204 @@ async def _set_video_result_kb_if_video(message, title: str, artist: str,
         pass
 
 
+# --- Q4 supplementary identify (fix round 3, 2026-11-10) -----------------
+# The retry tap on a NON-ELIGIBLE clip hit used to answer the honest
+# not-found after ZERO work (fix round 2 early return). The user
+# orders real work first: re-identify the extracted clip from
+# DIFFERENT audio windows, so Stage 0 cannot return the stored
+# result for the original bytes. One attempt per tap, ~30 s budget.
+_Q4_SLICE_TIMEOUT_SEC = 15.0
+_Q4_TOTAL_BUDGET_SEC = 30.0
+_Q4_CLIP_MAX_BYTES = 10 * 1024 * 1024
+
+
+async def _supplementary_clip_bytes(callback, hit):
+    """Bytes of the staged/sent extracted clip, or None.
+
+    Prefers the 1b cache's staged disk file; else downloads the sent
+    clip audio from Telegram (capped at 10 MB, timed out) — the same
+    load pattern as _smart_clip_fingerprint, but returning bytes so
+    the caller can slice DIFFERENT windows. Never raises.
+    """
+    disk = (hit or {}).get("disk_path") or ""
+    if disk:
+        try:
+            import os as _os
+            if _os.path.isfile(disk):
+                with open(disk, "rb") as _fh:
+                    _data = _fh.read()
+                if _data and len(_data) <= _Q4_CLIP_MAX_BYTES:
+                    return _data
+        except Exception:
+            pass
+    fid = (hit or {}).get("file_id") or ""
+    if not fid:
+        return None
+    try:
+        tg_file = await asyncio.wait_for(
+            callback.bot.get_file(fid), timeout=15)
+        buf = io.BytesIO()
+        await asyncio.wait_for(
+            callback.bot.download_file(tg_file.file_path, buf), timeout=20)
+        data = buf.getvalue()
+        if not data or len(data) > _Q4_CLIP_MAX_BYTES:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _loudest_wav_window(wav: bytes, seconds: float = 10.0):
+    """Loudest `seconds` span of a mono-22050Hz-16bit WAV, or None.
+
+    Scans 1 s RMS windows over the PCM and cuts the max-RMS span —
+    the music's loudest part, where speech-over-music is least
+    likely to dominate. Returns a valid WAV via wav_time_slice;
+    a clip shorter than the span returns the whole WAV. Pure
+    Python; never raises.
+    """
+    try:
+        import struct as _struct
+        from ..services.shazam_id import wav_time_slice as _slice
+        if len(wav) < 44 or wav[0:4] != b"RIFF" or wav[8:12] != b"WAVE":
+            return None
+        pos = 12
+        data_off = 0
+        sample_rate = 22050
+        while pos + 8 <= len(wav):
+            chunk_id = wav[pos:pos + 4]
+            chunk_size = _struct.unpack("<I", wav[pos + 4:pos + 8])[0]
+            body = wav[pos + 8:pos + 8 + chunk_size]
+            if chunk_id == b"fmt " and len(body) >= 8:
+                sample_rate = _struct.unpack("<I", body[4:8])[0] or 22050
+            elif chunk_id == b"data":
+                data_off = pos + 8
+                break
+            pos += 8 + chunk_size + (chunk_size % 2)
+        if not data_off or not sample_rate:
+            return None
+        pcm = wav[data_off:]
+        n = len(pcm) // 2
+        if n < sample_rate:  # < 1 s of audio
+            return None
+        samples = _struct.unpack(f"<{n}h", pcm)
+        # Per-second energies, then the loudest `seconds` span.
+        per_sec = []
+        for _s in range(0, n, sample_rate):
+            _chunk = samples[_s:_s + sample_rate]
+            per_sec.append(sum(_x * _x for _x in _chunk))
+        span = max(1, int(seconds))
+        if len(per_sec) <= span:
+            return wav
+        best_i, best_e = 0, -1.0
+        for _i in range(0, len(per_sec) - span + 1):
+            _e = sum(per_sec[_i:_i + span])
+            if _e > best_e:
+                best_e, best_i = _e, _i
+        total_s = n / sample_rate
+        return _slice(wav, best_i / total_s,
+                      (best_i + span) / total_s)
+    except Exception:
+        return None
+
+
+async def _supplementary_identify(callback, entry, hit, config, conn,
+                                  req_id=None, t_req=None):
+    """Re-identify the extracted clip from DIFFERENT audio windows.
+
+    Fix round 3 (Q4, user order 2026-11-10 09:55): the retry tap must
+    do real work before any not-found. Loads the clip bytes (staged
+    disk file, else the sent audio's file_id), decodes once, and runs
+    _identify_audio on the middle 25–75% window, then the loudest
+    10 s window. Different slices => different content hashes, so
+    Stage 0 cannot return the stored result for the original bytes;
+    cache_url_key is never passed for the same reason. One attempt
+    per tap, ~30 s total budget, 15 s per slice; never spawns or
+    awaits the bg job. Returns the first CONFIRMED result, else the
+    best (unconfirmed / not_found / error) result seen, else None
+    when no clip bytes could be loaded. Never raises.
+    """
+    _rid = req_id or _timing.new_req_id()
+    _t0 = _time.perf_counter()
+    try:
+        data = await _supplementary_clip_bytes(callback, hit)
+    except Exception:
+        data = None
+    if not data:
+        try:
+            _timing.log_stage(log, "identify_stage", _rid, t_req,
+                              "supplementary_identify", _t0,
+                              status="no_audio")
+        except Exception:
+            pass
+        return None
+    try:
+        import functools as _functools
+        import hashlib as _hashlib
+        from ..services.shazam_id import (
+            analyze_audio_with_wav as _analyze,
+            wav_time_slice as _slice)
+        _analysis, _wav = await asyncio.get_running_loop().run_in_executor(
+            None, _functools.partial(_analyze, data, req_id=_rid))
+    except Exception:
+        return AudioIdResult(status="error", detail="decode_failed")
+    if not _analysis.get("ok") or _wav is None:
+        try:
+            _timing.log_stage(log, "identify_stage", _rid, t_req,
+                              "supplementary_identify", _t0,
+                              status="error",
+                              detail=_analysis.get("reason", "undecodable"))
+        except Exception:
+            pass
+        return AudioIdResult(status="error",
+                             detail=_analysis.get("reason", "undecodable"))
+    _slices = []
+    _mid = _slice(_wav, 0.25, 0.75)
+    if _mid is not None:
+        _slices.append(("middle", _mid))
+    _loud = _loudest_wav_window(_wav, 10.0)
+    if _loud is not None:
+        _slices.append(("loudest", _loud))
+    if not _slices:
+        return AudioIdResult(status="error", detail="slice_failed")
+    _best = None
+    _deadline = _time.monotonic() + _Q4_TOTAL_BUDGET_SEC
+    _seen_hashes = set()
+    for _name, _sl in _slices:
+        _h = _hashlib.sha256(_sl).hexdigest()
+        if _h in _seen_hashes:
+            continue
+        _seen_hashes.add(_h)
+        _remaining = _deadline - _time.monotonic()
+        if _remaining <= 0:
+            break
+        _t_sl = _time.perf_counter()
+        try:
+            _res = await asyncio.wait_for(
+                _identify_audio(_sl, "clip.wav", config, conn,
+                                req_id=_rid, t_req=t_req,
+                                exclude=entry.get("wrong") or None),
+                timeout=min(_Q4_SLICE_TIMEOUT_SEC, _remaining))
+        except asyncio.TimeoutError:
+            _res = AudioIdResult(status="error", detail="slice_timeout")
+        except Exception:
+            _res = AudioIdResult(status="error", detail="slice_error")
+        try:
+            _timing.log_stage(log, "identify_stage", _rid, t_req,
+                              "supplementary_identify", _t_sl,
+                              slice=_name, status=_res.status,
+                              title=_res.title or "",
+                              artist=_res.artist or "",
+                              ms=int((_time.perf_counter() - _t_sl) * 1000))
+        except Exception:
+            pass
+        if _res is not None:
+            _best = _res
+            if _res.status == "identified":
+                return _res
+    return _best
+
+
 @router.callback_query(F.data.startswith("vid:id:"))
 async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     """One-click «🎵 شناسایی موسیقی» under a received video.
@@ -2462,16 +2689,19 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
     result = None
     # Step 1b additions (2026-11-09): the three timing parts of a tap.
     # wait_bg = this tap's time awaiting the bg identify job (0 on a
-    # pure cache hit); search_file = the bg job's file-resolution time
-    # for this key, carried on the stored entry (0 when unknown);
-    # send = the final audio send. On a miss where the tap awaited the
-    # bg, search_file is a sub-part of wait_bg (the bg's resolve phase
-    # ran inside the waited window); the miss verdict compares
+    # pure cache hit); search_file = THIS tap's file-search work (0
+    # on a pure hit; on a bg-awaited miss it is the bg entry's
+    # resolve_ms, a sub-part of wait_bg); send = the final audio
+    # send. stored_resolve_ms (fix round 3, L2) is the bg job's
+    # HISTORICAL file-resolution time carried on the stored entry —
+    # logged separately so a 10 s historical value never masquerades
+    # as tap-time work on a hit again. On a miss the verdict compares
     # wait_bg vs send for the total, and search_file vs
     # (wait_bg - search_file) to split the bg's work.
     _wait_bg_ms = 0
     _search_file_ms = 0
     _send_ms = 0
+    _stored_resolve_ms = 0
 
     def _log_identify_timing():
         """The three timing stages of this tap (identify_stage lines)."""
@@ -2509,6 +2739,56 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                 if _hit is not None:
                     _identify_result_put(_cache_key, _hit)
         _failed_fid = ""
+        # FIX ROUND 3 — Q4 supplementary identify (2026-11-10, user
+        # order 09:55): a retry tap on a NON-ELIGIBLE clip hit must
+        # do REAL work before any not-found — the fix-round-2 early
+        # return below used to answer after zero work. Runs only on
+        # the early return's exact condition (audio message + clip
+        # hit + not eligible + not rejected); a rejected name never
+        # reaches here (it takes the BG re-identify path). If a
+        # slice CONFIRMS the song (with a title, never a name the
+        # user rejected), the 1b entry is rebuilt (status
+        # identified, clip file kept) and the smart branch below
+        # runs on the updated hit; otherwise the cause is logged
+        # and the early return below shows the honest not-found.
+        if (callback.message is not None
+                and getattr(callback.message, "audio", None) is not None
+                and _hit is not None
+                and (_hit.get("kind") or "clip") == "clip"
+                and not _smart_search_eligible(callback, entry, _hit)
+                and not _is_rejected(entry, _hit.get("title", ""),
+                                     _hit.get("artist", ""))):
+            _q4 = await _supplementary_identify(
+                callback, entry, _hit, config, conn,
+                req_id=_req_id, t_req=_t_req)
+            if (_q4 is not None and _q4.status == "identified"
+                    and (_q4.title or "").strip()
+                    and not _is_rejected(entry, _q4.title, _q4.artist)):
+                _upd = _identify_result_entry(
+                    "identified", _q4.title, _q4.artist,
+                    source=_q4.source or "shazam+audd", kind="clip",
+                    file_id=_hit.get("file_id") or "",
+                    disk_path=_hit.get("disk_path") or "",
+                    duration_sec=_hit.get("duration_sec") or 0,
+                    resolve_ms=_hit.get("resolve_ms") or 0)
+                _identify_result_store(_cache_key, _upd, req_id=_req_id)
+                _hit = _upd
+                # A stale smart negative for this song must not block
+                # the fresh confirmed search below.
+                try:
+                    from ..search.smart_fullsong import (
+                        forget_negative as _forget_neg)
+                    _forget_neg(_q4.artist, _q4.title)
+                except Exception:
+                    pass
+            elif _q4 is not None:
+                # Still not confirmed: the per-slice lines above carry
+                # the cause; the early return below answers honestly.
+                _timing.log_stage(log, "identify_stage", _req_id, _t_req,
+                                  "supplementary_identify", _t_req,
+                                  status=_q4.status,
+                                  title=_q4.title or "",
+                                  artist=_q4.artist or "")
         # SMART SEARCH (2026-11-09, free-only): the retry button under
         # an extracted audio message, with a cached clip result and a
         # known title, runs the smart full-version search INSTEAD of
@@ -2606,7 +2886,12 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                     artist=_hit.get("artist", ""),
                     confirmed=_hit.get("status") == "identified",
                     source=_hit.get("source") or "cache")
-                _search_file_ms = int(_hit.get("resolve_ms") or 0)
+                # Fix round 3 (L2): on a pure hit the tap does NO
+                # file search — the stored resolve_ms is the bg
+                # job's HISTORICAL time, kept separately as
+                # stored_resolve_ms on the total line below.
+                _search_file_ms = 0
+                _stored_resolve_ms = int(_hit.get("resolve_ms") or 0)
                 _t_send = _time.perf_counter()
                 sent = await _send_identify_cache_hit(
                     callback.message, conn, _hit, token, entry, ulang,
@@ -2781,6 +3066,7 @@ async def video_identify(callback, conn: sqlite3.Connection, config: Config):
                           cache_hit=_cache_hit,
                           wait_bg_ms=_wait_bg_ms,
                           search_file_ms=_search_file_ms,
+                          stored_resolve_ms=_stored_resolve_ms,
                           send_ms=_send_ms)
 
 
@@ -3546,7 +3832,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                           req_id=req_id,
                           total_ms=int((_time.perf_counter() - t_req) * 1000),
                           window=i, ms=int((_time.perf_counter() - t0) * 1000),
-                          status=candidate.status if candidate else "none")
+                          status=candidate.status if candidate else "none",
+                          title=candidate.title if candidate else "",
+                          artist=candidate.artist if candidate else "")
             except Exception as exc:
                 log_event(log, "identify_stage", stage="lookup_error",
                           req_id=req_id,
@@ -3570,7 +3858,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       req_id=req_id,
                       total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="audd", ms=int((_time.perf_counter() - t0) * 1000),
-                      status=audd.status if audd else "none")
+                      status=audd.status if audd else "none",
+                      title=audd.title if audd else "",
+                      artist=audd.artist if audd else "")
             return audd
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
@@ -3605,7 +3895,9 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       req_id=req_id,
                       total_ms=int((_time.perf_counter() - t_req) * 1000),
                       window="acrcloud", ms=int((_time.perf_counter() - t0) * 1000),
-                      status=acr.status if acr else "none")
+                      status=acr.status if acr else "none",
+                      title=acr.title if acr else "",
+                      artist=acr.artist if acr else "")
         except Exception as exc:
             log_event(log, "identify_stage", stage="lookup_error",
                       req_id=req_id,
@@ -3838,6 +4130,12 @@ def _identify_result_put(key: str, entry: dict) -> None:
             return
         _IDENTIFY_RESULT_CACHE.pop(key, None)
         _IDENTIFY_RESULT_CACHE[key] = dict(entry)
+        # Fix round 3: evict EXPIRED entries first — a burst must not
+        # kill live confirmed 7d entries while dead ones sit in slots.
+        _now = _time.time()
+        for _k in [k for k, e in _IDENTIFY_RESULT_CACHE.items()
+                   if _now - e.get("created_at", 0) > e.get("ttl", 0)]:
+            _IDENTIFY_RESULT_CACHE.pop(_k, None)
         while len(_IDENTIFY_RESULT_CACHE) > _IDENTIFY_RESULT_MAX:
             _IDENTIFY_RESULT_CACHE.pop(next(iter(_IDENTIFY_RESULT_CACHE)))
     except Exception:
@@ -5345,6 +5643,19 @@ async def _after_card_delivery(message, conn, title, artist, config, kb,
                             req_id=req_id)
                     except Exception:
                         pass
+                    # Fix round 3: mirror the bank full version to
+                    # Turso song_file_cache too (name-based lookups),
+                    # not just the shortcode entry above. The bank
+                    # file's identity is its registered title/artist.
+                    try:
+                        from .turso_cache import store_song_file_id as _turso_song_store
+                        _turso_song_store(artist, title, _bank_fid, "audio",
+                                          verified_title=title,
+                                          verified_artist=artist,
+                                          duration_sec=song.get("duration_sec") or 0,
+                                          req_id=req_id)
+                    except Exception:
+                        pass
                 try:
                     if t_wall is not None:
                         log_event(log, "identify_stage", stage="name_sent",
@@ -5750,7 +6061,7 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
             from .file_cache import store_file_id as _store_local
             from .file_cache import invalidate_file as _inv_local
             from ..search.fullsong_verify import file_identity_matches as _fim
-            _turso_row = _turso_song_get(artist, title)
+            _turso_row = _turso_song_get(artist, title, req_id=req_id)
             if _turso_row:
                 _vt, _va = _turso_row.get("verified_title"), _turso_row.get("verified_artist")
                 if _vt and _fim(title, artist, _vt, _va or ""):
@@ -5891,7 +6202,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                         _turso_song_store(artist, title, _fid, "audio",
                                                           verified_title=_vt,
                                                           verified_artist=_va,
-                                                          duration_sec=full["duration_sec"])
+                                                          duration_sec=full["duration_sec"],
+                                                          req_id=req_id)
                                     except Exception:
                                         pass
                             except Exception:
@@ -5942,7 +6254,8 @@ async def _deliver_fullsong_bg(message, conn, title, artist, config, kb,
                                 _turso_song_store(artist, title, _fid, "audio",
                                                   verified_title=_vt,
                                                   verified_artist=_va,
-                                                  duration_sec=full["duration_sec"])
+                                                  duration_sec=full["duration_sec"],
+                                                  req_id=req_id)
                             except Exception:
                                 pass
                         # Speed measurement (Requirement #7): cache miss

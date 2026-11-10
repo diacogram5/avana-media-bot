@@ -24,13 +24,26 @@ _turso_ok = False
 
 
 def _normalize_url(url: str) -> str:
-    """Normalize URL for cache key (same as file_cache._normalize_url)."""
+    """Normalize URL for cache key (same as file_cache._normalize_url).
+
+    Fix round 3: spellings of the same reel share one key — the
+    "www." host prefix is dropped and instagram /reel|p|tv|reels/
+    paths collapse to /reel/<code>. Keep in sync with
+    file_cache._normalize_url (same rules, same order).
+    """
     try:
         from urllib.parse import urlparse, urlunparse
         p = urlparse(url.strip())
         # Lowercase host, strip trailing slash, drop query/fragment
         netloc = p.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
         path = p.path.rstrip("/") or "/"
+        if netloc == "instagram.com":
+            import re as _re
+            _m = _re.match(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)$", path)
+            if _m:
+                path = "/reel/" + _m.group(1)
         return urlunparse((p.scheme.lower(), netloc, path, "", "", ""))
     except Exception:
         return url.strip().lower()
@@ -191,6 +204,38 @@ _WRONG_SONG_REPORTS_DDL = """
 """
 
 
+_turso_down_logged = False
+
+
+def _log_turso_down(msg: str, *args) -> None:
+    """Error-level the FIRST time the mirror is found down (fix round
+    3): Turso-down used to be info/warning-only, so a dead durable
+    cache was invisible in Render logs. Later occurrences stay debug
+    to avoid spamming every request."""
+    global _turso_down_logged
+    if not _turso_down_logged:
+        _turso_down_logged = True
+        _log.error(msg, *args)
+    else:
+        _log.debug(msg, *args)
+
+
+def _turso_invalidate() -> None:
+    """Drop a broken cached Turso connection so the next call
+    reconnects from scratch (fix round 3). A connection that fails
+    mid-process was previously reused forever, so every later read
+    silently returned None and the durable cache looked dead.
+    Never raises."""
+    global _turso_conn, _turso_ok
+    try:
+        if _turso_conn is not None:
+            _turso_conn.close()
+    except Exception:
+        pass
+    _turso_conn = None
+    _turso_ok = False
+
+
 def _get_conn():
     """Get or create Turso connection. Returns None if not configured/fails."""
     global _turso_conn, _turso_ok
@@ -200,7 +245,8 @@ def _get_conn():
     url = os.environ.get("TURSO_URL", "").strip()
     token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     if not url or not token:
-        _log.info("turso_cache: not configured (TURSO_URL/TOKEN missing)")
+        _log_turso_down(
+            "turso_cache: not configured (TURSO_URL/TOKEN missing) — durable cache disabled")
         _turso_ok = False
         return None
 
@@ -259,11 +305,12 @@ def _get_conn():
         _log.info("turso_cache: connected OK (persistent cache active)")
         return conn
     except ImportError:
-        _log.warning("turso_cache: libsql_experimental not installed")
+        _log_turso_down(
+            "turso_cache: libsql_experimental not installed — durable cache disabled")
         _turso_ok = False
         return None
     except Exception as e:
-        _log.warning("turso_cache: connection failed: %s", e)
+        _log_turso_down("turso_cache: connection failed: %s — durable cache disabled", e)
         _turso_ok = False
         return None
 
@@ -295,6 +342,7 @@ def get_url_file_id(url: str, req_id: str | None = None) -> tuple | None:
             return None
         return (file_id, file_type)
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: get failed: %s", e)
         return None
 
@@ -320,6 +368,7 @@ def store_url_file_id(url: str, file_id: str, file_type: str, ttl_days: int = 30
         conn.commit()
         return True
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: store failed: %s", e)
         return False
 
@@ -363,6 +412,7 @@ def get_song_file(artist: str, title: str, req_id: str | None = None) -> dict | 
         return {"file_id": file_id, "verified_title": row[2],
                 "verified_artist": row[3], "duration_sec": row[4] or 0}
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: get_song_file failed: %s", e)
         return None
 
@@ -378,6 +428,7 @@ def delete_song_file_id(artist: str, title: str, req_id: str | None = None) -> b
         conn.commit()
         return True
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: delete_song_file_id failed: %s", e)
         return False
 
@@ -428,6 +479,7 @@ def store_song_file_id(artist: str, title: str, file_id: str, file_type: str = "
         conn.commit()
         return True
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: store_song_file_id failed: %s", e)
         return False
 
@@ -477,6 +529,7 @@ def get_identify_result(key: str, req_id: str | None = None) -> dict | None:
                 "created_at": created_at,
                 "ttl": max(0, int(expires_at) - int(created_at))}
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: get_identify_result failed: %s", e)
         return None
 
@@ -519,6 +572,7 @@ def store_identify_result(key: str, entry: dict,
         conn.commit()
         return True
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: store_identify_result failed: %s", e)
         return False
 
@@ -536,6 +590,7 @@ def delete_identify_result(key: str, req_id: str | None = None) -> bool:
         conn.commit()
         return True
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: delete_identify_result failed: %s", e)
         return False
 
@@ -558,6 +613,7 @@ def delete_identify_result_if(key: str, title: str, artist: str,
         conn.commit()
         return cur.rowcount > 0
     except Exception as e:
+        _turso_invalidate()
         _log.debug("turso_cache: delete_identify_result_if failed: %s", e)
         return False
 

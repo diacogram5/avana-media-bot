@@ -851,6 +851,10 @@ def set_cached_search(conn, key: str, result_json: str) -> None:
 # never turn into a permanent answer.
 IDENTIFY_CACHE_TTL = 7 * 86400       # hash keys: audio content is immutable
 IDENTIFY_CACHE_URL_TTL = 86400       # url keys: signed CDN URLs rotate
+# Fix round 3: a stored "not_found" is a SHORT negative (10 min,
+# matching the 1b negative TTL) — a transient miss must never block
+# re-identification for 7 days. Applied at read in get_identify_cache.
+IDENTIFY_CACHE_NOTFOUND_TTL = 600
 IDENTIFY_CACHE_MAX_ROWS = 1000       # cap; oldest rows evicted first
 
 
@@ -858,7 +862,17 @@ def get_identify_cache(conn, key: str, max_age: int = IDENTIFY_CACHE_TTL) -> dic
     row = conn.execute(
         "SELECT status, title, artist, created_at FROM identify_cache WHERE key=?",
         (key,)).fetchone()
-    if not row or int(time.time()) - int(row[3]) > max_age:
+    if not row:
+        return None
+    _age = int(time.time()) - int(row[3])
+    # Fix round 3: a "not_found" row expires after the SHORT negative
+    # TTL (10 min) even when the caller allows a longer max_age — the
+    # 7d hash TTL applies to identified results only. A transient
+    # miss is re-identified on the next tap after 10 min instead of
+    # being bank-only-blocked for a week.
+    _limit = (min(max_age, IDENTIFY_CACHE_NOTFOUND_TTL)
+              if row[0] == "not_found" else max_age)
+    if _age > _limit:
         return None
     return {"status": row[0], "title": row[1] or "", "artist": row[2] or ""}
 

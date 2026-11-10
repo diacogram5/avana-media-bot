@@ -25,10 +25,25 @@ def _cache_key(artist: str, title: str) -> str:
     return f"song:{artist.strip().lower()}|{title.strip().lower()}"
 
 def _normalize_url(url: str) -> str:
-    """Normalize URL for cache key: lowercase host, strip trailing slash, drop query/fragment."""
+    """Normalize URL for cache key: lowercase host, strip trailing slash, drop query/fragment.
+
+    Fix round 3: spellings of the same reel share one key — the
+    "www." host prefix is dropped and instagram /reel|p|tv|reels/
+    paths collapse to /reel/<code>. Keep in sync with
+    turso_cache._normalize_url (same rules, same order).
+    """
     try:
         p = urlparse(url.strip())
-        return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path.rstrip('/'), '', '', ''))
+        netloc = p.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = p.path.rstrip('/')
+        if netloc == "instagram.com":
+            import re as _re
+            _m = _re.match(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)$", path)
+            if _m:
+                path = "/reel/" + _m.group(1)
+        return urlunparse((p.scheme.lower(), netloc, path, '', '', ''))
     except Exception:
         return url.strip().lower()
 

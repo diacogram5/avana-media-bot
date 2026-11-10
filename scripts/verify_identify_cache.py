@@ -61,8 +61,10 @@ Cases (each driven end-to-end through the real handlers unless noted):
       goes through the bg job only).
   C14 Timing stages: wait_bg / search_file / send appear in the
       identify_stage lines AND in log_total, on hit and miss;
-      wait_bg=0 on a pure hit; the total's search_file_ms equals
-      the stored entry's resolve_ms.
+      wait_bg=0 on a pure hit; on a hit search_file_ms is 0 (the tap
+      does no file search — the stored entry's resolve_ms is logged
+      separately as stored_resolve_ms, fix round 3 L2); on a miss
+      search_file_ms equals the bg entry's resolve_ms.
   C15 File_id-only hit: the stored file_id is sent with NO download,
       NO _identify_audio call and NO file-search call (find /
       smart_search / exclusive).
@@ -82,6 +84,22 @@ Cases (each driven end-to-end through the real handlers unless noted):
       name stages the clip + stores it (kind clip, 10-min TTL) for
       the next tap — the entry cleared at the start is not left
       empty.
+  C21 (fix round 3) Stage-0 not_found is a SHORT negative: a
+      not_found row older than 10 min reads as a miss (re-identified),
+      while an identified row of the same age still hits (7d); a
+      caller-supplied smaller max_age is still respected.
+  C22 (fix round 3) Turso song_file_cache writes: a smart-tap found
+      file and a disk-staged FULL song sent from cache both mirror
+      the file_id to Turso (verified tags); a staged CLIP sent from
+      cache does NOT (it is not a full song).
+  C23 (fix round 3) TTL-aware LRU put: when the 200-entry cap is
+      hit, expired entries are evicted before the oldest LIVE entry.
+  C24 (fix round 3) Smart negative cache: capped at 1000 entries,
+      and forget_negative drops a stored negative (Q4's confirmed
+      retry must not wait out the 10-minute window).
+  C25 (fix round 3) URL normalization: www vs bare host and
+      /reel/ vs /p/ spellings of the same reel share one url-cache
+      key (local + Turso).
 
 Reuses the fake aiogram / fake libsql / fake message harness from
 scripts/verify_speedfix.py, the clip fixtures from
@@ -111,6 +129,9 @@ import verify_wrong_song as vw  # noqa: E402  (video-token helpers)
 
 import app.bot.handlers as h  # noqa: E402
 import app.bot.turso_cache as tc  # noqa: E402
+import app.bot.file_cache as fc  # noqa: E402
+import app.db as dbmod  # noqa: E402
+import app.search.smart_fullsong as sf  # noqa: E402
 from app.services.audio_id import AudioIdResult  # noqa: E402
 
 check = vs.check
@@ -820,7 +841,10 @@ async def main():
 
     # ---- C14: the three timing stages, hit + miss ----------------------
     try:
-        # Hit: wait_bg=0, search_file == the stored resolve_ms.
+        # Hit: wait_bg=0; search_file=0 on a pure hit (fix round 3,
+        # L2: the tap does no file search — the stored resolve_ms is
+        # the bg job's HISTORICAL time, logged separately as
+        # stored_resolve_ms on the total).
         _clear_cache()
         LOG_LINES.clear()
         _seed(_IG_KEY, source="bank", file_id="BANKFID1",
@@ -832,8 +856,10 @@ async def main():
         _tot = _log_line_with("total", '"wait_bg_ms"')
         check("C14a hit: the total logs wait_bg_ms=0 (no bg wait on a pure hit)",
               '"wait_bg_ms": 0' in _tot, f"total={_tot}")
-        check("C14b hit: the total's search_file_ms equals the stored entry's resolve_ms",
-              '"search_file_ms": 1234' in _tot, f"total={_tot}")
+        check("C14b hit: the total's search_file_ms is 0 on a pure hit",
+              '"search_file_ms": 0' in _tot, f"total={_tot}")
+        check("C14b2 hit: the stored resolve_ms is logged separately",
+              '"stored_resolve_ms": 1234' in _tot, f"total={_tot}")
         check("C14c hit: the total logs send_ms",
               '"send_ms":' in _tot, f"total={_tot}")
         check("C14d hit: the three identify_stage lines exist (wait_bg / search_file / send)",
@@ -1111,6 +1137,214 @@ async def main():
         check("C20 wrong-song unconfirmed stores clip", False, f"{type(exc).__name__}: {exc}")
     finally:
         vs._turso_off()
+
+    # ---- C21: Stage-0 not_found is a SHORT negative -------------------
+    try:
+        _conn21 = vs._make_conn()
+        _now21 = int(time.time())
+
+        def _backdate(key, secs):
+            _conn21.execute(
+                "UPDATE identify_cache SET created_at=? WHERE key=?",
+                (_now21 - secs, key))
+            _conn21.commit()
+
+        dbmod.set_identify_cache(_conn21, "hash:fresh-id", "identified", "T1", "A1")
+        dbmod.set_identify_cache(_conn21, "hash:fresh-nf", "not_found")
+        dbmod.set_identify_cache(_conn21, "hash:old-nf", "not_found")
+        dbmod.set_identify_cache(_conn21, "hash:old-id", "identified", "T3", "A3")
+        dbmod.set_identify_cache(_conn21, "hash:ancient-id", "identified", "T5", "A5")
+        dbmod.set_identify_cache(_conn21, "hash:bound-nf", "not_found")
+        _backdate("hash:old-nf", 700)
+        _backdate("hash:old-id", 700)
+        _backdate("hash:ancient-id", 8 * 86400)
+        _backdate("hash:bound-nf", 70)
+        check("C21a fresh identified hits",
+              (dbmod.get_identify_cache(_conn21, "hash:fresh-id") or {}).get("status") == "identified")
+        check("C21b fresh not_found hits (inside the 10-min window)",
+              (dbmod.get_identify_cache(_conn21, "hash:fresh-nf") or {}).get("status") == "not_found")
+        check("C21c not_found older than 10 min reads as a miss (re-identified)",
+              dbmod.get_identify_cache(_conn21, "hash:old-nf") is None)
+        check("C21d identified of the same age still hits (7d TTL)",
+              (dbmod.get_identify_cache(_conn21, "hash:old-id") or {}).get("status") == "identified")
+        check("C21e identified older than 7d reads as a miss",
+              dbmod.get_identify_cache(_conn21, "hash:ancient-id") is None)
+        check("C21f a caller-supplied smaller max_age is still respected",
+              dbmod.get_identify_cache(_conn21, "hash:bound-nf", max_age=60) is None)
+    except Exception as exc:
+        check("C21 Stage-0 not_found short TTL", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C22: Turso song_file_cache writes ---------------------------
+    _orig_song_store = tc.store_song_file_id
+    try:
+        _song_writes: list[dict] = []
+
+        def _rec_song_store(artist, title, file_id, file_type="audio",
+                            ttl_days=7, req_id=None, verified_title=None,
+                            verified_artist=None, duration_sec=None):
+            _song_writes.append({"artist": artist, "title": title,
+                                 "file_id": file_id,
+                                 "verified_title": verified_title,
+                                 "verified_artist": verified_artist,
+                                 "duration_sec": duration_sec})
+            return True
+
+        tc.store_song_file_id = _rec_song_store
+        # (a) smart-tap found file mirrors to Turso with verified tags.
+        orig_search_sf = sf.search_smart_full_version
+
+        async def _fake_found_sf(artist, title, clip_fingerprint=None):
+            td = tempfile.mkdtemp(prefix="c22_found_")
+            copy = os.path.join(td, "found.mp3")
+            with open(copy, "wb") as _fh:
+                _fh.write(vm._make_mp3(_TITLE, _ARTIST, seconds=5))
+            return sf.SmartOutcome(
+                status="found",
+                file=sf.SmartFile(
+                    disk_path=copy, ext="mp3", duration_sec=5.0,
+                    source="smart:javanmelody.ir", title=_TITLE,
+                    artist=_ARTIST, size=os.path.getsize(copy),
+                    url="https://example.invalid/found.mp3",
+                    validation={"status": "match", "detail": "match"},
+                    fingerprint_sim=None),
+                detail="match", ms=120, checked=1,
+                expected_duration_sec=5.0)
+
+        sf.search_smart_full_version = _fake_found_sf
+        try:
+            _conn22 = vs._make_conn()
+            _msg22 = vw._VideoMsg()
+            _cb22 = vw._FakeCallback(_msg22, "vid:id:tok-c22")
+            _hit22 = {"title": _TITLE, "artist": _ARTIST, "kind": "clip",
+                      "status": "identified"}
+            await h._run_smart_search_tap(
+                _cb22, _conn22, {"kind": "link", "file_id": "VID123"},
+                _hit22, _IG_KEY, "tok-c22", "fa")
+        finally:
+            sf.search_smart_full_version = orig_search_sf
+        check("C22a smart-tap found mirrors the file_id to Turso song_file_cache",
+              len(_song_writes) == 1
+              and _song_writes[0]["file_id"] == "BYTES_FILE_ID"
+              and _song_writes[0]["verified_title"] == _TITLE
+              and _song_writes[0]["verified_artist"] == _ARTIST
+              and _song_writes[0]["duration_sec"] == 5.0,
+              f"writes={_song_writes}")
+        # (b) disk -> file_id upgrade: a staged FULL song mirrors.
+        _song_writes.clear()
+        _full_path = os.path.join(tempfile.mkdtemp(prefix="c22_full_"), "full.mp3")
+        with open(_full_path, "wb") as _fh:
+            _fh.write(vm._make_mp3(_TITLE, _ARTIST, seconds=5))
+        _clear_cache()
+        _seed(_IG_KEY, kind="full", disk_path=_full_path, file_id="",
+              status="identified", duration_sec=5.0)
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="identified", title=_TITLE, artist=_ARTIST,
+                          confirmed=True, source="shazam+audd"),
+            None)
+        check("C22b disk-staged FULL song mirrors to Turso on send",
+              len(_song_writes) == 1
+              and _song_writes[0]["file_id"] == "BYTES_FILE_ID"
+              and _song_writes[0]["verified_title"] == _TITLE,
+              f"writes={_song_writes}")
+        check("C22b2 disk-staged FULL song sent exactly once",
+              len(msg.audio_calls) == 1, f"audio_calls={msg.audio_calls}")
+        # (c) same flow, kind clip: the upgrade stores the 1b entry
+        # but must NOT write a clip into song_file_cache.
+        _song_writes.clear()
+        _clip_path22 = os.path.join(tempfile.mkdtemp(prefix="c22_clip_"), "clip.mp3")
+        with open(_clip_path22, "wb") as _fh:
+            _fh.write(vm._make_mp3(_TITLE, _ARTIST, seconds=5))
+        _clear_cache()
+        _seed(_IG_KEY, kind="clip", disk_path=_clip_path22, file_id="",
+              status="unconfirmed", duration_sec=5.0)
+        msg, cb, token = await _run_tap(
+            AudioIdResult(status="unconfirmed", title=_TITLE, artist=_ARTIST,
+                          confirmed=False, source="shazam"),
+            None)
+        check("C22c disk-staged CLIP does not write Turso song_file_cache",
+              _song_writes == [], f"writes={_song_writes}")
+        check("C22c2 disk-staged CLIP sent exactly once",
+              len(msg.audio_calls) == 1, f"audio_calls={msg.audio_calls}")
+        tc.store_song_file_id = _orig_song_store
+    except Exception as exc:
+        check("C22 Turso song_file_cache writes", False, f"{type(exc).__name__}: {exc}")
+        try:
+            tc.store_song_file_id = _orig_song_store
+        except Exception:
+            pass
+
+    # ---- C23: TTL-aware LRU eviction ----------------------------------
+    try:
+        _clear_cache()
+        _now23 = time.time()
+        for _i in range(199):
+            _ent = h._identify_result_entry(
+                "identified", f"T{_i}", f"A{_i}", source="x", kind="full",
+                file_id=f"FID{_i}")
+            h._identify_result_put(f"ig:K{_i}", _ent)
+        _exp = h._identify_result_entry(
+            "not_found", "EXP", "EXP", source="x", kind="clip")
+        _exp["created_at"] = _now23 - 3600
+        _exp["ttl"] = 600
+        # Direct insert: _identify_result_put itself evicts expired
+        # entries, so the expired entry must be seeded around it.
+        h._IDENTIFY_RESULT_CACHE["ig:EXP"] = dict(_exp)
+        check("C23 setup: cache holds 200 entries",
+              len(h._IDENTIFY_RESULT_CACHE) == 200,
+              f"len={len(h._IDENTIFY_RESULT_CACHE)}")
+        _new = h._identify_result_entry(
+            "identified", "NEW", "NEW", source="x", kind="full",
+            file_id="FIDNEW")
+        h._identify_result_put("ig:NEW", _new)
+        check("C23a the expired entry was evicted first",
+              h._identify_result_get("ig:EXP") is None)
+        check("C23b the oldest LIVE entry survived",
+              h._identify_result_get("ig:K0") is not None)
+        check("C23c the new entry is stored",
+              h._identify_result_get("ig:NEW") is not None)
+        check("C23d the cap still holds (200 entries)",
+              len(h._IDENTIFY_RESULT_CACHE) == 200,
+              f"len={len(h._IDENTIFY_RESULT_CACHE)}")
+    except Exception as exc:
+        check("C23 TTL-aware LRU eviction", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C24: smart negative cache cap + forget -----------------------
+    try:
+        sf._NEGATIVE.clear()
+        for _i in range(1005):
+            sf.remember_negative(f"Artist{_i}", "Song")
+        check("C24a the negative cache is capped at 1000 entries",
+              len(sf._NEGATIVE) == 1000, f"len={len(sf._NEGATIVE)}")
+        sf.remember_negative("Q4 Artist", "Q4 Song")
+        check("C24b a fresh negative is cached",
+              sf.negative_cached("Q4 Artist", "Q4 Song") is True)
+        sf.forget_negative("Q4 Artist", "Q4 Song")
+        check("C24c forget_negative drops the stored negative",
+              sf.negative_cached("Q4 Artist", "Q4 Song") is False)
+        check("C24d forgetting an unknown song is a no-op",
+              sf.negative_cached("Nobody", "Nothing") is False)
+        sf._NEGATIVE.clear()
+    except Exception as exc:
+        check("C24 smart negative cache cap + forget", False, f"{type(exc).__name__}: {exc}")
+
+    # ---- C25: URL normalization converges ----------------------------
+    try:
+        _u1 = "https://www.instagram.com/reel/ABC123/?igshid=xyz&utm_source=ig"
+        _u2 = "https://instagram.com/p/ABC123"
+        _u3 = "https://instagram.com/reel/ABC123/"
+        check("C25a local url-cache keys converge across reel spellings",
+              fc._url_cache_key(_u1) == fc._url_cache_key(_u2)
+              == fc._url_cache_key(_u3),
+              f"{fc._url_cache_key(_u1)} vs {fc._url_cache_key(_u2)}")
+        check("C25b Turso url-cache keys converge across reel spellings",
+              tc._url_key(_u1) == tc._url_key(_u2) == tc._url_key(_u3))
+        check("C25c local and Turso keys agree with each other",
+              fc._url_cache_key(_u1) == tc._url_key(_u1))
+        check("C25d a different reel still gets a different key",
+              fc._url_cache_key(_u1) != fc._url_cache_key(
+                  "https://instagram.com/reel/ZZZ999/"))
+    except Exception as exc:
+        check("C25 URL normalization converges", False, f"{type(exc).__name__}: {exc}")
 
     print(f"\nidentify_cache: {len(RESULTS)} checks run")
 
