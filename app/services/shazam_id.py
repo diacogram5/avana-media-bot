@@ -32,6 +32,9 @@ log = get_logger(__name__)
 # Fix round 5 (F-01): Shazam's recognize() has no network timeout of its
 # own — a hung lookup used to wedge the bg identify task until restart.
 # Every caller inherits this bound via _recognize_bytes.
+# Fix round 6: the bound is overridable per call (timeout_s) — the Q4
+# fast path passes ~10 s so a hung window dies inside the 20 s slice
+# budget instead of outliving it; the default stays 30.0.
 _RECOGNIZE_TIMEOUT_S = 30.0
 
 
@@ -62,7 +65,8 @@ def parse_shazam_payload(payload: dict) -> ShazamIdResult:
     return ShazamIdResult(status="identified", title=title, artist=artist, raw=track)
 
 
-async def _recognize_bytes(data: bytes) -> tuple[dict | None, bool]:
+async def _recognize_bytes(data: bytes,
+                         timeout_s: float | None = None) -> tuple[dict | None, bool]:
     """Run shazamio on raw bytes.
 
     Returns (payload, unsupported_codec). ``unsupported_codec`` is True
@@ -70,19 +74,27 @@ async def _recognize_bytes(data: bytes) -> tuple[dict | None, bool]:
     (e.g. ``SignatureError: unsupported feature: aac``) — in which case
     the caller may transcode and retry. Any other exception propagates
     to the caller, which logs it as a lookup error.
+
+    ``timeout_s`` bounds one recognize() call; None (default) inherits
+    the module constant _RECOGNIZE_TIMEOUT_S (30.0) — resolved at call
+    time, so tests may shrink the constant. The Q4 fast path passes
+    ~10 s (fix round 6): a hung window must die well inside the 20 s
+    slice budget, never outlive it.
     """
+    if timeout_s is None:
+        timeout_s = _RECOGNIZE_TIMEOUT_S
     from shazamio import Shazam
     shazam = Shazam()
     try:
         try:
             payload = await asyncio.wait_for(
-                shazam.recognize(data), timeout=_RECOGNIZE_TIMEOUT_S)
+                shazam.recognize(data), timeout=timeout_s)
         except asyncio.TimeoutError:
             # Fix round 5 (F-01): a hung Shazam lookup is a normal
             # lookup failure, never a wedge. identify_bytes_shazam
             # converts the raised TimeoutError to status "error".
             log_event(log, "shazam_timeout",
-                      timeout_s=_RECOGNIZE_TIMEOUT_S)
+                      timeout_s=timeout_s)
             raise
         except Exception as exc:
             if "unsupported feature" in str(exc):
@@ -274,7 +286,8 @@ def analyze_audio(data: bytes, req_id: str | None = None) -> dict:
 
 async def identify_bytes_shazam(data: bytes,
                                 prepared_wav: bytes | None = None,
-                                req_id: str | None = None) -> ShazamIdResult:
+                                req_id: str | None = None,
+                                timeout_s: float | None = None) -> ShazamIdResult:
     """Identify raw audio/video bytes via a Shazam signature.
 
     `data` is the Telegram file bytes or a downloaded media file. When
@@ -286,6 +299,13 @@ async def identify_bytes_shazam(data: bytes,
     `prepared_wav`: a caller that already validated the input via
     ``analyze_audio_with_wav`` can pass its WAV (mono 22050Hz PCM) to
     skip the redundant second transcode of the same input.
+
+    `timeout_s`: per-recognize bound, passed to _recognize_bytes
+    (fix round 6); None (default) inherits _RECOGNIZE_TIMEOUT_S
+    (30.0). The transcode retry reuses the same bound — a retry only
+    follows a fast codec rejection, never a hung lookup (a hang raises
+    TimeoutError and returns "error" without retrying), so two hung
+    windows can never stack inside one call.
     """
     if not data:
         return ShazamIdResult(status="error")
@@ -295,7 +315,8 @@ async def identify_bytes_shazam(data: bytes,
         log_event(log, "shazam_error", error="ImportError: shazamio not installed")
         return ShazamIdResult(status="error")
     try:
-        payload, unsupported = await _recognize_bytes(data)
+        payload, unsupported = await _recognize_bytes(data,
+                                                      timeout_s=timeout_s)
         if unsupported:
             if prepared_wav is not None:
                 # The validation stage already produced the exact WAV the
@@ -310,7 +331,8 @@ async def identify_bytes_shazam(data: bytes,
                     log_event(log, "shazam_transcode_ok", wav_bytes=len(wav))
             if not wav:
                 return ShazamIdResult(status="error")
-            payload, unsupported = await _recognize_bytes(wav)
+            payload, unsupported = await _recognize_bytes(
+                wav, timeout_s=timeout_s)
             if unsupported:
                 log_event(log, "shazam_error",
                           error="SignatureError: still unsupported after transcode")

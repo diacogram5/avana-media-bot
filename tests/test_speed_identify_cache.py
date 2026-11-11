@@ -119,7 +119,7 @@ async def test_identify_audio_hash_hit_not_found(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_identify_audio_stores_terminal_result(db, monkeypatch):
-    async def fake_shazam(data, prepared_wav=None):
+    async def fake_shazam(data, prepared_wav=None, timeout_s=None):
         return ShazamIdResult(status="identified", title="T", artist="A")
 
     monkeypatch.setattr(H, "identify_bytes_shazam", fake_shazam)
@@ -136,7 +136,7 @@ async def test_identify_audio_stores_terminal_result(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_identify_audio_never_caches_lookup_error(db, monkeypatch):
-    async def fake_shazam(data, prepared_wav=None):
+    async def fake_shazam(data, prepared_wav=None, timeout_s=None):
         return ShazamIdResult(status="error")
 
     monkeypatch.setattr(H, "identify_bytes_shazam", fake_shazam)
@@ -151,7 +151,7 @@ async def test_identify_audio_never_caches_lookup_error(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_identify_audio_without_conn_disables_cache(monkeypatch):
     """conn=None (tests, scripts) keeps the old behavior exactly."""
-    async def fake_shazam(data, prepared_wav=None):
+    async def fake_shazam(data, prepared_wav=None, timeout_s=None):
         return ShazamIdResult(status="not_found")
 
     monkeypatch.setattr(H, "identify_bytes_shazam", fake_shazam)

@@ -2450,6 +2450,12 @@ async def _set_video_result_kb_if_video(message, title: str, artist: str,
 # (fix round 4: was ~30 s).
 _Q4_SLICE_TIMEOUT_SEC = 20.0
 _Q4_TOTAL_BUDGET_SEC = 40.0
+# Fix round 6: one Shazam window inside a Q4 slice is bounded to 10 s
+# (live 2026-11-11: the loudest slice died at 20,002 ms because the
+# 30 s recognize bound outlived the 20 s slice budget, so the slice
+# died as slice_timeout before AudD could answer). 10 s leaves ~10 s
+# of the slice budget for AudD + overhead.
+_Q4_SHAZAM_TIMEOUT_S = 10.0
 _Q4_CLIP_MAX_BYTES = 10 * 1024 * 1024
 
 
@@ -3581,10 +3587,20 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
                 callback.message, result.title, result.artist, ulang,
                 entry["file_id"], callback.from_user.id,
                 entry.get("kind") or "file", result.source)
-        elif result.status == "unconfirmed" and result.title:
+        elif result.status == "unconfirmed" and result.title \
+                and not _names_agree(result.title, result.artist,
+                                     wrong_title, wrong_artist):
             # A DIFFERENT single-source name: a «شاید...» lead, never a
             # «شناسایی شد» card. Heart/lyrics/playlist stay available;
             # the wrong-song button stays too, under the same token.
+            # Fix round 6: a hyphen-only spelling variant of the
+            # DISPUTED name ("Saf-o Sadeh" for "Safo Sadeh") is the
+            # SAME song, not a different one — it is excluded from
+            # this branch entirely, so it never becomes a «شاید...»
+            # lead and no wrong_song_report is ever stored for the
+            # variant; it falls through to the honest "not found"
+            # branch below (the exclusion in _identify_audio should
+            # already have dropped it; this is the backstop).
             outcome = "different_maybe"
             new_title, new_artist, new_source = (
                 result.title, result.artist, result.source)
@@ -3645,11 +3661,12 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
             else:
                 await callback.message.answer(maybe_text, reply_markup=kb)
         else:
-            # No different result (not_found, lookup error, or every
-            # source named only rejected songs): honest «پیدا نشد» +
-            # invite the user to type the name — the normal text
-            # search handles it. The searching message becomes the
-            # answer; nothing else is sent.
+            # No different result (not_found, lookup error, every
+            # source named only rejected songs, or the single-source
+            # name is only a spelling variant of the disputed name):
+            # honest «پیدا نشد» + invite the user to type the name —
+            # the normal text search handles it. The searching
+            # message becomes the answer; nothing else is sent.
             outcome = "not_found"
             if status_msg is not None:
                 try:
@@ -3712,6 +3729,32 @@ async def wrong_song(callback, conn: sqlite3.Connection, config: Config):
 # the exact-match path runs first and is untouched. Both sources must
 # still return a result; a single source can never confirm.
 
+# --- Hyphen-spelling normalization (fix round 6, 2026-11-11) -----------
+# Live reel DfjwxvyCsgf: Shazam "Safo Sadeh" vs AudD "Saf-o Sadeh" —
+# the same song, same artist, both engines identified — but the gate
+# stayed unconfirmed. Root cause: _distinctive_tokens (logic.py)
+# splits on punctuation, so "Saf-o" becomes "saf" + "o" (1 char,
+# dropped by the len>=2 filter) while "Safo" stays "safo": "saf" !=
+# "safo" fails BOTH the exact path (file_identity_matches, token
+# overlap 1/2 < 0.99) and the near-match subset check. Fix: normalize
+# BEFORE comparing — join intra-word hyphens/punctuation ("Saf-o" ->
+# "Safo"), case-fold, strip Latin diacritics (NFKD, combining marks
+# dropped: é -> e; Persian/Arabic marks were already dropped by the
+# skeleton). A hyphen surrounded by spaces ("A - B") is a separator
+# and is left alone. Applies ONLY to the two-engine agreement
+# comparison in this module — displayed/stored titles stay verbatim,
+# and the tag guard / card acceptance in logic.py are untouched.
+_INTRA_WORD_PUNCT_RE = re.compile(r"(?<=\w)[-'’ʼ‐‑‒–—](?=\w)")
+
+
+def _agreement_text(text: str) -> str:
+    """Title/artist as the agreement comparison sees it: diacritics
+    stripped, intra-word hyphens/punctuation joined, case-folded."""
+    import unicodedata as _ud
+    s = _ud.normalize("NFKD", text or "")
+    s = "".join(ch for ch in s if not _ud.combining(ch))
+    return _INTRA_WORD_PUNCT_RE.sub("", s).lower()
+
 # Bare version words (same family as _VERSION_WORDS in
 # app/search/youtube_full.py, plus the skeleton form "rimiks" for
 # Persian "ریمیکس" and the generic markers "version"/"extended"/
@@ -3737,8 +3780,10 @@ def _near_match_version_tokens(title: str) -> set[str]:
     """Version markers of a title, the same way the existing code
     extracts them: bracketed tags via identified_version_tokens
     ("(Remix)" -> remix) plus bare version words in the distinctive
-    tokens ("Taziyane Remix" -> remix)."""
+    tokens ("Taziyane Remix" -> remix). Computed on the normalized
+    title, so a hyphenated spelling ("Re-mix") meets its plain form."""
     from .logic import _distinctive_tokens, identified_version_tokens
+    title = _agreement_text(title)
     toks = set(_distinctive_tokens(title))
     return set(identified_version_tokens(title)) | {
         t for t in toks if t in _NEAR_MATCH_VERSION_WORDS}
@@ -3754,8 +3799,15 @@ def _titles_agree_near(shazam_title: str, shazam_artist: str,
         artists agree after normalization, or either side is empty.
     Both titles must be non-empty; an empty title never agrees.
     The caller passes the AudD artist already through
-    _audd_artist_for_agreement, so "UserMix" arrives as "" here."""
+    _audd_artist_for_agreement, so "UserMix" arrives as "" here.
+    Titles/artists are normalized first (fix round 6), so a
+    hyphen-only spelling difference ("Saf-o Sadeh" vs "Safo
+    Sadeh") agrees here exactly as it does on the exact path."""
     from .logic import _distinctive_tokens
+    shazam_title = _agreement_text(shazam_title)
+    shazam_artist = _agreement_text(shazam_artist)
+    audd_title = _agreement_text(audd_title)
+    audd_artist = _agreement_text(audd_artist)
     toks_s = set(_distinctive_tokens(shazam_title))
     toks_a = set(_distinctive_tokens(audd_title))
     if not toks_s or not toks_a:
@@ -3776,6 +3828,27 @@ def _titles_agree_near(shazam_title: str, shazam_artist: str,
     if art_s and art_a and art_s != art_a:
         return False
     return True
+
+
+def _names_agree(title1: str, artist1: str,
+                 title2: str, artist2: str) -> bool:
+    """True when two engine results name the SAME song under the
+    gate's own rules, after hyphen/punctuation normalization: the
+    normalized exact path (bracket-insensitive, same as
+    file_identity_matches) OR the fix-5 near-match. AudD's literal
+    "UserMix" counts as artist-absent on either side. This is the
+    one agreement predicate for the gate, the rejected-name
+    exclusion, and the wrong-song guard — so a hyphen-only spelling
+    variant can neither confirm against a different song nor leak
+    past an exclusion as a "different" name."""
+    from ..search.fullsong_verify import file_identity_matches as _fim
+    t1 = _agreement_text(title1)
+    a1 = _agreement_text(_audd_artist_for_agreement(artist1))
+    t2 = _agreement_text(title2)
+    a2 = _agreement_text(_audd_artist_for_agreement(artist2))
+    if _fim(t1, a1, t2, a2):
+        return True
+    return _titles_agree_near(t1, a1, t2, a2)
 
 
 async def _identify_audio(data: bytes, filename: str, config: Config,
@@ -3812,6 +3885,14 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     path, and the confirmation gate is unchanged. ``stage_tracker``
     is an optional one-element list the caller reads when a slice
     times out, so the abandon reason names the stage in flight.
+
+    Fix round 6: in the Q4 fast path the Shazam window is bounded
+    to _Q4_SHAZAM_TIMEOUT_S (10 s, inside the 20 s slice budget)
+    instead of the 30 s service default, and when Shazam ERRORS
+    (incl. that timeout) AudD still gets its chance — its answer
+    surfaces as the unconfirmed single-source name, and an AudD
+    not_found is the slice's honest not_found. A clean Shazam
+    not_found still skips the AudD upload, as before.
 
     Pipeline stages (each logged with timing; errors carry their stage):
       0. identify cache — sha256 of the input bytes is looked up first;
@@ -3882,12 +3963,16 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     def _is_excluded(title: str, artist: str) -> bool:
         """True when (title, artist) is a rejected name. Same
         normalization as the two-source gate, so a rejected "(Remix)"
-        never slips back in under a plainer spelling."""
+        never slips back in under a plainer spelling — and (fix
+        round 6) neither does a hyphen-only spelling variant
+        ("Saf-o Sadeh" for rejected "Safo Sadeh"): _names_agree
+        covers the normalized exact path and the near-match."""
         if not exclude:
             return False
         from ..search.fullsong_verify import file_identity_matches as _fim
         for _ex_t, _ex_a in exclude:
-            if _fim(title, artist, _ex_t, _ex_a):
+            if _fim(title, artist, _ex_t, _ex_a) \
+                    or _names_agree(title, artist, _ex_t, _ex_a):
                 _excluded_hit[0] = True
                 return True
         return False
@@ -4139,22 +4224,33 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # exclusive bank matched (returned above) or Shazam AND AudD AGREE
     # on title/artist (same normalization as the tag guard:
     # file_identity_matches — lowercase, strip, bracketed-suffix
-    # insensitive, Persian/Arabic char normalization). A single source
+    # insensitive, Persian/Arabic char normalization — PLUS fix
+    # round 6 hyphen/punctuation normalization, so "Safo Sadeh"
+    # vs "Saf-o Sadeh" confirms). A single source
     # (Shazam-only, AudD-only, ACRCloud-only) or a disagreement returns
     # "unconfirmed" with the best single-source name — the callers
     # never show an «شناسایی شد» card for it, only the extracted audio.
     # ACRCloud is not configured (user order) — its block is untouched
     # except that it can only ever produce an unconfirmed single-source
     # name now, never an "identified" return.
-    async def _run_shazam_windows():
+    async def _run_shazam_windows(timeout_s: float = 30.0):
+        """Run Shazam over the prepared windows, stop on a match.
+
+        ``timeout_s`` (fix round 6) bounds one recognize() call per
+        window and is passed to identify_bytes_shazam; the default
+        30.0 is the pre-existing service bound, so the normal/bg
+        path is byte-identical. The Q4 fast path passes
+        _Q4_SHAZAM_TIMEOUT_S (10 s) so a hung window dies well
+        inside the 20 s slice budget.
+        """
         _shazam = None
         for i, (probe, prepared) in enumerate(windows):
             _stage_in_flight[0] = f"shazam_window:{i + 1}"
             t0 = _time.perf_counter()
             try:
-                candidate = await identify_bytes_shazam(probe,
-                                                        prepared_wav=prepared,
-                                                        req_id=req_id)
+                candidate = await identify_bytes_shazam(
+                    probe, prepared_wav=prepared, req_id=req_id,
+                    timeout_s=timeout_s)
                 log_event(log, "identify_stage", stage="lookup_response",
                           req_id=req_id,
                           total_ms=int((_time.perf_counter() - t_req) * 1000),
@@ -4206,9 +4302,21 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
         # confirm here. This drops the gather-waits-for-slower
         # penalty and the AudD upload on the common not-found path.
         # The gate below is unchanged.
-        shazam = await _run_shazam_windows()
+        # Fix round 6: the Shazam window is bounded to
+        # _Q4_SHAZAM_TIMEOUT_S (10 s, inside the 20 s slice budget)
+        # instead of the 30 s service default — a hung lookup used
+        # to outlive the slice and die as slice_timeout before AudD
+        # could answer. When Shazam ERRORS (incl. that timeout)
+        # AudD still gets its chance (its answer surfaces as the
+        # unconfirmed single-source name below; an AudD not_found
+        # is the slice's honest not_found — see the q4_fast branch
+        # before the gate). A clean Shazam not_found still skips
+        # the AudD upload, exactly as before.
+        shazam = await _run_shazam_windows(timeout_s=_Q4_SHAZAM_TIMEOUT_S)
         audd = None
         if shazam is not None and shazam.status == "identified":
+            audd = await _run_audd()
+        elif shazam is None or shazam.status == "error":
             audd = await _run_audd()
     else:
         shazam, audd = await asyncio.gather(_run_shazam_windows(), _run_audd())
@@ -4247,6 +4355,21 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                       error=f"{type(exc).__name__}: {str(exc)[:120]}")
             acr = None
         _st("api_acrcloud", t0, status=acr.status if acr is not None else "none")
+    # Fix round 6 (Q4 only): Shazam hung/errored — bounded above to
+    # 10 s — and AudD, the only provider that answered, found
+    # nothing. The slice's honest verdict is not_found, not
+    # lookup_error: the slice returns inside its budget instead of
+    # dying as slice_timeout. Deliberately NOT cached: Shazam never
+    # answered, so a later retry of the same slice must re-run the
+    # providers (same reasoning as the all_excluded branch in the
+    # tail below). The confirmation gate is untouched: this branch
+    # can only fire when confirmation is already impossible
+    # (Shazam did not identify).
+    if q4_fast and (shazam is None or shazam.status == "error") \
+            and audd is not None and audd.status == "not_found":
+        _st("result_sent", t0, status="not_found",
+            reason="q4_shazam_error_audd_not_found")
+        return AudioIdResult(status="not_found")
     # TWO-SOURCE CONFIRMATION GATE: Shazam + AudD agreement only. A
     # rejected name (batch F) never confirms, even when both sources
     # still agree on it — the fall-through below lets a DIFFERENT
@@ -4257,6 +4380,11 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
     # used verbatim. The gate still needs BOTH sources identified —
     # the near-match below is an additional acceptance, never a
     # replacement for the exact match and never single-source.
+    # Fix round 6: the exact path compares NORMALIZED titles/artists
+    # (_agreement_text), so a hyphen-only spelling difference
+    # ("Safo" vs "Saf-o") confirms exactly; the near-match
+    # normalizes internally. Stored/returned titles stay verbatim
+    # (Shazam's spelling).
     _audd_artist = _audd_artist_for_agreement(
         audd.artist if audd is not None else "")
     _both_identified = (shazam is not None
@@ -4264,8 +4392,10 @@ async def _identify_audio(data: bytes, filename: str, config: Config,
                         and audd is not None
                         and audd.status == "identified")
     _exact_agree = (_both_identified
-                    and _fim(shazam.title, shazam.artist,
-                             audd.title, _audd_artist))
+                    and _fim(_agreement_text(shazam.title),
+                             _agreement_text(shazam.artist),
+                             _agreement_text(audd.title),
+                             _agreement_text(_audd_artist)))
     _near_agree = (_both_identified and not _exact_agree
                    and _titles_agree_near(shazam.title, shazam.artist,
                                           audd.title, _audd_artist))

@@ -18,10 +18,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db as dbmod
 from .bot import blocked_cache
+from .services.sources_probe import run_probe
 
 
 def _esc(s) -> str:
     return html.escape(str(s), quote=True)
+
+
+# TEMPORARY sources probe (see app/services/sources_probe.py):
+# one probe run at a time; _SOURCES_PROBE_LAST holds the last result.
+# The probe takes minutes (16 sites x 6 songs + ID engines), so a GET
+# starts it in a background thread and returns {"started": true};
+# later GETs return the last result. REMOVE this block and the probe
+# module once the probe has run and the verdicts are recorded.
+_SOURCES_PROBE_LOCK = threading.Lock()
+_SOURCES_PROBE_LAST: dict | None = None
+
+
+def _run_sources_probe_async():
+    global _SOURCES_PROBE_LAST
+    try:
+        _SOURCES_PROBE_LAST = run_probe()
+    except Exception as e:  # the probe never raises, but never wedge the lock
+        _SOURCES_PROBE_LAST = {"error": type(e).__name__ + ": " + str(e)[:500]}
+    finally:
+        _SOURCES_PROBE_LOCK.release()
 
 
 def settings_rows_html(settings: dict) -> str:
@@ -74,6 +95,22 @@ def make_handler(db_path, config):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            # TEMPORARY sources probe (see module comment above):
+            # public like /health — NO auth, NO database, NO user data,
+            # NO state changes. First GET starts the probe in a
+            # background thread and returns {"started": true}; a second
+            # GET while it runs returns {"started": false, "running":
+            # true} plus the last result; later GETs return the result.
+            if urllib.parse.urlparse(self.path).path == "/probe-sources":
+                if not _SOURCES_PROBE_LOCK.acquire(blocking=False):
+                    self._send_json({"started": False, "running": True,
+                                     "last": _SOURCES_PROBE_LAST})
+                    return
+                threading.Thread(target=_run_sources_probe_async,
+                                 daemon=True).start()
+                self._send_json({"started": True, "running": True,
+                                 "last": _SOURCES_PROBE_LAST})
                 return
             if not self._auth():
                 self._send("<h1>⛔ دسترسی غیرمجاز</h1>", 403); return

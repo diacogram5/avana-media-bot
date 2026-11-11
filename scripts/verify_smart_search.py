@@ -139,6 +139,16 @@ Cases:
       vs plain, bare "Remix" vs plain); (f) >2 extra tokens still
       rejects, exactly 2 confirms; (g) a shorter title with <2
       tokens still rejects. The exact-match path still confirms.
+  T35 (fix round 6 — Q4 Shazam window bound, live bhccp): reel 2's
+      loudest slice died at 20,002 ms (slice_timeout) because the
+      30 s recognize bound outlived the 20 s slice budget. (a) the
+      per-call timeout override bounds a hung Shazam lookup and the
+      default still flows from _RECOGNIZE_TIMEOUT_S (30.0); (b) a
+      hung-Shazam Q4 slice returns WITHIN budget carrying AudD's
+      answer (unconfirmed single-source name), no slice_timeout,
+      both slices attempted; (c) hung Shazam + AudD not_found is
+      the slice's honest not_found, no slice_timeout; (d) the
+      normal (non-Q4) path still passes the 30 s default.
 
 Run: python3 scripts/verify_smart_search.py ; exit 0 = all PASS.
 """
@@ -1557,7 +1567,7 @@ async def main() -> int:
     orig_shazam = h.identify_bytes_shazam
     orig_audd = h.identify_bytes
 
-    async def _fake_shazam_qc(probe, prepared_wav=None, req_id=None):
+    async def _fake_shazam_qc(probe, prepared_wav=None, req_id=None, timeout_s=None):
         return AudioIdResult(status="identified", title="Pistol",
                              artist="Tiem & Salii", confirmed=True,
                              source="shazam")
@@ -1760,7 +1770,7 @@ async def main() -> int:
     orig_shazam = h.identify_bytes_shazam
     orig_audd = h.identify_bytes
 
-    async def _fake_shazam_hang(probe, prepared_wav=None, req_id=None):
+    async def _fake_shazam_hang(probe, prepared_wav=None, req_id=None, timeout_s=None):
         await asyncio.sleep(30)
         return AudioIdResult(status="identified", title="Pistol",
                              artist="Tiem & Salii", confirmed=True,
@@ -1890,7 +1900,7 @@ async def main() -> int:
     async def _identify33(sh_title, sh_artist, au_title, au_artist):
         """Run _identify_audio with the given fake provider answers;
         a None title means that provider answers not_found."""
-        async def _fake_shazam(probe, prepared_wav=None, req_id=None):
+        async def _fake_shazam(probe, prepared_wav=None, req_id=None, timeout_s=None):
             if sh_title is None:
                 return AudioIdResult(status="not_found")
             return AudioIdResult(status="identified", title=sh_title,
@@ -2060,6 +2070,197 @@ async def main() -> int:
     except Exception as exc:
         check("T34 _smart_clip_fingerprint off-loop", False,
               f"{type(exc).__name__}: {exc}")
+
+    # --- FIX ROUND 6 (2026-11-11): Q4 Shazam window bound ----------
+    # Live [bhccp]: reel 2's loudest slice died at 20,002 ms
+    # (slice_timeout, stage_in_flight shazam_window:1) — the 30 s
+    # recognize bound outlived the 20 s slice budget, so the slice
+    # died before AudD could answer.
+    # (a) unit level: the per-call timeout override bounds a hung
+    # Shazam lookup, and the default still flows from the module
+    # constant (30.0) — same fake-shazamio pattern as I6 in
+    # verify_identify_fix.py.
+    import logging as _logging
+    import app.services.shazam_id as shazam_mod
+
+    class _HungShazam35:
+        async def recognize(self, data):
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            return None
+
+    _shazam35_lines: list = []
+
+    class _CapShazam35(_logging.Handler):
+        def emit(self, record):
+            _shazam35_lines.append(record.getMessage())
+
+    _cap35 = _CapShazam35()
+    shazam_mod.log.addHandler(_cap35)
+    _fake_shazamio35 = types.ModuleType("shazamio")
+    _fake_shazamio35.Shazam = _HungShazam35
+    _prev_shazamio35 = sys.modules.get("shazamio")
+    sys.modules["shazamio"] = _fake_shazamio35
+    _prev_timeout35 = shazam_mod._RECOGNIZE_TIMEOUT_S
+    try:
+        check("T35a Q4 bound: production default is still 30 s",
+              shazam_mod._RECOGNIZE_TIMEOUT_S == 30.0
+              and h._Q4_SHAZAM_TIMEOUT_S == 10.0,
+              f"recognize={shazam_mod._RECOGNIZE_TIMEOUT_S!r} "
+              f"q4={h._Q4_SHAZAM_TIMEOUT_S!r}")
+        _t35a = time.perf_counter()
+        _res35a = await shazam_mod.identify_bytes_shazam(
+            b"fake-audio-bytes", timeout_s=0.5)
+        _dt35a = time.perf_counter() - _t35a
+        check("T35a override: hung Shazam resolves as error, not a hang",
+              _res35a.status == "error", f"status={_res35a.status}")
+        check("T35a override: hung Shazam resolves within the 0.5 s bound",
+              _dt35a < 5.0, f"dt={_dt35a:.2f}s")
+        check("T35a override: the timeout is logged, not silent",
+              any("shazam_timeout" in m for m in _shazam35_lines),
+              f"lines={_shazam35_lines}")
+        # Default (no timeout_s): the bound still comes from the
+        # module constant — shrink it and the same hung lookup
+        # resolves within the shrunk bound.
+        shazam_mod._RECOGNIZE_TIMEOUT_S = 0.5
+        _t35a2 = time.perf_counter()
+        _res35a2 = await shazam_mod.identify_bytes_shazam(
+            b"fake-audio-bytes")
+        _dt35a2 = time.perf_counter() - _t35a2
+        check("T35a default: hung Shazam resolves within the (shrunk) default bound",
+              _res35a2.status == "error" and _dt35a2 < 5.0,
+              f"status={_res35a2.status} dt={_dt35a2:.2f}s")
+    finally:
+        shazam_mod._RECOGNIZE_TIMEOUT_S = _prev_timeout35
+        shazam_mod.log.removeHandler(_cap35)
+        if _prev_shazamio35 is None:
+            sys.modules.pop("shazamio", None)
+        else:
+            sys.modules["shazamio"] = _prev_shazamio35
+
+    # (b)+(c) tap level, REAL _identify_audio + REAL
+    # _supplementary_identify (same shape as T32c): the fake Shazam
+    # honours the timeout_s it receives exactly like the real
+    # _recognize_bytes does (sleeps that long, then fails) — so a
+    # 30 s hang would still die as slice_timeout, while the 10 s
+    # Q4 bound lets the slice finish inside its 20 s budget.
+    # _Q4_SHAZAM_TIMEOUT_S is shrunk to 0.5 s only so the test runs
+    # fast; the mechanism (and the 10.0 production value, pinned
+    # in T35a) is identical. Reel 2's real AudD answer is used.
+    _cfg35 = SimpleNamespace(audd_token="fake", acrcloud_host="",
+                             acrcloud_key="", acrcloud_secret="")
+    orig_shazam35 = h.identify_bytes_shazam
+    orig_audd35 = h.identify_bytes
+
+    async def _drive_q4_tap35(token, audd_result):
+        """Drive one audio retry tap with a hung Shazam; returns
+        (msg, shazam_calls, audd_calls, elapsed, supp_lines)."""
+        _sh_calls: list = []
+        _au_calls: list = []
+
+        async def _fake_shazam35(probe, prepared_wav=None, req_id=None,
+                                 timeout_s=None):
+            _sh_calls.append(timeout_s)
+            # Mirror the real _recognize_bytes: the lookup hangs
+            # until the bound, then fails — it never returns late.
+            await asyncio.sleep(timeout_s if timeout_s else 30.0)
+            return AudioIdResult(status="error")
+
+        async def _fake_audd35(data, filename, token):
+            _au_calls.append(True)
+            return audd_result
+
+        h.identify_bytes_shazam = _fake_shazam35
+        h.identify_bytes = _fake_audd35
+        _old_q4_to = h._Q4_SHAZAM_TIMEOUT_S
+        h._Q4_SHAZAM_TIMEOUT_S = 0.5
+        _seed_q4_clip(token)
+        vs.LOG_LINES.clear()
+        _t0 = time.perf_counter()
+        try:
+            msg = _Msg(with_audio=True)
+            cb = _Cb(msg, data=f"vid:id:{token}")
+            await h.video_identify(cb, conn, _cfg35)
+        finally:
+            h.identify_bytes_shazam = orig_shazam35
+            h.identify_bytes = orig_audd35
+            h._Q4_SHAZAM_TIMEOUT_S = _old_q4_to
+            _drop_q4_token(token)
+        _supp = [ln for ln in vs.LOG_LINES
+                 if '"stage": "supplementary_identify"' in ln]
+        return msg, _sh_calls, _au_calls, time.perf_counter() - _t0, _supp
+
+    # (b) hung Shazam + AudD identifies reel 2's song: the slice
+    # returns WITHIN budget carrying AudD's answer (unconfirmed
+    # single-source name) — no slice_timeout, both slices tried.
+    _msg35b, _sh35b, _au35b, _dt35b, _supp35b = await _drive_q4_tap35(
+        "tok-fix6-t35b",
+        AudioIdResult(status="identified", title="Beni Biraz Sevseydin",
+                      artist="Nilay IŞIK", confirmed=True, source="audd"))
+    check("T35b hung Shazam + AudD answer: tap finished fast, no hang",
+          _dt35b < 10.0, f"elapsed={_dt35b:.2f}s")
+    check("T35b hung Shazam + AudD answer: Q4 passed the tight bound (0.5 s)",
+          len(_sh35b) == 2 and all(_t == 0.5 for _t in _sh35b),
+          f"shazam_timeout_s={_sh35b}")
+    check("T35b hung Shazam + AudD answer: AudD ran on both slices",
+          len(_au35b) == 2, f"audd_calls={len(_au35b)}")
+    check("T35b hung Shazam + AudD answer: NO slice_timeout logged",
+          not any('"detail": "slice_timeout"' in ln for ln in _supp35b),
+          f"lines={_supp35b}")
+    check("T35b hung Shazam + AudD answer: slice carries AudD's title",
+          any('"title": "Beni Biraz Sevseydin"' in ln for ln in _supp35b),
+          f"lines={_supp35b}")
+    check("T35b hung Shazam + AudD answer: honest head-not-found, ZERO audio",
+          t("m_identify_head_notfound", "fa") in _msg35b.answers
+          and _msg35b.audio_calls == [],
+          f"answers={_msg35b.answers} audio={_msg35b.audio_calls}")
+
+    # (c) hung Shazam + AudD not_found: the slice's honest verdict
+    # is not_found (not lookup_error, not slice_timeout).
+    _msg35c, _sh35c, _au35c, _dt35c, _supp35c = await _drive_q4_tap35(
+        "tok-fix6-t35c", AudioIdResult(status="not_found"))
+    check("T35c hung Shazam + AudD nothing: tap finished fast, no hang",
+          _dt35c < 10.0, f"elapsed={_dt35c:.2f}s")
+    check("T35c hung Shazam + AudD nothing: NO slice_timeout logged",
+          not any('"detail": "slice_timeout"' in ln for ln in _supp35c),
+          f"lines={_supp35c}")
+    check("T35c hung Shazam + AudD nothing: slice verdict is honest not_found",
+          len([ln for ln in _supp35c if '"slice":' in ln]) == 2
+          and all('"status": "not_found"' in ln for ln in _supp35c
+                  if '"slice":' in ln),
+          f"lines={_supp35c}")
+    check("T35c hung Shazam + AudD nothing: honest head-not-found, ZERO audio",
+          t("m_identify_head_notfound", "fa") in _msg35c.answers
+          and _msg35c.audio_calls == [],
+          f"answers={_msg35c.answers} audio={_msg35c.audio_calls}")
+
+    # (d) normal (non-Q4) path: _run_shazam_windows still passes
+    # the 30 s default — byte-identical behaviour outside Q4.
+    _sh35d: list = []
+    orig_shazam35d = h.identify_bytes_shazam
+    orig_audd35d = h.identify_bytes
+
+    async def _fake_shazam35d(probe, prepared_wav=None, req_id=None,
+                              timeout_s=None):
+        _sh35d.append(timeout_s)
+        return AudioIdResult(status="not_found")
+
+    async def _fake_audd35d(data, filename, token):
+        return AudioIdResult(status="not_found")
+
+    h.identify_bytes_shazam = _fake_shazam35d
+    h.identify_bytes = _fake_audd35d
+    try:
+        _res35d = await h._identify_audio(
+            _clip6, "clip.mp3", _cfg35, None, req_id="normal-timeout-test")
+    finally:
+        h.identify_bytes_shazam = orig_shazam35d
+        h.identify_bytes = orig_audd35d
+    check("T35d normal path: Shazam called with the 30 s default",
+          _sh35d == [30.0], f"shazam_timeout_s={_sh35d}")
+    check("T35d normal path: result is still honest not_found",
+          _res35d.status == "not_found", f"res={_res35d}")
 
     failed = [r for r in vs.RESULTS if not r[1]]
     print(f"\n{len(vs.RESULTS) - len(failed)}/{len(vs.RESULTS)} checks passed")

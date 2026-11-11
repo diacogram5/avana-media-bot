@@ -127,7 +127,7 @@ async def _drain(timeout=5.0):
 
 def _stub_lookups(shazam, audd, calls):
     """Monkeypatch handlers' Shazam/AudD with recording fakes."""
-    async def _fake_shazam(probe, prepared_wav=None, req_id=None):
+    async def _fake_shazam(probe, prepared_wav=None, req_id=None, timeout_s=None):
         calls.append("shazam")
         return shazam if shazam is not None else AudioIdResult(status="not_found")
 

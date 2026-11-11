@@ -166,7 +166,7 @@ async def test_media_handler_uses_shazam_before_audd(monkeypatch, db):
     config = Config()
     config.audd_token = ""
 
-    async def fake_shazam(data, prepared_wav=None):
+    async def fake_shazam(data, prepared_wav=None, timeout_s=None):
         class R:
             status = "identified"
             title = "Dooset Daram"

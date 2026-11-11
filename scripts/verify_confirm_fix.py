@@ -43,6 +43,13 @@ Cases:
   C7  Identified/bank sends use the identified caption (never the old
       full-song caption, never the new extracted caption) and
       NEITHER new button.
+  C8  Fix round 6 (hyphen spelling gap): Shazam "Safo Sadeh" vs AudD
+      "Saf-o Sadeh" confirms on the bg path and the Q4 fast path;
+      the fix-5 near-match still confirms; clearly different titles
+      and single-source results still reject; a hyphen variant of a
+      rejected name never surfaces; a wrong-song re-check that finds
+      only the spelling variant emits no «شاید...» lead and stores
+      no report for the variant.
 
 Reuses the fake aiogram / fake libsql / fake message harness from
 scripts/verify_speedfix.py and the clip fixtures from
@@ -172,7 +179,7 @@ def _stub_lookups(shazam, audd, calls):
     not_found). calls: list receiving (name, start, end) per call, so
     the test can prove the two ran concurrently.
     """
-    async def _fake_shazam(probe, prepared_wav=None, req_id=None):
+    async def _fake_shazam(probe, prepared_wav=None, req_id=None, timeout_s=None):
         t0 = time.perf_counter()
         await asyncio.sleep(0.3)
         calls.append(("shazam", t0, time.perf_counter()))
@@ -193,6 +200,49 @@ class _FakeCallback:
 
     def __init__(self, msg, token):
         self.data = f"vid:id:{token}"
+        self.message = msg
+        self.bot = msg.bot
+        self.from_user = msg.from_user
+        self.answered = []
+
+    async def answer(self, text="", show_alert=False, **kw):
+        self.answered.append(text)
+        return None
+
+
+class _RecSent(_CardSent):
+    """Sent message that records every edit_text (for C8h)."""
+
+    def __init__(self):
+        super().__init__()
+        self.texts: list[str] = []
+
+    async def edit_text(self, text, **kw):
+        self.texts.append(text)
+        self.edited = True
+        return self
+
+
+class _RecMsg(_CardMsg):
+    """Fake message whose answers return recording sent messages."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.sent: list[_RecSent] = []
+
+    async def answer(self, text, **kw):
+        self.answers.append(text)
+        sent = _RecSent()
+        self.card_sent = sent
+        self.sent.append(sent)
+        return sent
+
+
+class _FakeWrongCallback:
+    """Minimal CallbackQuery stand-in for wrong_song (C8h)."""
+
+    def __init__(self, msg, token):
+        self.data = f"wrong:{token}"
         self.message = msg
         self.bot = msg.bot
         self.from_user = msg.from_user
@@ -571,6 +621,220 @@ async def main():
     except Exception as exc:
         check("C7 identified keeps old caption", False,
               f"{type(exc).__name__}: {exc}")
+
+
+    # ---- C8: fix round 6 — hyphen-only spelling differences -----------
+    # Live reel DfjwxvyCsgf: Shazam "Safo Sadeh" vs AudD "Saf-o Sadeh"
+    # stayed unconfirmed because _distinctive_tokens splits "Saf-o"
+    # into "saf" ("o" dropped) != "safo". Both gate paths now compare
+    # normalized text, the rejected-name exclusion treats a hyphen
+    # variant as the same name, and the wrong-song guard never turns
+    # a spelling variant into a «شاید...» lead or a report.
+    try:
+        # C8a helpers.
+        check("C8a _agreement_text joins an intra-word hyphen",
+              h._agreement_text("Saf-o Sadeh") == "safo sadeh",
+              f"got={h._agreement_text('Saf-o Sadeh')!r}")
+        check("C8a _agreement_text strips diacritics and case-folds",
+              h._agreement_text("Beyoncé") == "beyonce",
+              f"got={h._agreement_text('Beyoncé')!r}")
+        check("C8a _agreement_text leaves a spaced hyphen alone",
+              h._agreement_text("A - B") == "a - b",
+              f"got={h._agreement_text('A - B')!r}")
+        check("C8a _names_agree accepts the hyphen pair",
+              h._names_agree("Safo Sadeh", "Mehdi Ahmadvand",
+                             "Saf-o Sadeh", "Mehdi Ahmadvand"))
+        check("C8a _names_agree rejects clearly different titles/artists",
+              not h._names_agree("Safo Sadeh", "Mehdi Ahmadvand",
+                                 "Saf-o Dard", "Mehdi Ahmadvand")
+              and not h._names_agree("Safo Sadeh", "Mehdi Ahmadvand",
+                                     "Safo Sadeh", "Someone Else"))
+        check("C8a _titles_agree_near accepts the hyphen pair",
+              h._titles_agree_near("Safo Sadeh", "Mehdi Ahmadvand",
+                                   "Saf-o Sadeh", "Mehdi Ahmadvand"))
+
+        orig_shazam8 = h.identify_bytes_shazam
+        orig_audd8 = h.identify_bytes
+        orig_xbank8 = h._XBANK_OK
+        h._XBANK_OK = False  # bank is a separate path (C3); gate only
+        try:
+            data8 = vm._MP4
+            calls8: list = []
+            # C8b bg path: the live pair confirms.
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="identified", title="Saf-o Sadeh",
+                              artist="Mehdi Ahmadvand"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8b hyphen pair confirms on the bg path (both engines)",
+                  r8.status == "identified" and r8.confirmed
+                  and r8.source == "shazam+audd"
+                  and r8.title == "Safo Sadeh"
+                  and r8.artist == "Mehdi Ahmadvand",
+                  f"status={r8.status} confirmed={r8.confirmed} "
+                  f"source={r8.source} title={r8.title!r}")
+            # C8c Q4 fast path: the same pair confirms from one slice.
+            import io as _io8
+            import math as _math8
+            import struct as _struct8
+            import wave as _wave8
+            _buf8 = _io8.BytesIO()
+            with _wave8.open(_buf8, "wb") as _w8:
+                _w8.setnchannels(1)
+                _w8.setsampwidth(2)
+                _w8.setframerate(22050)
+                _w8.writeframes(b"".join(
+                    _struct8.pack(
+                        "<h", int(12000 * _math8.sin(
+                            2 * _math8.pi * 440 * i / 22050)))
+                    for i in range(22050 * 2)))
+            _slice8 = _buf8.getvalue()
+            calls8.clear()
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="identified", title="Saf-o Sadeh",
+                              artist="Mehdi Ahmadvand"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None, q4_fast=True,
+                                         predecoded_wav=_slice8)
+            check("C8c hyphen pair confirms on the Q4 fast path",
+                  r8.status == "identified" and r8.confirmed
+                  and r8.source == "shazam+audd"
+                  and r8.title == "Safo Sadeh",
+                  f"status={r8.status} confirmed={r8.confirmed} "
+                  f"source={r8.source} title={r8.title!r}")
+            # C8d fix-5 near-match regression: still confirms.
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Hanoo Be Yadetam",
+                              artist="Hichkas"),
+                AudioIdResult(status="identified", title="Be Yadetam",
+                              artist="UserMix"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8d fix-5 near-match still confirms",
+                  r8.status == "identified" and r8.confirmed
+                  and r8.title == "Hanoo Be Yadetam",
+                  f"status={r8.status} title={r8.title!r}")
+            # C8e clearly different titles / artists still reject.
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="identified", title="Saf-o Dard",
+                              artist="Mehdi Ahmadvand"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8e hyphen pair with a different word still rejects",
+                  r8.status == "unconfirmed" and not r8.confirmed
+                  and r8.title == "Safo Sadeh" and r8.source == "shazam",
+                  f"status={r8.status} title={r8.title!r}")
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="identified", title="Saf-o Sadeh",
+                              artist="Someone Else"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8e hyphen titles but a different artist still rejects",
+                  r8.status == "unconfirmed" and not r8.confirmed,
+                  f"status={r8.status} title={r8.title!r}")
+            # C8f single-source hyphen variant never confirms.
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="not_found"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8f Shazam-only hyphen spelling stays unconfirmed",
+                  r8.status == "unconfirmed" and not r8.confirmed
+                  and r8.title == "Safo Sadeh" and r8.source == "shazam",
+                  f"status={r8.status} source={r8.source}")
+            _stub_lookups(
+                AudioIdResult(status="not_found"),
+                AudioIdResult(status="identified", title="Saf-o Sadeh",
+                              artist="Mehdi Ahmadvand"), calls8)
+            r8 = await h._identify_audio(data8, "clip.mp4", _config(),
+                                         conn=None)
+            check("C8f AudD-only hyphen spelling stays unconfirmed",
+                  r8.status == "unconfirmed" and not r8.confirmed
+                  and r8.title == "Saf-o Sadeh" and r8.source == "audd",
+                  f"status={r8.status} source={r8.source}")
+            # C8g a hyphen variant of a rejected name never surfaces.
+            _stub_lookups(
+                AudioIdResult(status="identified", title="Safo Sadeh",
+                              artist="Mehdi Ahmadvand"),
+                AudioIdResult(status="identified", title="Saf-o Sadeh",
+                              artist="Mehdi Ahmadvand"), calls8)
+            r8 = await h._identify_audio(
+                data8, "clip.mp4", _config(), conn=None,
+                exclude=[("Safo Sadeh", "Mehdi Ahmadvand")])
+            check("C8g hyphen variant of a rejected name never surfaces",
+                  r8.status == "not_found" and r8.title == "",
+                  f"status={r8.status} title={r8.title!r}")
+            r8 = await h._identify_audio(
+                data8, "clip.mp4", _config(), conn=None,
+                exclude=[("Saf-o Sadeh", "Mehdi Ahmadvand")])
+            check("C8g2 rejected hyphen spelling also excludes the plain form",
+                  r8.status == "not_found" and r8.title == "",
+                  f"status={r8.status} title={r8.title!r}")
+        finally:
+            h.identify_bytes_shazam = orig_shazam8
+            h.identify_bytes = orig_audd8
+            h._XBANK_OK = orig_xbank8
+
+        # C8h wrong-song guard: the disputed name is "Safo Sadeh"; the
+        # re-check returns only its unconfirmed hyphen variant.
+        LOG_LINES.clear()
+        h._VIDEO_IDENTIFY.clear()
+        h._WRONG_SONG_RUNNING.clear()
+        kb08 = h._video_identify_kb(572595158, "VID123", "file")
+        tok8 = kb08.inline_keyboard[0][0].callback_data.split("vid:id:", 1)[1]
+        entry8 = h._VIDEO_IDENTIFY[tok8]
+        entry8.update({
+            "user_id": 572595158, "file_id": "VID123", "kind": "file",
+            "link": None, "audio_url": None,
+            "last_title": "Safo Sadeh", "last_artist": "Mehdi Ahmadvand",
+            "last_source": "shazam", "wrong": [], "attempts": 0})
+        msg8 = _RecMsg()
+        vm._attach_clip_video(msg8)
+        conn8 = vs._make_conn()
+        orig_ident8 = h._identify_audio
+        orig_store8 = h._wrong_song_log_and_store
+        reports8: list = []
+
+        def _rec_store8(*a, **k):
+            reports8.append((a, k))
+
+        async def _fake_ident8(data, filename, config, conn=None, **_kw):
+            return AudioIdResult(status="unconfirmed", title="Saf-o Sadeh",
+                                 artist="Mehdi Ahmadvand", confirmed=False,
+                                 source="audd")
+
+        h._identify_audio = _fake_ident8
+        h._wrong_song_log_and_store = _rec_store8
+        try:
+            await h.wrong_song(_FakeWrongCallback(msg8, tok8), conn8,
+                               _config())
+        finally:
+            h._identify_audio = orig_ident8
+            h._wrong_song_log_and_store = orig_store8
+        _all_text8 = list(msg8.answers) + [
+            t for s in msg8.sent for t in s.texts]
+        check("C8h spelling variant emits no «شاید...» lead",
+              not any("شاید" in t for t in _all_text8),
+              f"texts={_all_text8}")
+        check("C8h disputed entry keeps the original name (no variant stored on it)",
+              entry8.get("last_title") == "Safo Sadeh"
+              and entry8.get("last_artist") == "Mehdi Ahmadvand",
+              f"entry={entry8.get('last_title')!r}")
+        check("C8h exactly one report, outcome not_found, no variant as the new name",
+              len(reports8) == 1 and len(reports8[0][0]) >= 9
+              and reports8[0][0][5] == "" and reports8[0][0][8] == "not_found",
+              f"reports={reports8}")
+    except Exception as exc:
+        check("C8 hyphen spelling gap", False, f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
